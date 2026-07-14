@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+.logs/
+Helper/target/
+*.app/
+*.dSYM/
+build/
+dist/
+*.log
+.DS_Store
