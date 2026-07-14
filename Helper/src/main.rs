@@ -92,10 +92,11 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     normalize_codex_reasoning_usage(&mut messages, |message| {
-        pricing.calculate_cost_with_provider(
+        pricing.calculate_cost_with_service_tier(
             &message.model_id,
             Some(&message.provider_id),
             &message.tokens,
+            message.service_tier,
         )
     });
     let session_titles = session_index_path

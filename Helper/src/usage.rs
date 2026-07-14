@@ -31,6 +31,15 @@ pub enum CostSource {
     Estimated,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceTier {
+    #[default]
+    Unknown,
+    Standard,
+    Fast,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnifiedMessage {
     pub client: String,
@@ -47,6 +56,8 @@ pub struct UnifiedMessage {
     pub cost: f64,
     #[serde(default)]
     pub cost_source: CostSource,
+    #[serde(default)]
+    pub service_tier: ServiceTier,
     #[serde(default)]
     pub duration_ms: Option<i64>,
     #[serde(default = "default_message_count")]
@@ -90,6 +101,7 @@ impl UnifiedMessage {
             tokens,
             cost,
             cost_source: CostSource::Unknown,
+            service_tier: ServiceTier::Unknown,
             duration_ms: None,
             message_count: 1,
             agent,

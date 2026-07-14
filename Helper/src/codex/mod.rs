@@ -69,10 +69,11 @@ pub fn parse_local_codex_messages(
 fn apply_pricing(message: &mut UnifiedMessage, pricing: &CodexPricing) {
     message.cost = 0.0;
     message.cost_source = CostSource::Unknown;
-    if let Some(cost) = pricing.calculate_cost_with_provider(
+    if let Some(cost) = pricing.calculate_cost_with_service_tier(
         &message.model_id,
         Some(&message.provider_id),
         &message.tokens,
+        message.service_tier,
     ) {
         message.cost = cost;
         message.cost_source = CostSource::Estimated;

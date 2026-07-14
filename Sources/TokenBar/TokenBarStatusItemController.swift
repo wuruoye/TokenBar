@@ -409,7 +409,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             cost: session.menuCostText,
             detail: detail,
             trailing: time,
-            showsChevron: true)
+            showsChevron: true,
+            badge: session.menuServiceTierBadge)
         item.view = row
     }
 
@@ -483,7 +484,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             cost: turn.menuCostText,
             detail: turn.tokens.requestMenuDetail,
             trailing: "\(turn.startedAt.menuClockText) · \(turn.menuDurationText)",
-            showsChevron: physicalRequests.count > 1 || self.settings.showsFullRequestContentOnHover)
+            showsChevron: physicalRequests.count > 1 || self.settings.showsFullRequestContentOnHover,
+            badge: turn.menuServiceTierBadge)
         item.view = row
 
         if physicalRequests.count > 1 {
@@ -520,7 +522,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 cost: request.menuCostText,
                 detail: request.tokens.requestMenuDetail,
                 trailing: "\(request.startedAt.menuClockText) · \(request.menuDurationText)",
-                showsChevron: self.settings.showsFullRequestContentOnHover)
+                showsChevron: self.settings.showsFullRequestContentOnHover,
+                badge: request.menuServiceTierBadge)
             item.view = row
             self.configureCopyInteraction(item: item, row: row, request: request)
             if self.settings.showsFullRequestContentOnHover {

@@ -32,6 +32,7 @@ TokenBar is a native, standalone macOS menu bar app focused on Codex. It combine
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - Browse recent sessions using Codex-generated titles when available.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
+- See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
 
@@ -101,15 +102,19 @@ TokenBar presents local Codex activity in three levels:
 
 Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex reports reasoning tokens as part of output tokens; TokenBar normalizes that breakdown before aggregation so reasoning is counted and priced once.
 
+Codex records Fast mode as the `priority` service tier (`fast` is also accepted for older logs); `default` and `standard` are treated as Standard. When every service-tier snapshot in one physical session agrees, TokenBar applies that tier to the whole session, including usage written before the first snapshot. If a session switches tier, TokenBar follows the timeline from each snapshot and leaves any prefix before the first snapshot unknown. Subagents inherit the last tier from their replayed parent context without counting the parent's earlier tier history as their own. A turn containing both Fast and Standard physical requests is marked `MIXED`.
+
 `Cache×` is the cache reuse ratio:
 
 ```text
 cache-read tokens / (input tokens + cache-write tokens)
 ```
 
-Costs prefixed with `~` are compatibility estimates based on pricing data maintained inside TokenBar, not provider invoices. Provider-reported costs, when present in the source data, remain authoritative. Recognized OpenAI model IDs retain the estimate behind custom Codex gateways, and the unpriced research-preview `gpt-5.3-codex-spark` ID uses the public GPT-5.3-Codex rate so historical totals stay aligned with Tokscale. Unknown model families remain unpriced. TokenBar also preserves the existing Tokscale long-context convention instead of silently applying a different `>272K` multiplier to old history.
+Costs prefixed with `~` are compatibility estimates based on pricing data maintained inside TokenBar, not provider invoices. Provider-reported costs, when present in the source data, remain authoritative. Fast estimates apply the official API Priority multiplier once to each physical usage record: GPT-5.4 uses 2×, GPT-5.5 uses 2.5×, and the GPT-5.6 Sol/Terra/Luna family uses 2×. These are API-equivalent dollar estimates based on OpenAI's [pricing table](https://developers.openai.com/api/docs/pricing) and [Priority Processing guide](https://developers.openai.com/api/docs/guides/priority-processing), not a claim about ChatGPT credit accounting. A model without an explicitly verified Priority rate keeps its standard estimate instead of receiving a guessed multiplier.
 
-Quota percentages and local token totals measure different things and should not be expected to map one-to-one.
+Recognized OpenAI model IDs retain the estimate behind custom Codex gateways, and the unpriced research-preview `gpt-5.3-codex-spark` ID uses the public GPT-5.3-Codex rate so historical totals stay aligned with Tokscale. Unknown model families remain unpriced. TokenBar also preserves the existing Tokscale long-context convention instead of silently applying a different `>272K` multiplier to old history.
+
+Fast pricing never changes raw token/cache counts. Quota percentages come from Codex and are not multiplied again; quota and local token totals measure different things and should not be expected to map one-to-one.
 
 ## Privacy
 

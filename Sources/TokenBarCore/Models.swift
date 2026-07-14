@@ -70,6 +70,27 @@ public enum ActivityCostSource: String, Codable, Equatable, Sendable {
     case estimated
 }
 
+public enum ActivityServiceTier: String, Codable, Equatable, Sendable {
+    case unknown
+    case standard
+    case fast
+    case mixed
+
+    public static func combining(_ tiers: some Sequence<ActivityServiceTier>) -> ActivityServiceTier {
+        var knownTier: ActivityServiceTier?
+        for tier in tiers where tier != .unknown {
+            if tier == .mixed {
+                return .mixed
+            }
+            if let knownTier, knownTier != tier {
+                return .mixed
+            }
+            knownTier = tier
+        }
+        return knownTier ?? .unknown
+    }
+}
+
 public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let sessionId: String
@@ -88,6 +109,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let outputPreview: String?
     public let sessionPath: String?
     public let contributions: [RequestSummary]?
+    public let serviceTier: ActivityServiceTier?
 
     public init(
         id: String,
@@ -106,7 +128,8 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         promptPreview: String?,
         outputPreview: String?,
         sessionPath: String?,
-        contributions: [RequestSummary]? = nil)
+        contributions: [RequestSummary]? = nil,
+        serviceTier: ActivityServiceTier? = nil)
     {
         self.id = id
         self.sessionId = sessionId
@@ -125,6 +148,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         self.outputPreview = outputPreview
         self.sessionPath = sessionPath
         self.contributions = contributions
+        self.serviceTier = serviceTier
     }
 
     public var startedAt: Date {
@@ -166,7 +190,8 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
             promptPreview: nil,
             outputPreview: nil,
             sessionPath: nil,
-            contributions: self.contributions?.map { $0.redactedForCache() })
+            contributions: self.contributions?.map { $0.redactedForCache() },
+            serviceTier: self.serviceTier)
     }
 }
 

@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::usage::{
     content_preview_from_str, content_preview_from_value, normalize_workspace_key,
-    workspace_label_from_key, TokenBreakdown, UnifiedMessage,
+    workspace_label_from_key, ServiceTier, TokenBreakdown, UnifiedMessage,
 };
 
 const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
@@ -49,6 +49,12 @@ struct CodexPayload {
     model_provider: Option<String>,
     agent_nickname: Option<String>,
     message: Option<String>,
+    thread_settings: Option<CodexThreadSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexThreadSettings {
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +167,9 @@ impl CodexTotals {
 #[derive(Debug, Clone, Default)]
 struct CodexParseState {
     current_model: Option<String>,
+    current_service_tier: ServiceTier,
+    service_tier_consensus: Option<ServiceTier>,
+    service_tier_conflicted: bool,
     current_turn_start_ms: Option<i64>,
     previous_totals: Option<CodexTotals>,
     session_is_headless: bool,
@@ -230,6 +239,16 @@ fn parse_codex_reader<R: BufRead>(
                 let payload_model = extract_model(&payload);
                 let is_token_count = entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("token_count");
+                let is_thread_settings_applied = entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("thread_settings_applied");
+                let service_tier_snapshot = is_thread_settings_applied
+                    .then(|| {
+                        payload
+                            .thread_settings
+                            .as_ref()
+                            .and_then(|settings| settings.service_tier.as_deref())
+                    })
+                    .flatten();
                 let info_model = is_token_count
                     .then(|| payload.info.as_ref().and_then(extract_model_from_info))
                     .flatten();
@@ -243,12 +262,16 @@ fn parse_codex_reader<R: BufRead>(
                         state.forked_child_replay_session_id = None;
                         state.forked_child_task_started_turn_ids.clear();
                         state.forked_child_is_user_fork = false;
+                        begin_forked_child_service_tier_tracking(&mut state);
                         if let Some(id) = state.forked_child_session_id.as_ref() {
                             state.session_id_from_meta = Some(id.clone());
                         }
                         state.current_model = payload_model.clone();
                         handled = true;
                     } else {
+                        if is_thread_settings_applied {
+                            record_service_tier_snapshot(&mut state, service_tier_snapshot, false);
+                        }
                         if entry_type == "event_msg"
                             && payload.payload_type.as_deref() == Some("task_started")
                         {
@@ -292,6 +315,11 @@ fn parse_codex_reader<R: BufRead>(
 
                 if entry_type == "session_meta" {
                     apply_session_meta(&mut state, &payload);
+                }
+
+                if is_thread_settings_applied {
+                    record_service_tier_snapshot(&mut state, service_tier_snapshot, true);
+                    handled = true;
                 }
 
                 if entry_type == "turn_context" {
@@ -424,6 +452,7 @@ fn parse_codex_reader<R: BufRead>(
                         0.0,
                         agent,
                     );
+                    message.service_tier = state.current_service_tier;
                     message.duration_ms = duration_ms;
                     if state.pending_turn_start {
                         message.is_turn_start = true;
@@ -485,6 +514,7 @@ fn parse_codex_reader<R: BufRead>(
             flush_pending_model_messages(&mut pending_model_messages, &mut messages, model);
         }
         if let Some(mut message) = headless_message {
+            message.service_tier = state.current_service_tier;
             message.set_workspace(
                 state.session_workspace_key.clone(),
                 state.session_workspace_label.clone(),
@@ -494,6 +524,7 @@ fn parse_codex_reader<R: BufRead>(
     }
 
     flush_pending_model_messages(&mut pending_model_messages, &mut messages, "unknown");
+    backfill_homogeneous_service_tier(&mut messages, &state);
     Ok(messages)
 }
 
@@ -531,6 +562,9 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.forked_child_inherited_reported_total = None;
             state.forked_child_task_started_turn_ids.clear();
             state.forked_child_is_user_fork = payload.thread_source.as_deref() == Some("user");
+            state.current_service_tier = ServiceTier::Unknown;
+            state.service_tier_consensus = None;
+            state.service_tier_conflicted = false;
         }
     }
     if let Some(provider) = payload.model_provider.as_ref() {
@@ -543,6 +577,56 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
         let (key, label) = codex_workspace_from_cwd(cwd);
         state.session_workspace_key = key;
         state.session_workspace_label = label;
+    }
+}
+
+fn service_tier_from_raw(raw: Option<&str>) -> ServiceTier {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("priority" | "fast") => ServiceTier::Fast,
+        Some("default" | "standard") => ServiceTier::Standard,
+        _ => ServiceTier::Unknown,
+    }
+}
+
+fn record_service_tier_snapshot(
+    state: &mut CodexParseState,
+    raw: Option<&str>,
+    contributes_to_consensus: bool,
+) {
+    let tier = service_tier_from_raw(raw);
+    state.current_service_tier = tier;
+    if !contributes_to_consensus {
+        return;
+    }
+
+    if tier == ServiceTier::Unknown {
+        state.service_tier_conflicted = true;
+        return;
+    }
+    match state.service_tier_consensus {
+        None => state.service_tier_consensus = Some(tier),
+        Some(existing) if existing == tier => {}
+        Some(_) => state.service_tier_conflicted = true,
+    }
+}
+
+fn begin_forked_child_service_tier_tracking(state: &mut CodexParseState) {
+    state.service_tier_consensus =
+        (state.current_service_tier != ServiceTier::Unknown).then_some(state.current_service_tier);
+    state.service_tier_conflicted = false;
+}
+
+fn backfill_homogeneous_service_tier(messages: &mut [UnifiedMessage], state: &CodexParseState) {
+    if state.service_tier_conflicted {
+        return;
+    }
+    let Some(tier) = state.service_tier_consensus else {
+        return;
+    };
+    for message in messages {
+        if message.service_tier == ServiceTier::Unknown {
+            message.service_tier = tier;
+        }
     }
 }
 
@@ -966,6 +1050,95 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    fn service_tier_line(service_tier: &str) -> String {
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": service_tier}
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn homogeneous_fast_tier_backfills_usage_before_the_first_snapshot() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            token_line("2026-01-01T00:00:01Z", (10, 2, 0, 0), (10, 2, 0, 0)),
+            service_tier_line("priority"),
+            token_line("2026-01-01T00:00:02Z", (20, 4, 0, 0), (10, 2, 0, 0)),
+            service_tier_line("fast")
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|message| message.service_tier == ServiceTier::Fast));
+    }
+
+    #[test]
+    fn homogeneous_standard_tier_backfills_usage_before_the_first_snapshot() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            token_line("2026-01-01T00:00:01Z", (10, 2, 0, 0), (10, 2, 0, 0)),
+            service_tier_line("default"),
+            service_tier_line("standard")
+        );
+
+        assert_eq!(parse(&lines)[0].service_tier, ServiceTier::Standard);
+    }
+
+    #[test]
+    fn tier_switches_follow_the_timeline_without_backfilling_the_prefix() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            token_line("2026-01-01T00:00:01Z", (10, 2, 0, 0), (10, 2, 0, 0)),
+            service_tier_line("priority"),
+            token_line("2026-01-01T00:00:02Z", (20, 4, 0, 0), (10, 2, 0, 0)),
+            service_tier_line("default"),
+            token_line("2026-01-01T00:00:03Z", (30, 6, 0, 0), (10, 2, 0, 0))
+        );
+
+        let tiers = parse(&lines)
+            .into_iter()
+            .map(|message| message.service_tier)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tiers,
+            vec![
+                ServiceTier::Unknown,
+                ServiceTier::Fast,
+                ServiceTier::Standard
+            ]
+        );
+    }
+
+    #[test]
+    fn forked_child_inherits_the_last_tier_from_parent_replay() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"session_meta","payload":{"id":"019e5c03-1e99-7000-8000-0000000000ff","forked_from_id":"019e5b00-0000-7000-8000-000000000001","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019e5b00-0000-7000-8000-000000000001","depth":1}}},"model_provider":"openai"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"019e5b00-0000-7000-8000-000000000001","source":"vscode"}}"#,
+            service_tier_line("default"),
+            service_tier_line("priority"),
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"019e5c03-6425-7000-8000-000000000001"}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"019e5c03-6425-7000-8000-000000000001","model":"gpt-5.6-sol"}}"#,
+            token_line("2026-01-01T00:00:02Z", (10, 2, 0, 0), (10, 2, 0, 0))
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].service_tier, ServiceTier::Fast);
     }
 
     #[test]

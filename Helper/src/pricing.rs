@@ -1,4 +1,4 @@
-use crate::usage::TokenBreakdown;
+use crate::usage::{ServiceTier, TokenBreakdown};
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
@@ -76,6 +76,44 @@ impl CodexPricing {
         let output_cost = output_tokens as f64 * rate.output_per_million / TOKENS_PER_MILLION;
         let total = input_cost + cached_cost + cache_write_cost + output_cost;
         total.is_finite().then_some(total)
+    }
+
+    /// Applies Codex Fast/Priority pricing to the standard API-equivalent
+    /// estimate. The tier changes cost only; token and cache counts stay raw.
+    /// Models without an explicitly verified Priority rate keep their standard
+    /// estimate instead of receiving a guessed multiplier.
+    pub fn calculate_cost_with_service_tier(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+        service_tier: ServiceTier,
+    ) -> Option<f64> {
+        let base = self.calculate_cost_with_provider(model_id, provider_id, usage)?;
+        let multiplier = if service_tier == ServiceTier::Fast {
+            fast_cost_multiplier(model_id).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let total = base * multiplier;
+        total.is_finite().then_some(total)
+    }
+}
+
+/// Official OpenAI Priority prices reviewed 2026-07-14:
+/// - GPT-5.4: 2x
+/// - GPT-5.5: 2.5x
+/// - GPT-5.6 Sol/Terra/Luna: 2x
+///
+/// Sources:
+/// - https://developers.openai.com/api/docs/pricing
+/// - https://developers.openai.com/api/docs/guides/priority-processing
+fn fast_cost_multiplier(model_id: &str) -> Option<f64> {
+    match normalize_pricing_model_id(model_id).as_str() {
+        "gpt-5.4" => Some(2.0),
+        "gpt-5.5" => Some(2.5),
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(2.0),
+        _ => None,
     }
 }
 
@@ -250,6 +288,65 @@ mod tests {
             .calculate_cost_with_provider("gpt-5.5", Some("openai"), &usage)
             .unwrap();
         assert!((cost - 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn applies_verified_fast_multipliers_without_changing_standard_cost() {
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            cache_read: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        let pricing = CodexPricing::bundled();
+
+        for (model, multiplier) in [
+            ("gpt-5.4", 2.0),
+            ("gpt-5.5", 2.5),
+            ("gpt-5.6-sol", 2.0),
+            ("gpt-5.6-terra", 2.0),
+            ("gpt-5.6-luna", 2.0),
+        ] {
+            let standard = pricing
+                .calculate_cost_with_service_tier(
+                    model,
+                    Some("openai"),
+                    &usage,
+                    ServiceTier::Standard,
+                )
+                .unwrap();
+            let fast = pricing
+                .calculate_cost_with_service_tier(model, Some("openai"), &usage, ServiceTier::Fast)
+                .unwrap();
+            assert!((fast - standard * multiplier).abs() < 1e-9, "{model}");
+        }
+    }
+
+    #[test]
+    fn does_not_guess_a_fast_multiplier_for_an_unsupported_model() {
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            ..Default::default()
+        };
+        let pricing = CodexPricing::bundled();
+        let standard = pricing
+            .calculate_cost_with_service_tier(
+                "gpt-5.4-mini",
+                Some("openai"),
+                &usage,
+                ServiceTier::Standard,
+            )
+            .unwrap();
+        let fast = pricing
+            .calculate_cost_with_service_tier(
+                "gpt-5.4-mini",
+                Some("openai"),
+                &usage,
+                ServiceTier::Fast,
+            )
+            .unwrap();
+
+        assert_eq!(fast, standard);
     }
 
     #[test]

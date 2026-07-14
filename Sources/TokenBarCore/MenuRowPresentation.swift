@@ -26,6 +26,18 @@ public extension TokenBreakdown {
 }
 
 public extension RequestSummary {
+    var menuServiceTier: ActivityServiceTier {
+        let physicalTier = ActivityServiceTier.combining(
+            self.physicalRequests.map { $0.serviceTier ?? .unknown })
+        return physicalTier == .unknown
+            ? self.serviceTier ?? .unknown
+            : physicalTier
+    }
+
+    var menuServiceTierBadge: String? {
+        self.menuServiceTier.menuBadge
+    }
+
     var menuRowTitle: String {
         let prompt = self.promptPreview?.compactMenuText
         guard self.isSubagent else {
@@ -67,6 +79,14 @@ public extension RequestSummary {
 }
 
 public extension SessionSummary {
+    var menuServiceTier: ActivityServiceTier {
+        ActivityServiceTier.combining(self.requests.map(\.menuServiceTier))
+    }
+
+    var menuServiceTierBadge: String? {
+        self.menuServiceTier.menuBadge
+    }
+
     var menuCostText: String? {
         let isProviderReported = !self.requests.isEmpty
             && self.requests.allSatisfy { $0.costSource == .providerReported }
@@ -74,6 +94,16 @@ public extension SessionSummary {
             return nil
         }
         return self.costUsd.menuCostText(isEstimated: !isProviderReported)
+    }
+}
+
+private extension ActivityServiceTier {
+    var menuBadge: String? {
+        switch self {
+        case .fast: "FAST"
+        case .mixed: "MIXED"
+        case .unknown, .standard: nil
+        }
     }
 }
 

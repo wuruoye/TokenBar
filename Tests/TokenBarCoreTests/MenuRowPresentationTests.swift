@@ -57,6 +57,45 @@ struct MenuRowPresentationTests {
         #expect(turn.menuRowTitle == "Prompt")
     }
 
+    @Test("Fast badges derive from physical requests for turns and sessions")
+    func serviceTierBadges() {
+        let fast = self.makeRequest(id: "fast", serviceTier: .fast)
+        let unknown = self.makeRequest(id: "unknown")
+        let standard = self.makeRequest(id: "standard", serviceTier: .standard)
+        let fastTurn = self.makeRequest(
+            id: "fast-turn",
+            contributions: [fast, unknown])
+        let mixedTurn = self.makeRequest(
+            id: "mixed-turn",
+            contributions: [fast, standard])
+        let aggregateFallback = self.makeRequest(
+            id: "aggregate-fallback",
+            contributions: [unknown],
+            serviceTier: .fast)
+        let session = SessionSummary(
+            id: "session",
+            workspaceLabel: "TokenBar",
+            startedAtMs: fast.startedAtMs,
+            endedAtMs: standard.endedAtMs,
+            tokens: .zero,
+            costUsd: 0,
+            models: [fast.model],
+            requests: [fastTurn, mixedTurn])
+
+        #expect(fast.menuServiceTier == .fast)
+        #expect(fast.menuServiceTierBadge == "FAST")
+        #expect(fastTurn.menuServiceTier == .fast)
+        #expect(fastTurn.menuServiceTierBadge == "FAST")
+        #expect(standard.menuServiceTierBadge == nil)
+        #expect(unknown.menuServiceTier == .unknown)
+        #expect(unknown.menuServiceTierBadge == nil)
+        #expect(mixedTurn.menuServiceTier == .mixed)
+        #expect(mixedTurn.menuServiceTierBadge == "MIXED")
+        #expect(aggregateFallback.menuServiceTier == .fast)
+        #expect(session.menuServiceTier == .mixed)
+        #expect(session.menuServiceTierBadge == "MIXED")
+    }
+
     @Test("Menu costs distinguish estimated, reported, tiny, and unknown values")
     func costFormatting() {
         let estimated = self.makeRequest(costUsd: 0.42, costSource: .estimated)
@@ -87,7 +126,8 @@ struct MenuRowPresentationTests {
         costSource: ActivityCostSource = .unknown,
         prompt: String? = "Prompt",
         output: String? = nil,
-        contributions: [RequestSummary]? = nil) -> RequestSummary
+        contributions: [RequestSummary]? = nil,
+        serviceTier: ActivityServiceTier? = nil) -> RequestSummary
     {
         RequestSummary(
             id: id,
@@ -106,6 +146,7 @@ struct MenuRowPresentationTests {
             promptPreview: prompt,
             outputPreview: output,
             sessionPath: nil,
-            contributions: contributions)
+            contributions: contributions,
+            serviceTier: serviceTier)
     }
 }

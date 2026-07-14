@@ -13,6 +13,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
 
     private let fixedWidth: CGFloat
     private let titleField = NSTextField(labelWithString: "")
+    private let badgeField = NSTextField(labelWithString: "")
     private let costField = NSTextField(labelWithString: "")
     private let detailField = NSTextField(labelWithString: "")
     private let trailingField = NSTextField(labelWithString: "")
@@ -29,6 +30,18 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.configureLabel(
             self.titleField,
             font: .systemFont(ofSize: 12.5, weight: .medium))
+        self.configureLabel(
+            self.badgeField,
+            font: .systemFont(ofSize: 8.5, weight: .bold))
+        self.badgeField.alignment = .center
+        self.badgeField.lineBreakMode = .byClipping
+        self.badgeField.cell?.truncatesLastVisibleLine = false
+        self.badgeField.drawsBackground = true
+        self.badgeField.wantsLayer = true
+        self.badgeField.layer?.cornerRadius = 4
+        self.badgeField.layer?.borderWidth = 0.5
+        self.badgeField.layer?.masksToBounds = true
+        self.badgeField.isHidden = true
         self.configureLabel(
             self.costField,
             font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold))
@@ -49,6 +62,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.chevronView.imageScaling = .scaleProportionallyDown
 
         self.addSubview(self.titleField)
+        self.addSubview(self.badgeField)
         self.addSubview(self.costField)
         self.addSubview(self.detailField)
         self.addSubview(self.trailingField)
@@ -67,6 +81,11 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: self.fixedWidth, height: Self.rowHeight)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        self.updateColors()
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -110,11 +129,39 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         let titleRight = self.trailingField.stringValue.isEmpty
             ? availableRight
             : trailingX - 8
-        self.titleField.frame = NSRect(
-            x: leading,
-            y: 21,
-            width: max(0, titleRight - leading),
-            height: 17)
+        let titleAreaWidth = max(0, titleRight - leading)
+        if self.badgeField.isHidden {
+            self.titleField.frame = NSRect(
+                x: leading,
+                y: 21,
+                width: titleAreaWidth,
+                height: 17)
+            self.badgeField.frame = .zero
+        } else {
+            let badgeHorizontalPadding: CGFloat = 14
+            let measuredBadgeWidth = ceil(
+                (self.badgeField.stringValue as NSString).size(withAttributes: [
+                    .font: self.badgeField.font ?? NSFont.systemFont(ofSize: 8.5),
+                ]).width) + badgeHorizontalPadding
+            let badgeWidth = min(50, measuredBadgeWidth)
+            let badgeGap: CGFloat = 6
+            let maxTitleWidth = max(0, titleAreaWidth - badgeWidth - badgeGap)
+            let measuredTitleWidth = ceil(
+                (self.titleField.stringValue as NSString).size(withAttributes: [
+                    .font: self.titleField.font ?? NSFont.systemFont(ofSize: 12.5),
+                ]).width) + 6
+            let titleWidth = min(maxTitleWidth, measuredTitleWidth)
+            self.titleField.frame = NSRect(
+                x: leading,
+                y: 21,
+                width: titleWidth,
+                height: 17)
+            self.badgeField.frame = NSRect(
+                x: leading + titleWidth + badgeGap,
+                y: 23,
+                width: badgeWidth,
+                height: 13)
+        }
         let hasCost = !self.costField.stringValue.isEmpty
         let measuredCostWidth = hasCost
             ? ceil((self.costField.stringValue as NSString).size(withAttributes: [
@@ -180,16 +227,19 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         cost: String?,
         detail: String,
         trailing: String,
-        showsChevron: Bool)
+        showsChevron: Bool,
+        badge: String? = nil)
     {
         self.titleField.stringValue = title
+        self.badgeField.stringValue = badge ?? ""
+        self.badgeField.isHidden = badge == nil
         self.costField.stringValue = cost ?? ""
         self.costField.isHidden = cost == nil
         self.detailField.stringValue = cost == nil ? detail : "· \(detail)"
         self.trailingField.stringValue = trailing
         self.showsChevron = showsChevron
         self.chevronView.isHidden = !showsChevron
-        self.setAccessibilityLabel(title)
+        self.setAccessibilityLabel([title, badge].compactMap { $0 }.joined(separator: ", "))
         let accessibleDetail = [cost, detail, trailing].compactMap { $0 }.joined(separator: ". ")
         self.setAccessibilityHelp(accessibleDetail)
         self.needsLayout = true
@@ -213,12 +263,19 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
     private func updateColors() {
         if self.isMenuHighlighted {
             self.titleField.textColor = .selectedMenuItemTextColor
+            self.badgeField.textColor = .selectedMenuItemTextColor
+            self.badgeField.backgroundColor = .selectedMenuItemTextColor.withAlphaComponent(0.16)
+            self.badgeField.layer?.borderColor = NSColor.selectedMenuItemTextColor.withAlphaComponent(0.28).cgColor
             self.costField.textColor = .selectedMenuItemTextColor
             self.detailField.textColor = .selectedMenuItemTextColor.withAlphaComponent(0.78)
             self.trailingField.textColor = .selectedMenuItemTextColor.withAlphaComponent(0.78)
             self.chevronView.contentTintColor = .selectedMenuItemTextColor
         } else {
             self.titleField.textColor = .labelColor
+            let badgeAccent = TokenBarVisualStyle.tierBadgeAccentNSColor
+            self.badgeField.textColor = badgeAccent
+            self.badgeField.backgroundColor = badgeAccent.withAlphaComponent(0.13)
+            self.badgeField.layer?.borderColor = badgeAccent.withAlphaComponent(0.26).cgColor
             self.costField.textColor = TokenBarVisualStyle.costAccentNSColor
             self.detailField.textColor = .secondaryLabelColor
             self.trailingField.textColor = .secondaryLabelColor

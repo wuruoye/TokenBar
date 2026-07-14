@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::{Days, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::usage::{normalize_model_for_grouping, CostSource, UnifiedMessage};
+use crate::usage::{normalize_model_for_grouping, CostSource, ServiceTier, UnifiedMessage};
 
 pub mod codex;
 pub mod pricing;
@@ -84,6 +84,26 @@ impl From<CostSource> for ActivityCostSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityServiceTier {
+    #[default]
+    Unknown,
+    Standard,
+    Fast,
+    Mixed,
+}
+
+impl From<ServiceTier> for ActivityServiceTier {
+    fn from(tier: ServiceTier) -> Self {
+        match tier {
+            ServiceTier::Unknown => Self::Unknown,
+            ServiceTier::Standard => Self::Standard,
+            ServiceTier::Fast => Self::Fast,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestSummary {
@@ -100,6 +120,8 @@ pub struct RequestSummary {
     pub tokens: TokenBreakdown,
     pub cost_usd: f64,
     pub cost_source: ActivityCostSource,
+    #[serde(default)]
+    pub service_tier: ActivityServiceTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_path: Option<String>,
     pub prompt_preview: Option<String>,
@@ -204,6 +226,7 @@ struct RequestRow {
     tokens: TokenBreakdown,
     cost: f64,
     cost_source: ActivityCostSource,
+    service_tier: ActivityServiceTier,
     duration_ms: Option<i64>,
     request_start_timestamp: Option<i64>,
     request_end_timestamp: i64,
@@ -686,6 +709,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         tokens,
         cost,
         cost_source: message.cost_source.into(),
+        service_tier: message.service_tier.into(),
         duration_ms: message.duration_ms,
         request_start_timestamp,
         request_end_timestamp: message.timestamp,
@@ -810,6 +834,7 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
     target.tokens.add_assign(&row.tokens);
     target.cost = add_cost(target.cost, row.cost);
     target.cost_source = merge_cost_source(target.cost_source, row.cost_source);
+    target.service_tier = merge_service_tier(target.service_tier, row.service_tier);
     target.duration_ms = match (target.duration_ms, row.duration_ms) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(left), None) => Some(left),
@@ -1027,6 +1052,7 @@ fn request_summary_with_id(
         tokens: row.tokens,
         cost_usd: row.cost,
         cost_source: row.cost_source,
+        service_tier: row.service_tier,
         session_path: row.session_path,
         prompt_preview: row.prompt_preview,
         output_preview: row.output_preview,
@@ -1082,6 +1108,20 @@ fn merge_cost_source(left: ActivityCostSource, right: ActivityCostSource) -> Act
     match (left, right) {
         (ActivityCostSource::Unknown, value) | (value, ActivityCostSource::Unknown) => value,
         _ => ActivityCostSource::Unknown,
+    }
+}
+
+fn merge_service_tier(
+    left: ActivityServiceTier,
+    right: ActivityServiceTier,
+) -> ActivityServiceTier {
+    match (left, right) {
+        (ActivityServiceTier::Mixed, _) | (_, ActivityServiceTier::Mixed) => {
+            ActivityServiceTier::Mixed
+        }
+        (ActivityServiceTier::Unknown, tier) | (tier, ActivityServiceTier::Unknown) => tier,
+        (left, right) if left == right => left,
+        _ => ActivityServiceTier::Mixed,
     }
 }
 
@@ -1154,6 +1194,7 @@ mod tests {
             },
             cost: 0.25,
             cost_source: CostSource::Estimated,
+            service_tier: ServiceTier::Unknown,
             duration_ms: Some(2_000),
             message_count: 1,
             agent: None,
@@ -1261,6 +1302,50 @@ mod tests {
         assert_eq!(child.session_id, "root-session");
         assert_eq!(child.agent.as_deref(), Some("Faraday"));
         assert_eq!(child.session_path.as_deref(), Some("/tmp/child-a.jsonl"));
+    }
+
+    #[test]
+    fn aggregates_fast_and_standard_physical_requests_as_a_mixed_turn() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut root = message(
+            "2026-07-13",
+            100_000,
+            "root-session",
+            "/tmp/root-session.jsonl",
+            10,
+            1,
+        );
+        root.content_preview = Some("Prompt".to_string());
+        root.is_turn_start = true;
+        root.service_tier = ServiceTier::Fast;
+
+        let mut child = message(
+            "2026-07-13",
+            110_000,
+            "root-session",
+            "/tmp/child-session.jsonl",
+            20,
+            2,
+        );
+        child.agent = Some("worker".to_string());
+        child.is_turn_start = true;
+        child.service_tier = ServiceTier::Standard;
+
+        let snapshot =
+            build_snapshot(vec![root, child], today, 120_000, "UTC".to_string(), 1).unwrap();
+        let turn = &snapshot.sessions[0].requests[0];
+
+        assert_eq!(turn.service_tier, ActivityServiceTier::Mixed);
+        assert_eq!(
+            turn.contributions[0].service_tier,
+            ActivityServiceTier::Fast
+        );
+        assert_eq!(
+            turn.contributions[1].service_tier,
+            ActivityServiceTier::Standard
+        );
+        let value = serde_json::to_value(turn).unwrap();
+        assert_eq!(value["serviceTier"], "mixed");
     }
 
     #[test]
@@ -1807,6 +1892,39 @@ mod tests {
         assert_eq!(codex.tokens.output, 20);
         assert_eq!(codex.tokens.reasoning, 10);
         assert!((codex.cost - 0.000_21).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reasoning_normalization_preserves_fast_pricing() {
+        let pricing = CodexPricing::bundled();
+        let mut codex = message("2026-07-13", 1_000, "codex", "/tmp/codex.jsonl", 100, 30);
+        codex.model_id = "gpt-5.6-sol".to_string();
+        codex.service_tier = ServiceTier::Fast;
+        codex.tokens.reasoning = 10;
+        codex.cost_source = CostSource::Estimated;
+        codex.cost = pricing
+            .calculate_cost_with_service_tier(
+                &codex.model_id,
+                Some(&codex.provider_id),
+                &codex.tokens,
+                codex.service_tier,
+            )
+            .unwrap();
+
+        normalize_codex_reasoning_usage(std::slice::from_mut(&mut codex), |message| {
+            pricing.calculate_cost_with_service_tier(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+                message.service_tier,
+            )
+        });
+
+        let standard = pricing
+            .calculate_cost_with_provider(&codex.model_id, Some(&codex.provider_id), &codex.tokens)
+            .unwrap();
+        assert_eq!(codex.tokens.output, 20);
+        assert!((codex.cost - standard * 2.0).abs() < 1e-12);
     }
 
     #[test]

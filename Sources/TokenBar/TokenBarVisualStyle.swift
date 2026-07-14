@@ -12,4 +12,11 @@ enum TokenBarVisualStyle {
     static var costAccentColor: Color {
         Color(nsColor: self.costAccentNSColor)
     }
+
+    static let tierBadgeAccentNSColor = NSColor(name: "TokenBarTierBadgeAccent") { appearance in
+        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return isDark
+            ? NSColor(srgbRed: 0.72, green: 0.66, blue: 1.00, alpha: 1)
+            : NSColor(srgbRed: 0.40, green: 0.30, blue: 0.86, alpha: 1)
+    }
 }

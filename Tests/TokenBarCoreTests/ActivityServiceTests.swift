@@ -50,7 +50,9 @@ struct ActivityServiceTests {
         #expect(snapshot.sessions.first?.requests.first?.model == "gpt-test")
         #expect(snapshot.sessions.first?.requests.first?.promptPreview == "private prompt")
         #expect(snapshot.sessions.first?.requests.first?.sessionPath == "/tmp/private-session.jsonl")
+        #expect(snapshot.sessions.first?.requests.first?.serviceTier == .fast)
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.physicalSessionId == "physical-1")
+        #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.serviceTier == .fast)
         #expect(snapshot.days.first?.models.first?.model == "gpt-test")
     }
 
@@ -141,6 +143,7 @@ struct ActivityServiceTests {
         let request = try JSONDecoder().decode(RequestSummary.self, from: data)
 
         #expect(request.contributions == nil)
+        #expect(request.serviceTier == nil)
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
     }
 
@@ -190,6 +193,7 @@ struct ActivityServiceTests {
               "promptPreview": "private prompt",
               "outputPreview": "private output",
               "sessionPath": "/tmp/private-session.jsonl",
+              "serviceTier": "fast",
               "contributions": [{
                 "id": "physical-request-1",
                 "sessionId": "session-1",
@@ -206,7 +210,8 @@ struct ActivityServiceTests {
                 "costSource": "estimated",
                 "promptPreview": "private prompt",
                 "outputPreview": "private output",
-                "sessionPath": "/tmp/private-session.jsonl"
+                "sessionPath": "/tmp/private-session.jsonl",
+                "serviceTier": "fast"
               }]
             }]
           }],

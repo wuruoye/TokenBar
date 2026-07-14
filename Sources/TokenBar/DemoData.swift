@@ -69,6 +69,7 @@ struct DemoActivityProvider: ActivityProviding {
                 let requestPrompt = requestIndex == 0
                     ? prompt
                     : ["Continue with the implementation", "Run focused validation"][requestIndex - 1]
+                let serviceTier = sessionIndex.isMultiple(of: 3) ? "fast" : "standard"
                 var request: [String: Any] = [
                     "id": "request-\(sessionIndex)-\(requestIndex)",
                     "sessionId": "session-\(sessionIndex)",
@@ -83,12 +84,17 @@ struct DemoActivityProvider: ActivityProviding {
                     "tokens": tokens.object,
                     "costUsd": Double(tokens.total) / 1_000_000 * 4.2,
                     "costSource": "estimated",
+                    "serviceTier": serviceTier,
                     "promptPreview": requestPrompt,
                     "outputPreview": "Completed the requested changes and verified the relevant behavior.",
                 ]
                 if requestIndex == 0, sessionIndex.isMultiple(of: 2) {
                     let mainTokens = tokens.scaled(numerator: 3, denominator: 4)
                     let childTokens = tokens.subtracting(mainTokens)
+                    let childServiceTier = sessionIndex == 0 ? "standard" : serviceTier
+                    if childServiceTier != serviceTier {
+                        request["serviceTier"] = "mixed"
+                    }
                     request["contributions"] = [
                         [
                             "id": "main-\(sessionIndex)-\(requestIndex)",
@@ -104,6 +110,7 @@ struct DemoActivityProvider: ActivityProviding {
                             "tokens": mainTokens.object,
                             "costUsd": Double(mainTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
+                            "serviceTier": serviceTier,
                             "promptPreview": requestPrompt,
                             "outputPreview": "Coordinated the implementation and integrated the result.",
                         ],
@@ -121,6 +128,7 @@ struct DemoActivityProvider: ActivityProviding {
                             "tokens": childTokens.object,
                             "costUsd": Double(childTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
+                            "serviceTier": childServiceTier,
                             "promptPreview": "Review the implementation for edge cases.",
                             "outputPreview": "Verified the nested request grouping and copy ranges.",
                         ],
@@ -339,7 +347,8 @@ enum DemoPreviewRenderer {
             cost: session.menuCostText,
             detail: session.tokens.sessionMenuDetail,
             trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
-            showsChevron: true)
+            showsChevron: true,
+            badge: session.menuServiceTierBadge)
 
         let requestRow = TokenMenuRowView(width: width)
         requestRow.configure(
@@ -347,7 +356,8 @@ enum DemoPreviewRenderer {
             cost: request.menuCostText,
             detail: request.tokens.requestMenuDetail,
             trailing: "\(request.startedAt.demoClockText) · \(request.menuDurationText)",
-            showsChevron: true)
+            showsChevron: true,
+            badge: request.menuServiceTierBadge)
 
         var rows = [sessionRow, requestRow]
         rows.append(contentsOf: physicalRequests.map { physicalRequest in
@@ -357,7 +367,8 @@ enum DemoPreviewRenderer {
                 cost: physicalRequest.menuCostText,
                 detail: physicalRequest.tokens.requestMenuDetail,
                 trailing: "\(physicalRequest.startedAt.demoClockText) · \(physicalRequest.menuDurationText)",
-                showsChevron: true)
+                showsChevron: true,
+                badge: physicalRequest.menuServiceTierBadge)
             return row
         })
         for (index, row) in rows.enumerated() {
