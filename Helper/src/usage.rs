@@ -22,6 +22,62 @@ impl TokenBreakdown {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenCostBreakdown {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub reasoning: f64,
+}
+
+impl TokenCostBreakdown {
+    pub fn total(&self) -> f64 {
+        self.input + self.output + self.cache_read + self.cache_write + self.reasoning
+    }
+
+    pub fn scaled(self, multiplier: f64) -> Option<Self> {
+        let scaled = Self {
+            input: self.input * multiplier,
+            output: self.output * multiplier,
+            cache_read: self.cache_read * multiplier,
+            cache_write: self.cache_write * multiplier,
+            reasoning: self.reasoning * multiplier,
+        };
+        scaled.is_valid().then_some(scaled)
+    }
+
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input = add_cost(self.input, other.input);
+        self.output = add_cost(self.output, other.output);
+        self.cache_read = add_cost(self.cache_read, other.cache_read);
+        self.cache_write = add_cost(self.cache_write, other.cache_write);
+        self.reasoning = add_cost(self.reasoning, other.reasoning);
+    }
+
+    fn is_valid(&self) -> bool {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+        ]
+        .into_iter()
+        .all(|cost| cost.is_finite() && cost >= 0.0)
+    }
+}
+
+fn add_cost(left: f64, right: f64) -> f64 {
+    let sum = left + right;
+    if sum.is_finite() {
+        sum
+    } else {
+        f64::MAX
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CostSource {
@@ -54,6 +110,8 @@ pub struct UnifiedMessage {
     pub date: String,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    #[serde(default)]
+    pub token_costs: Option<TokenCostBreakdown>,
     #[serde(default)]
     pub cost_source: CostSource,
     #[serde(default)]
@@ -100,6 +158,7 @@ impl UnifiedMessage {
             date: timestamp_to_date(timestamp),
             tokens,
             cost,
+            token_costs: None,
             cost_source: CostSource::Unknown,
             service_tier: ServiceTier::Unknown,
             duration_ms: None,

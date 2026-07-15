@@ -149,7 +149,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func updateStatusButton() {
         guard let button = self.statusItem.button else { return }
-        let today = self.model.activitySnapshot?.today.tokens.total.compactCount ?? "—"
+        let today = self.model.activitySnapshot?.today.tokens.total.statusBarCompactCount ?? "—"
         let weekly = self.model.quotaSnapshot?.weekly.map {
             "\(Int($0.remainingPercent.clamped(to: 0 ... 100).rounded()))%"
         } ?? "—"
@@ -736,9 +736,8 @@ enum StatusLabelRenderer {
         let bottomLabel = "W" as NSString
         let topValue = today as NSString
         let bottomValue = weekly as NSString
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .semibold)
         let baseAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .bold),
             .foregroundColor: NSColor.black,
         ]
 
@@ -748,18 +747,18 @@ enum StatusLabelRenderer {
         let valueWidth = ceil(max(
             topValue.size(withAttributes: baseAttributes).width,
             bottomValue.size(withAttributes: baseAttributes).width))
-        let columnGap: CGFloat = 2
+        let columnGap: CGFloat = 5
         let contentWidth = labelWidth + columnGap + valueWidth
         let size = NSSize(width: max(30, contentWidth + 4), height: 20)
         let contentX = floor((size.width - contentWidth) / 2)
 
         let labelParagraph = NSMutableParagraphStyle()
-        labelParagraph.alignment = .left
+        labelParagraph.alignment = .center
         var labelAttributes = baseAttributes
         labelAttributes[.paragraphStyle] = labelParagraph
 
         let valueParagraph = NSMutableParagraphStyle()
-        valueParagraph.alignment = .right
+        valueParagraph.alignment = .left
         var valueAttributes = baseAttributes
         valueAttributes[.paragraphStyle] = valueParagraph
 

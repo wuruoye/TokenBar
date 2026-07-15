@@ -3,6 +3,14 @@ import Foundation
 import Testing
 
 struct MenuRowPresentationTests {
+    @Test("Status bar token counts use whole compact units")
+    func statusBarTokenCounts() {
+        #expect(Int64(999).statusBarCompactCount == "999")
+        #expect(Int64(1_499).statusBarCompactCount == "1K")
+        #expect(Int64(358_900_000).statusBarCompactCount == "359M")
+        #expect(Int64(1_250_000_000).statusBarCompactCount == "1B")
+    }
+
     @Test("Session and request details keep only total tokens and Tokscale cache reuse")
     func tokenDetails() {
         let tokens = TokenBreakdown(

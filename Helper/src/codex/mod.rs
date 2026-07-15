@@ -68,14 +68,16 @@ pub fn parse_local_codex_messages(
 
 fn apply_pricing(message: &mut UnifiedMessage, pricing: &CodexPricing) {
     message.cost = 0.0;
+    message.token_costs = None;
     message.cost_source = CostSource::Unknown;
-    if let Some(cost) = pricing.calculate_cost_with_service_tier(
+    if let Some(token_costs) = pricing.calculate_token_costs_with_service_tier(
         &message.model_id,
         Some(&message.provider_id),
         &message.tokens,
         message.service_tier,
     ) {
-        message.cost = cost;
+        message.cost = token_costs.total();
+        message.token_costs = Some(token_costs);
         message.cost_source = CostSource::Estimated;
     }
 }
@@ -442,6 +444,7 @@ mod tests {
         .unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages.iter().all(|message| message.session_id == "root"));
+        assert!(messages.iter().all(|message| message.token_costs.is_some()));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -531,6 +534,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(messages[0].token_costs, None);
         assert_eq!(messages[0].cost_source, CostSource::Unknown);
         fs::remove_dir_all(home).unwrap();
     }

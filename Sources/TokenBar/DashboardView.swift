@@ -474,15 +474,28 @@ private struct TodaySummarySection: View {
                 TokenStackedBar(tokens: totals.tokens, accentColor: self.accentColor)
 
                 HStack(spacing: 16) {
-                    TokenLegend(label: "Input", value: totals.tokens.input, color: self.accentColor)
-                    TokenLegend(label: "Output", value: totals.tokens.output, color: TokenBarPalette.blue)
+                    TokenLegend(
+                        label: "Input",
+                        value: totals.tokens.input,
+                        costUsd: totals.tokenCosts?.input,
+                        color: self.accentColor)
+                    TokenLegend(
+                        label: "Output",
+                        value: totals.tokens.output,
+                        costUsd: totals.tokenCosts?.output,
+                        color: TokenBarPalette.blue)
                 }
                 HStack(spacing: 16) {
                     TokenLegend(
                         label: "Cache",
                         value: totals.tokens.cacheRead + totals.tokens.cacheWrite,
+                        costUsd: totals.tokenCosts?.cache,
                         color: TokenBarPalette.mint)
-                    TokenLegend(label: "Reasoning", value: totals.tokens.reasoning, color: TokenBarPalette.orange)
+                    TokenLegend(
+                        label: "Reasoning",
+                        value: totals.tokens.reasoning,
+                        costUsd: totals.tokenCosts?.reasoning,
+                        color: TokenBarPalette.orange)
                 }
 
                 HStack {
@@ -560,6 +573,7 @@ private struct TokenComponent: Identifiable {
 private struct TokenLegend: View {
     let label: String
     let value: Int64
+    let costUsd: Double?
     let color: Color
 
     var body: some View {
@@ -572,9 +586,24 @@ private struct TokenLegend: View {
             Spacer(minLength: 4)
             Text(self.value.compactCount)
                 .monospacedDigit()
+            if let costText = self.costText {
+                Text(costText)
+                    .fontWeight(.regular)
+                    .foregroundStyle(TokenBarVisualStyle.costAccentColor.opacity(0.76))
+                    .monospacedDigit()
+            } else {
+                Text("—")
+                    .foregroundStyle(.tertiary)
+            }
         }
         .font(.system(size: 10.5))
         .frame(maxWidth: .infinity)
+        .lineLimit(1)
+    }
+
+    private var costText: String? {
+        guard let costUsd = self.costUsd, costUsd.isFinite, costUsd >= 0 else { return nil }
+        return costUsd.tokenComponentCostText
     }
 }
 
@@ -755,6 +784,10 @@ extension Double {
 
     func costText(tokenTotal: Int64) -> String {
         tokenTotal > 0 && self <= 0 ? "—" : self.usdText
+    }
+
+    fileprivate var tokenComponentCostText: String {
+        self > 0 && self < 0.01 ? "<$0.01" : self.usdText
     }
 }
 

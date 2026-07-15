@@ -26,6 +26,12 @@ enum TestFixtures {
         requestContributions: [RequestSummary]? = nil) -> ActivitySnapshot
     {
         let tokens = TokenBreakdown(input: 10, output: 5, cacheRead: 3, cacheWrite: 2, reasoning: 1)
+        let tokenCosts = TokenCostBreakdown(
+            input: 0.05,
+            output: 0.10,
+            cacheRead: 0.03,
+            cacheWrite: 0.02,
+            reasoning: 0.05)
         let request = RequestSummary(
             id: "request-1",
             sessionId: "session-1",
@@ -55,10 +61,15 @@ enum TestFixtures {
             requests: [request],
             title: sessionTitle)
         return ActivitySnapshot(
-            schemaVersion: 2,
+            schemaVersion: 3,
             generatedAtMs: generatedAtMs,
             timezone: "UTC",
-            today: ActivityTotals(tokens: tokens, costUsd: 0.25, requestCount: 1, sessionCount: 1),
+            today: ActivityTotals(
+                tokens: tokens,
+                costUsd: 0.25,
+                requestCount: 1,
+                sessionCount: 1,
+                tokenCosts: tokenCosts),
             sessions: [session],
             days: [DailySummary(
                 date: "2024-07-03",

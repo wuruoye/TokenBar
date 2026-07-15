@@ -1,4 +1,4 @@
-use crate::usage::{ServiceTier, TokenBreakdown};
+use crate::usage::{ServiceTier, TokenBreakdown, TokenCostBreakdown};
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
@@ -58,24 +58,36 @@ impl CodexPricing {
     pub fn calculate_cost_with_provider(
         &self,
         model_id: &str,
-        _provider_id: Option<&str>,
+        provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> Option<f64> {
+        self.calculate_token_costs_with_provider(model_id, provider_id, usage)
+            .map(|costs| costs.total())
+    }
+
+    pub fn calculate_token_costs_with_provider(
+        &self,
+        model_id: &str,
+        _provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<TokenCostBreakdown> {
         let rate = rate_for_model(model_id)?;
         if usage.cache_write > 0 && rate.cache_write_per_million.is_none() {
             return None;
         }
 
-        let input_cost = usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION;
-        let cached_cost =
-            usage.cache_read.max(0) as f64 * rate.cached_input_per_million / TOKENS_PER_MILLION;
-        let cache_write_cost = usage.cache_write.max(0) as f64
-            * rate.cache_write_per_million.unwrap_or_default()
-            / TOKENS_PER_MILLION;
-        let output_tokens = usage.output.max(0).saturating_add(usage.reasoning.max(0));
-        let output_cost = output_tokens as f64 * rate.output_per_million / TOKENS_PER_MILLION;
-        let total = input_cost + cached_cost + cache_write_cost + output_cost;
-        total.is_finite().then_some(total)
+        let costs = TokenCostBreakdown {
+            input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
+            output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
+                / TOKENS_PER_MILLION,
+            cache_write: usage.cache_write.max(0) as f64
+                * rate.cache_write_per_million.unwrap_or_default()
+                / TOKENS_PER_MILLION,
+            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                / TOKENS_PER_MILLION,
+        };
+        costs.total().is_finite().then_some(costs)
     }
 
     /// Applies Codex Fast/Priority pricing to the standard API-equivalent
@@ -89,14 +101,29 @@ impl CodexPricing {
         usage: &TokenBreakdown,
         service_tier: ServiceTier,
     ) -> Option<f64> {
-        let base = self.calculate_cost_with_provider(model_id, provider_id, usage)?;
+        self.calculate_token_costs_with_service_tier(
+            model_id,
+            provider_id,
+            usage,
+            service_tier,
+        )
+        .map(|costs| costs.total())
+    }
+
+    pub fn calculate_token_costs_with_service_tier(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+        service_tier: ServiceTier,
+    ) -> Option<TokenCostBreakdown> {
+        let base = self.calculate_token_costs_with_provider(model_id, provider_id, usage)?;
         let multiplier = if service_tier == ServiceTier::Fast {
             fast_cost_multiplier(model_id).unwrap_or(1.0)
         } else {
             1.0
         };
-        let total = base * multiplier;
-        total.is_finite().then_some(total)
+        base.scaled(multiplier)
     }
 }
 
@@ -275,6 +302,16 @@ mod tests {
             .calculate_cost_with_provider("gpt-5.4-mini", Some("openai"), &usage)
             .unwrap();
         assert!((cost - 1.725).abs() < 1e-9);
+
+        let costs = CodexPricing::bundled()
+            .calculate_token_costs_with_provider("gpt-5.4-mini", Some("openai"), &usage)
+            .unwrap();
+        assert!((costs.input - 0.75).abs() < 1e-9);
+        assert!((costs.output - 0.45).abs() < 1e-9);
+        assert!((costs.cache_read - 0.075).abs() < 1e-9);
+        assert_eq!(costs.cache_write, 0.0);
+        assert!((costs.reasoning - 0.45).abs() < 1e-9);
+        assert!((costs.total() - cost).abs() < 1e-9);
     }
 
     #[test]
@@ -319,6 +356,16 @@ mod tests {
                 .calculate_cost_with_service_tier(model, Some("openai"), &usage, ServiceTier::Fast)
                 .unwrap();
             assert!((fast - standard * multiplier).abs() < 1e-9, "{model}");
+
+            let fast_components = pricing
+                .calculate_token_costs_with_service_tier(
+                    model,
+                    Some("openai"),
+                    &usage,
+                    ServiceTier::Fast,
+                )
+                .unwrap();
+            assert!((fast_components.total() - fast).abs() < 1e-9, "{model}");
         }
     }
 

@@ -204,12 +204,13 @@ struct DemoActivityProvider: ActivityProviding {
         }
 
         var object: [String: Any] = [
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [
                 "tokens": today.object,
                 "costUsd": Double(today.total) / 1_000_000 * 4.2,
+                "tokenCosts": today.costObject,
                 "requestCount": requestCount,
                 "sessionCount": sessions.count,
             ],
@@ -222,6 +223,7 @@ struct DemoActivityProvider: ActivityProviding {
                 "totals": [
                     "tokens": weekly.object,
                     "costUsd": Double(weekly.total) / 1_000_000 * 4.2,
+                    "tokenCosts": weekly.costObject,
                     "requestCount": weeklyRequestCount,
                     "sessionCount": weeklySessionCount,
                 ],
@@ -269,6 +271,17 @@ private struct DemoTokenCounter {
             "cacheRead": self.cacheRead,
             "cacheWrite": self.cacheWrite,
             "reasoning": self.reasoning,
+        ]
+    }
+
+    var costObject: [String: Double] {
+        let rate = 4.2 / 1_000_000
+        return [
+            "input": Double(self.input) * rate,
+            "output": Double(self.output) * rate,
+            "cacheRead": Double(self.cacheRead) * rate,
+            "cacheWrite": Double(self.cacheWrite) * rate,
+            "reasoning": Double(self.reasoning) * rate,
         ]
     }
 
@@ -447,7 +460,7 @@ enum DemoPreviewRenderer {
     }
 
     static func renderStatus(path: String) throws {
-        let statusImage = StatusLabelRenderer.image(today: "128K", weekly: "69%")
+        let statusImage = StatusLabelRenderer.image(today: "359M", weekly: "68%")
         let padding: CGFloat = 4
         let canvas = DemoRowPreviewCanvas(frame: NSRect(
             x: 0,

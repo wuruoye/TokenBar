@@ -28,7 +28,7 @@ TokenBar is a native, standalone macOS menu bar app focused on Codex. It combine
 - See today's token total and remaining weekly quota directly in the menu bar.
 - Track weekly and available 5-hour quota windows, their reset times, and extra reset credits. The 5-hour row stays hidden when Codex does not return that window.
 - Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
-- Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns.
+- Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - Browse recent sessions using Codex-generated titles when available.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.

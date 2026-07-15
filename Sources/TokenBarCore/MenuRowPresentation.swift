@@ -1,5 +1,31 @@
 import Foundation
 
+public extension Int64 {
+    var statusBarCompactCount: String {
+        let magnitude = abs(Double(self))
+        let divisor: Double
+        let suffix: String
+        switch magnitude {
+        case 1_000_000_000...:
+            divisor = 1_000_000_000
+            suffix = "B"
+        case 1_000_000...:
+            divisor = 1_000_000
+            suffix = "M"
+        case 1_000...:
+            divisor = 1_000
+            suffix = "K"
+        default:
+            return self.formatted()
+        }
+        let value = String(
+            format: "%.0f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            Double(self) / divisor)
+        return "\(value)\(suffix)"
+    }
+}
+
 public extension TokenBreakdown {
     var sessionMenuDetail: String {
         self.compactMenuDetail

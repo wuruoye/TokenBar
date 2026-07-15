@@ -31,6 +31,30 @@ public struct TokenBreakdown: Codable, Equatable, Sendable {
         reasoning: 0)
 }
 
+public struct TokenCostBreakdown: Codable, Equatable, Sendable {
+    public let input: Double
+    public let output: Double
+    public let cacheRead: Double
+    public let cacheWrite: Double
+    public let reasoning: Double
+
+    public init(input: Double, output: Double, cacheRead: Double, cacheWrite: Double, reasoning: Double) {
+        self.input = input
+        self.output = output
+        self.cacheRead = cacheRead
+        self.cacheWrite = cacheWrite
+        self.reasoning = reasoning
+    }
+
+    public var cache: Double {
+        self.cacheRead + self.cacheWrite
+    }
+
+    public var total: Double {
+        self.input + self.output + self.cacheRead + self.cacheWrite + self.reasoning
+    }
+}
+
 public struct QuotaWindowSnapshot: Codable, Equatable, Sendable {
     public let usedPercent: Double
     public let windowMinutes: Int?
@@ -275,8 +299,23 @@ public struct SessionMenuProjection: Equatable, Sendable {
 public struct ActivityTotals: Codable, Equatable, Sendable {
     public let tokens: TokenBreakdown
     public let costUsd: Double
+    public let tokenCosts: TokenCostBreakdown?
     public let requestCount: Int
     public let sessionCount: Int
+
+    public init(
+        tokens: TokenBreakdown,
+        costUsd: Double,
+        requestCount: Int,
+        sessionCount: Int,
+        tokenCosts: TokenCostBreakdown? = nil)
+    {
+        self.tokens = tokens
+        self.costUsd = costUsd
+        self.tokenCosts = tokenCosts
+        self.requestCount = requestCount
+        self.sessionCount = sessionCount
+    }
 
     public static let zero = ActivityTotals(
         tokens: .zero,

@@ -6,13 +6,15 @@ use std::path::Path;
 use chrono::{Days, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::usage::{normalize_model_for_grouping, CostSource, ServiceTier, UnifiedMessage};
+use crate::usage::{
+    normalize_model_for_grouping, CostSource, ServiceTier, TokenCostBreakdown, UnifiedMessage,
+};
 
 pub mod codex;
 pub mod pricing;
 pub mod usage;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
     "<environment_context>",
@@ -150,6 +152,8 @@ pub struct SessionSummary {
 pub struct ActivityTotals {
     pub tokens: TokenBreakdown,
     pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_costs: Option<TokenCostBreakdown>,
     pub request_count: usize,
     pub session_count: usize,
 }
@@ -225,6 +229,7 @@ struct RequestRow {
     output_preview: Option<String>,
     tokens: TokenBreakdown,
     cost: f64,
+    token_costs: Option<TokenCostBreakdown>,
     cost_source: ActivityCostSource,
     service_tier: ActivityServiceTier,
     duration_ms: Option<i64>,
@@ -262,9 +267,35 @@ impl RequestRow {
 struct DailyAccumulator {
     tokens: TokenBreakdown,
     cost: f64,
+    token_costs: OptionalTokenCostAccumulator,
     turn_ids: HashSet<String>,
     session_ids: HashSet<String>,
     models: BTreeMap<(String, String), DailyModelAccumulator>,
+}
+
+#[derive(Default)]
+struct OptionalTokenCostAccumulator {
+    costs: TokenCostBreakdown,
+    saw_request: bool,
+    is_complete: bool,
+}
+
+impl OptionalTokenCostAccumulator {
+    fn add(&mut self, costs: Option<&TokenCostBreakdown>) {
+        if !self.saw_request {
+            self.saw_request = true;
+            self.is_complete = true;
+        }
+        if let Some(costs) = costs {
+            self.costs.add_assign(costs);
+        } else {
+            self.is_complete = false;
+        }
+    }
+
+    fn complete_costs(&self) -> Option<TokenCostBreakdown> {
+        (self.saw_request && self.is_complete).then_some(self.costs)
+    }
 }
 
 #[derive(Default)]
@@ -379,7 +410,7 @@ fn codex_message_is_human_turn(message: &str) -> bool {
 /// untouched while preventing TokenBar from counting reasoning twice.
 pub fn normalize_codex_reasoning_usage(
     messages: &mut [UnifiedMessage],
-    mut recalculate_estimated_cost: impl FnMut(&UnifiedMessage) -> Option<f64>,
+    mut recalculate_estimated_cost: impl FnMut(&UnifiedMessage) -> Option<TokenCostBreakdown>,
 ) {
     for message in messages {
         if message.client != "codex" {
@@ -403,15 +434,17 @@ pub fn normalize_codex_reasoning_usage(
             continue;
         }
 
-        let Some(cost) = recalculate_estimated_cost(message).filter(|cost| {
-            cost.is_finite() && *cost >= 0.0 && (*cost > 0.0 || message.cost == 0.0)
+        let Some(token_costs) = recalculate_estimated_cost(message).filter(|costs| {
+            let total = costs.total();
+            total.is_finite() && total >= 0.0 && (total > 0.0 || message.cost == 0.0)
         }) else {
             // Keep the previous cost and token contract together if the same
             // cached pricing dataset cannot reproduce an estimated cost.
             message.tokens.output = original_output;
             continue;
         };
-        message.cost = cost;
+        message.cost = token_costs.total();
+        message.token_costs = Some(token_costs);
     }
 }
 
@@ -573,6 +606,7 @@ pub fn build_snapshot_with_session_titles(
             let entry = daily.entry(request.date).or_default();
             entry.tokens.add_assign(&request.tokens);
             entry.cost = add_cost(entry.cost, request.cost);
+            entry.token_costs.add(request.token_costs.as_ref());
             entry.turn_ids.insert(turn.id.clone());
             entry.session_ids.insert(request.session_id.clone());
 
@@ -592,6 +626,7 @@ pub fn build_snapshot_with_session_titles(
         .map(|entry| ActivityTotals {
             tokens: entry.tokens.clone(),
             cost_usd: entry.cost,
+            token_costs: entry.token_costs.complete_costs(),
             request_count: entry.turn_ids.len(),
             session_count: entry.session_ids.len(),
         })
@@ -654,6 +689,7 @@ pub fn build_snapshot_with_session_titles(
 fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> ActivityTotals {
     let mut tokens = TokenBreakdown::default();
     let mut cost_usd = 0.0;
+    let mut token_costs = OptionalTokenCostAccumulator::default();
     let mut session_ids = HashSet::new();
     let mut turn_count = 0_usize;
     for turn in turns {
@@ -661,6 +697,7 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
         for request in turn.contributions.iter().filter(|request| include(request)) {
             tokens.add_assign(&request.tokens);
             cost_usd = add_cost(cost_usd, request.cost);
+            token_costs.add(request.token_costs.as_ref());
             session_ids.insert(request.session_id.clone());
             included_turn = true;
         }
@@ -671,6 +708,7 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
     ActivityTotals {
         tokens,
         cost_usd,
+        token_costs: token_costs.complete_costs(),
         request_count: turn_count,
         session_count: session_ids.len(),
     }
@@ -708,6 +746,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         output_preview: message.output_preview,
         tokens,
         cost,
+        token_costs: message.token_costs,
         cost_source: message.cost_source.into(),
         service_tier: message.service_tier.into(),
         duration_ms: message.duration_ms,
@@ -833,6 +872,7 @@ fn push_turn(
 fn merge_request(target: &mut RequestRow, row: RequestRow) {
     target.tokens.add_assign(&row.tokens);
     target.cost = add_cost(target.cost, row.cost);
+    target.token_costs = merge_token_costs(target.token_costs, row.token_costs);
     target.cost_source = merge_cost_source(target.cost_source, row.cost_source);
     target.service_tier = merge_service_tier(target.service_tier, row.service_tier);
     target.duration_ms = match (target.duration_ms, row.duration_ms) {
@@ -867,6 +907,19 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
     }
     if target.session_path.is_none() {
         target.session_path = row.session_path;
+    }
+}
+
+fn merge_token_costs(
+    left: Option<TokenCostBreakdown>,
+    right: Option<TokenCostBreakdown>,
+) -> Option<TokenCostBreakdown> {
+    match (left, right) {
+        (Some(mut left), Some(right)) => {
+            left.add_assign(&right);
+            Some(left)
+        }
+        _ => None,
     }
 }
 
@@ -1193,6 +1246,7 @@ mod tests {
                 reasoning: 0,
             },
             cost: 0.25,
+            token_costs: None,
             cost_source: CostSource::Estimated,
             service_tier: ServiceTier::Unknown,
             duration_ms: Some(2_000),
@@ -1859,7 +1913,13 @@ mod tests {
         normalize_codex_reasoning_usage(&mut messages, |message| {
             assert_eq!(message.tokens.output, 20);
             assert_eq!(message.tokens.reasoning, 10);
-            Some(1.25)
+            Some(TokenCostBreakdown {
+                input: 0.25,
+                output: 0.5,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                reasoning: 0.5,
+            })
         });
 
         let snapshot = build_snapshot(messages, today, 2_000, "UTC".to_string(), 1).unwrap();
@@ -1867,6 +1927,7 @@ mod tests {
         assert_eq!(snapshot.today.tokens.reasoning, 10);
         assert_eq!(snapshot.today.tokens.total(), 130);
         assert_eq!(snapshot.today.cost_usd, 1.25);
+        assert_eq!(snapshot.today.token_costs.unwrap().reasoning, 0.5);
     }
 
     #[test]
@@ -1882,7 +1943,7 @@ mod tests {
         assert!((codex.cost - 0.000_255).abs() < 1e-12);
 
         normalize_codex_reasoning_usage(std::slice::from_mut(&mut codex), |message| {
-            pricing.calculate_cost_with_provider(
+            pricing.calculate_token_costs_with_provider(
                 &message.model_id,
                 Some(&message.provider_id),
                 &message.tokens,
@@ -1912,7 +1973,7 @@ mod tests {
             .unwrap();
 
         normalize_codex_reasoning_usage(std::slice::from_mut(&mut codex), |message| {
-            pricing.calculate_cost_with_service_tier(
+            pricing.calculate_token_costs_with_service_tier(
                 &message.model_id,
                 Some(&message.provider_id),
                 &message.tokens,
@@ -1937,7 +1998,10 @@ mod tests {
 
         normalize_codex_reasoning_usage(std::slice::from_mut(&mut codex), |_| {
             recalculated = true;
-            Some(1.0)
+            Some(TokenCostBreakdown {
+                input: 1.0,
+                ..Default::default()
+            })
         });
 
         assert_eq!(codex.tokens.output, 5);
@@ -2086,7 +2150,7 @@ mod tests {
         let snapshot = build_snapshot(vec![], today, 123, "UTC".to_string(), 1).unwrap();
         let value: Value = serde_json::to_value(snapshot).unwrap();
 
-        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["schemaVersion"], 3);
         assert_eq!(value["generatedAtMs"], 123);
         assert_eq!(value["today"]["requestCount"], 0);
         assert_eq!(value["today"]["tokens"]["cacheRead"], 0);
