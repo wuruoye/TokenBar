@@ -134,6 +134,85 @@ struct CodexAppServerQuotaClientTests {
         #expect(snapshot.weekly?.usedPercent == 12)
     }
 
+    @Test("classifies a lone primary seven-day window as weekly")
+    func classifiesPrimaryWeeklyOnly() async throws {
+        let requester = StubRateLimitsRequester(result: .success(Data(
+            """
+            {
+              "rateLimits": {
+                "primary": {
+                  "usedPercent": 3,
+                  "windowDurationMins": 10080,
+                  "resetsAt": 1800597600
+                },
+                "secondary": null
+              }
+            }
+            """.utf8)))
+
+        let snapshot = try await CodexAppServerQuotaClient(requester: requester).fetchQuota()
+
+        #expect(snapshot.session == nil)
+        #expect(snapshot.weekly?.usedPercent == 3)
+        #expect(snapshot.weekly?.remainingPercent == 97)
+        #expect(snapshot.weekly?.windowMinutes == 10_080)
+        #expect(snapshot.weekly?.resetsAt == Date(timeIntervalSince1970: 1_800_597_600))
+    }
+
+    @Test("classifies reversed app-server windows by duration")
+    func classifiesReversedWindows() async throws {
+        let requester = StubRateLimitsRequester(result: .success(Data(
+            """
+            {
+              "rateLimits": {
+                "primary": {
+                  "usedPercent": 3,
+                  "windowDurationMins": 10080,
+                  "resetsAt": 1800597600
+                },
+                "secondary": {
+                  "usedPercent": 40,
+                  "windowDurationMins": 300,
+                  "resetsAt": 1800000300
+                }
+              }
+            }
+            """.utf8)))
+
+        let snapshot = try await CodexAppServerQuotaClient(requester: requester).fetchQuota()
+
+        #expect(snapshot.session?.usedPercent == 40)
+        #expect(snapshot.session?.windowMinutes == 300)
+        #expect(snapshot.weekly?.usedPercent == 3)
+        #expect(snapshot.weekly?.windowMinutes == 10_080)
+    }
+
+    @Test("keeps positional fallback for unknown window durations")
+    func keepsUnknownDurationFallback() async throws {
+        let requester = StubRateLimitsRequester(result: .success(Data(
+            """
+            {
+              "rateLimits": {
+                "primary": {
+                  "usedPercent": 10,
+                  "windowDurationMins": 540
+                },
+                "secondary": {
+                  "usedPercent": 20,
+                  "windowDurationMins": 1440
+                }
+              }
+            }
+            """.utf8)))
+
+        let snapshot = try await CodexAppServerQuotaClient(requester: requester).fetchQuota()
+
+        #expect(snapshot.session?.usedPercent == 10)
+        #expect(snapshot.session?.windowMinutes == 540)
+        #expect(snapshot.weekly?.usedPercent == 20)
+        #expect(snapshot.weekly?.windowMinutes == 1_440)
+    }
+
     @Test("keeps a valid weekly lane when the 5-hour lane is malformed")
     func toleratesOneMalformedLane() async throws {
         let requester = StubRateLimitsRequester(result: .success(Data(
@@ -173,6 +252,31 @@ struct CodexAppServerQuotaClientTests {
         #expect(snapshot.weekly?.usedPercent == 19)
         #expect(snapshot.weekly?.windowMinutes == 10_080)
         #expect(snapshot.updatedAt == now)
+    }
+
+    @Test("classifies a recovered primary seven-day window as weekly")
+    func recoversPrimaryWeeklyOnly() async throws {
+        let message = """
+        failed to fetch codex rate limits: Decode error; body={
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 3,
+              "limit_window_seconds": 604800,
+              "reset_at": 1800597600
+            },
+            "secondary_window": null
+          }
+        }
+        """
+        let requester = StubRateLimitsRequester(result: .failure(
+            CodexAppServerError.requestFailed(message)))
+
+        let snapshot = try await CodexAppServerQuotaClient(requester: requester).fetchQuota()
+
+        #expect(snapshot.session == nil)
+        #expect(snapshot.weekly?.usedPercent == 3)
+        #expect(snapshot.weekly?.remainingPercent == 97)
+        #expect(snapshot.weekly?.windowMinutes == 10_080)
     }
 
     @Test("rejects a response with no quota windows")

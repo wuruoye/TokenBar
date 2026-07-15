@@ -46,14 +46,15 @@ struct CodexAppServerQuotaClient: Sendable {
             throw CodexAppServerError.invalidResponse(error.localizedDescription)
         }
 
-        let session = result.rateLimits.primary.map(Self.mapWindow)
-        let weekly = result.rateLimits.secondary.map(Self.mapWindow)
-        guard session != nil || weekly != nil else {
+        let windows = Self.normalizeWindows(
+            primary: result.rateLimits.primary.map(Self.mapWindow),
+            secondary: result.rateLimits.secondary.map(Self.mapWindow))
+        guard windows.session != nil || windows.weekly != nil else {
             throw CodexQuotaServiceError.noQuotaWindows
         }
         return QuotaSnapshot(
-            session: session,
-            weekly: weekly,
+            session: windows.session,
+            weekly: windows.weekly,
             resetCredits: nil,
             updatedAt: self.now())
     }
@@ -68,12 +69,13 @@ struct CodexAppServerQuotaClient: Sendable {
         else {
             return nil
         }
-        let session = body.rateLimit?.primaryWindow.map(Self.mapErrorWindow)
-        let weekly = body.rateLimit?.secondaryWindow.map(Self.mapErrorWindow)
-        guard session != nil || weekly != nil else { return nil }
+        let windows = Self.normalizeWindows(
+            primary: body.rateLimit?.primaryWindow.map(Self.mapErrorWindow),
+            secondary: body.rateLimit?.secondaryWindow.map(Self.mapErrorWindow))
+        guard windows.session != nil || windows.weekly != nil else { return nil }
         return QuotaSnapshot(
-            session: session,
-            weekly: weekly,
+            session: windows.session,
+            weekly: windows.weekly,
             resetCredits: nil,
             updatedAt: updatedAt)
     }
@@ -125,6 +127,55 @@ struct CodexAppServerQuotaClient: Sendable {
             windowMinutes: window.limitWindowSeconds.map { max(0, $0 / 60) },
             resetsAt: window.resetAt.map { Date(timeIntervalSince1970: TimeInterval($0)) })
     }
+
+    private static func normalizeWindows(
+        primary: QuotaWindowSnapshot?,
+        secondary: QuotaWindowSnapshot?)
+        -> (session: QuotaWindowSnapshot?, weekly: QuotaWindowSnapshot?)
+    {
+        let candidates = [
+            (window: primary, fallbackRole: QuotaWindowRole.session),
+            (window: secondary, fallbackRole: QuotaWindowRole.weekly),
+        ].compactMap { candidate in
+            candidate.window.map { ($0, candidate.fallbackRole) }
+        }
+
+        var session = candidates.first { Self.role(for: $0.0) == .session }?.0
+        var weekly = candidates.first { Self.role(for: $0.0) == .weekly }?.0
+        for (window, fallbackRole) in candidates where Self.role(for: window) == .unknown {
+            switch fallbackRole {
+            case .session:
+                if session == nil {
+                    session = window
+                } else if weekly == nil {
+                    weekly = window
+                }
+            case .weekly:
+                if weekly == nil {
+                    weekly = window
+                } else if session == nil {
+                    session = window
+                }
+            case .unknown:
+                break
+            }
+        }
+        return (session, weekly)
+    }
+
+    private static func role(for window: QuotaWindowSnapshot) -> QuotaWindowRole {
+        switch window.windowMinutes {
+        case 300: .session
+        case 10_080: .weekly
+        default: .unknown
+        }
+    }
+}
+
+private enum QuotaWindowRole {
+    case session
+    case weekly
+    case unknown
 }
 
 enum CodexAppServerError: LocalizedError, Sendable {
