@@ -8,16 +8,22 @@ final class TokenBarMenu: NSMenu {
     weak var persistentActionDelegate: TokenBarMenuPersistentActionDelegate?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard Self.isPersistentRefreshShortcut(event) else {
+        guard self.handlePersistentShortcut(event) else {
             return super.performKeyEquivalent(with: event)
         }
+        return true
+    }
+
+    @discardableResult
+    func handlePersistentShortcut(_ event: NSEvent) -> Bool {
+        guard Self.isPersistentRefreshShortcut(event) else { return false }
         if !event.isARepeat {
             self.persistentActionDelegate?.performPersistentRefresh()
         }
         return true
     }
 
-    private static func isPersistentRefreshShortcut(_ event: NSEvent) -> Bool {
+    static func isPersistentRefreshShortcut(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown else { return false }
         let relevantModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
         return relevantModifiers == .command

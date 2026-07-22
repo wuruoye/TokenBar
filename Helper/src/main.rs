@@ -1,12 +1,14 @@
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use chrono::{Days, Local};
 use tokenbar_helper::codex::{parse_local_codex_messages, LocalParseOptions};
-use tokenbar_helper::pricing::CodexPricing;
+use serde::Deserialize;
+use tokenbar_helper::pricing::{CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
     build_snapshot_with_session_titles, extract_request_detail, load_codex_session_titles,
     normalize_codex_reasoning_usage,
@@ -45,6 +47,11 @@ enum Command {
     RequestDetail(RequestDetailConfig),
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexAuthConfig {
+    auth_mode: Option<String>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     match parse_args(env::args_os().skip(1))? {
         Command::Snapshot(config) => run_snapshot(config),
@@ -80,7 +87,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let use_env_roots = home_dir.is_none();
 
-    let pricing = CodexPricing::bundled();
+    let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config));
     let mut messages = parse_local_codex_messages(
         LocalParseOptions {
             home_dir,
@@ -120,15 +127,36 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
 }
 
 fn codex_session_index_path(config: &SnapshotConfig) -> Option<PathBuf> {
+    codex_home_path(config).map(|path| path.join("session_index.jsonl"))
+}
+
+fn codex_home_path(config: &SnapshotConfig) -> Option<PathBuf> {
     if let Some(home_dir) = config.home_dir.as_ref() {
-        return Some(home_dir.join(".codex/session_index.jsonl"));
+        return Some(home_dir.join(".codex"));
     }
     if let Some(codex_home) = env::var_os("CODEX_HOME") {
-        return Some(PathBuf::from(codex_home).join("session_index.jsonl"));
+        return Some(PathBuf::from(codex_home));
     }
     env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join(".codex/session_index.jsonl"))
+        .map(|home| home.join(".codex"))
+}
+
+fn codex_fast_pricing_basis(config: &SnapshotConfig) -> FastPricingBasis {
+    codex_home_path(config)
+        .and_then(|path| File::open(path.join("auth.json")).ok())
+        .and_then(|file| serde_json::from_reader::<_, CodexAuthConfig>(file).ok())
+        .and_then(|auth| auth.auth_mode)
+        .and_then(|mode| fast_pricing_basis_for_auth_mode(&mode))
+        .unwrap_or_default()
+}
+
+fn fast_pricing_basis_for_auth_mode(auth_mode: &str) -> Option<FastPricingBasis> {
+    match auth_mode.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" => Some(FastPricingBasis::ChatGptSubscription),
+        "api" | "api-key" | "api_key" | "apikey" => Some(FastPricingBasis::ApiPriority),
+        _ => None,
+    }
 }
 
 fn write_json(value: &impl serde::Serialize) -> Result<(), Box<dyn Error>> {
@@ -321,5 +349,18 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(reversed, "request start must not be after request end");
+    }
+
+    #[test]
+    fn maps_codex_auth_mode_to_the_matching_fast_pricing_basis() {
+        assert_eq!(
+            fast_pricing_basis_for_auth_mode("chatgpt"),
+            Some(FastPricingBasis::ChatGptSubscription)
+        );
+        assert_eq!(
+            fast_pricing_basis_for_auth_mode("apikey"),
+            Some(FastPricingBasis::ApiPriority)
+        );
+        assert_eq!(fast_pricing_basis_for_auth_mode("future-mode"), None);
     }
 }

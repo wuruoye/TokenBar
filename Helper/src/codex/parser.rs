@@ -696,7 +696,11 @@ fn forked_child_turn_starts_own_session(state: &CodexParseState, turn_id: Option
     match (turn_id, codex_uuid_v7_order_key(child_session_id)) {
         (Some(turn_id), Some(child_key)) => {
             let Some(turn_key) = codex_uuid_v7_order_key(turn_id) else {
-                return true;
+                // Once a different session id has confirmed that this file is
+                // replaying its parent, an unorderable legacy turn id is not
+                // evidence that the child has started. Nested forks can replay
+                // old UUIDv4 turns before reaching the child's own UUIDv7 turn.
+                return false;
             };
             match turn_key[..12].cmp(&child_key[..12]) {
                 std::cmp::Ordering::Greater => true,
@@ -1341,5 +1345,34 @@ mod tests {
         assert_eq!(messages[0].tokens.input, 20);
         assert_eq!(messages[0].tokens.output, 2);
         assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn nested_fork_keeps_skipping_legacy_turns_inside_parent_replay() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-05-06T00:00:00.000Z","type":"session_meta","payload":{"id":"019e6100-0000-7000-8000-000000000003","forked_from_id":"019e6000-0000-7000-8000-000000000002","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019e6000-0000-7000-8000-000000000002","depth":1}}},"model_provider":"openai","agent_nickname":"worker"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:00.001Z","type":"session_meta","payload":{"id":"019e6000-0000-7000-8000-000000000002","forked_from_id":"019e5f00-0000-7000-8000-000000000001","thread_source":"user","source":"vscode","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:00.002Z","type":"session_meta","payload":{"id":"019e5f00-0000-7000-8000-000000000001","source":"vscode","model_provider":"openai"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"019e5f00-0001-7000-8000-000000000001","model":"gpt-5.5"}}"#,
+            token_line("2026-05-06T00:00:00.200Z", (500, 50, 100, 5), (500, 50, 100, 5)),
+            r#"{"timestamp":"2026-05-06T00:00:00.300Z","type":"event_msg","payload":{"type":"task_started","turn_id":"8065946f-061b-4097-84db-795c8246e96b"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:00.400Z","type":"turn_context","payload":{"turn_id":"8065946f-061b-4097-84db-795c8246e96b","model":"gpt-5.5"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:00.500Z","type":"event_msg","payload":{"type":"user_message","message":"replayed legacy prompt"}}"#,
+            token_line("2026-05-06T00:00:00.600Z", (510, 52, 102, 6), (10, 2, 2, 1)),
+            r#"{"timestamp":"2026-05-06T00:00:05.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019e6100-1000-7000-8000-000000000004"}}"#,
+            r#"{"timestamp":"2026-05-06T00:00:05.100Z","type":"turn_context","payload":{"turn_id":"019e6100-1000-7000-8000-000000000004","model":"gpt-5.5"}}"#,
+            token_line("2026-05-06T00:00:05.200Z", (530, 55, 106, 7), (20, 3, 4, 1))
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 16);
+        assert_eq!(messages[0].tokens.cache_read, 4);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.reasoning, 1);
+        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(messages[0].content_preview, None);
     }
 }

@@ -47,12 +47,25 @@ struct ModelRate {
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-sol
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-terra
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-luna
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FastPricingBasis {
+    ChatGptSubscription,
+    #[default]
+    ApiPriority,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CodexPricing;
+pub struct CodexPricing {
+    fast_pricing_basis: FastPricingBasis,
+}
 
 impl CodexPricing {
     pub const fn bundled() -> Self {
-        Self
+        Self::with_fast_pricing(FastPricingBasis::ApiPriority)
+    }
+
+    pub const fn with_fast_pricing(fast_pricing_basis: FastPricingBasis) -> Self {
+        Self { fast_pricing_basis }
     }
 
     pub fn calculate_cost_with_provider(
@@ -90,10 +103,10 @@ impl CodexPricing {
         costs.total().is_finite().then_some(costs)
     }
 
-    /// Applies Codex Fast/Priority pricing to the standard API-equivalent
-    /// estimate. The tier changes cost only; token and cache counts stay raw.
-    /// Models without an explicitly verified Priority rate keep their standard
-    /// estimate instead of receiving a guessed multiplier.
+    /// Applies the Fast multiplier for the active Codex login type to the
+    /// standard API-equivalent estimate. The tier changes cost only; token and
+    /// cache counts stay raw. Models without an explicitly verified multiplier
+    /// keep their standard estimate instead of receiving a guessed multiplier.
     pub fn calculate_cost_with_service_tier(
         &self,
         model_id: &str,
@@ -119,7 +132,7 @@ impl CodexPricing {
     ) -> Option<TokenCostBreakdown> {
         let base = self.calculate_token_costs_with_provider(model_id, provider_id, usage)?;
         let multiplier = if service_tier == ServiceTier::Fast {
-            fast_cost_multiplier(model_id).unwrap_or(1.0)
+            fast_cost_multiplier(model_id, self.fast_pricing_basis).unwrap_or(1.0)
         } else {
             1.0
         };
@@ -127,19 +140,23 @@ impl CodexPricing {
     }
 }
 
-/// Official OpenAI Priority prices reviewed 2026-07-14:
-/// - GPT-5.4: 2x
-/// - GPT-5.5: 2.5x
-/// - GPT-5.6 Sol/Terra/Luna: 2x
+/// Official Fast multipliers reviewed 2026-07-16:
+/// - ChatGPT subscription credits: GPT-5.4 is 2x; GPT-5.5/5.6 are 2.5x.
+/// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6 is 2x.
 ///
 /// Sources:
+/// - https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode
 /// - https://developers.openai.com/api/docs/pricing
 /// - https://developers.openai.com/api/docs/guides/priority-processing
-fn fast_cost_multiplier(model_id: &str) -> Option<f64> {
-    match normalize_pricing_model_id(model_id).as_str() {
-        "gpt-5.4" => Some(2.0),
-        "gpt-5.5" => Some(2.5),
-        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(2.0),
+fn fast_cost_multiplier(model_id: &str, basis: FastPricingBasis) -> Option<f64> {
+    let normalized = normalize_pricing_model_id(model_id);
+    match (basis, normalized.as_str()) {
+        (_, "gpt-5.4") => Some(2.0),
+        (_, "gpt-5.5") => Some(2.5),
+        (FastPricingBasis::ChatGptSubscription, "gpt-5.6" | "gpt-5.6-sol") => Some(2.5),
+        (FastPricingBasis::ChatGptSubscription, "gpt-5.6-terra" | "gpt-5.6-luna") => Some(2.5),
+        (FastPricingBasis::ApiPriority, "gpt-5.6" | "gpt-5.6-sol") => Some(2.0),
+        (FastPricingBasis::ApiPriority, "gpt-5.6-terra" | "gpt-5.6-luna") => Some(2.0),
         _ => None,
     }
 }
@@ -366,6 +383,31 @@ mod tests {
                 )
                 .unwrap();
             assert!((fast_components.total() - fast).abs() < 1e-9, "{model}");
+        }
+    }
+
+    #[test]
+    fn applies_chatgpt_subscription_fast_multiplier_to_gpt_5_6() {
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        let pricing = CodexPricing::with_fast_pricing(FastPricingBasis::ChatGptSubscription);
+
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let standard = pricing
+                .calculate_cost_with_service_tier(
+                    model,
+                    Some("openai"),
+                    &usage,
+                    ServiceTier::Standard,
+                )
+                .unwrap();
+            let fast = pricing
+                .calculate_cost_with_service_tier(model, Some("openai"), &usage, ServiceTier::Fast)
+                .unwrap();
+            assert!((fast - standard * 2.5).abs() < 1e-9, "{model}");
         }
     }
 

@@ -31,6 +31,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var showsAllSessions = false
     private var isRootMenuOpen = false
     private var startupTask: Task<Void, Never>?
+    private var shortcutMonitor: MenuTrackingShortcutMonitor?
     private var settingsWindowController: SettingsWindowController?
 
     init(
@@ -72,6 +73,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     func tearDown() {
         self.startupTask?.cancel()
         self.startupTask = nil
+        self.removeShortcutMonitor()
         self.discardRequestDetailMenus(in: self.rootMenu)
         self.rootMenu.delegate = nil
         self.rootMenu.persistentActionDelegate = nil
@@ -100,6 +102,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     func menuWillOpen(_ menu: NSMenu) {
         if menu === self.rootMenu {
             self.isRootMenuOpen = true
+            self.installShortcutMonitor()
             Task { @MainActor [weak self] in
                 await self?.model.refreshAll()
             }
@@ -123,6 +126,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
         if menu === self.rootMenu {
             self.isRootMenuOpen = false
+            self.removeShortcutMonitor()
         }
     }
 
@@ -138,6 +142,21 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         Task { @MainActor [weak self] in
             await self?.model.refreshAll()
         }
+    }
+
+    private func installShortcutMonitor() {
+        self.removeShortcutMonitor()
+        let monitor = MenuTrackingShortcutMonitor(events: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self, self.isRootMenuOpen else { return false }
+            return self.rootMenu.handlePersistentShortcut(event)
+        }
+        monitor.start()
+        self.shortcutMonitor = monitor
+    }
+
+    private func removeShortcutMonitor() {
+        self.shortcutMonitor?.stop()
+        self.shortcutMonitor = nil
     }
 
     private func configureStatusButton() {
