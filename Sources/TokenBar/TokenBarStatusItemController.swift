@@ -52,6 +52,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.statusItem.menu = self.rootMenu
         self.configureStatusButton()
         self.model.updateBackgroundRefreshInterval(settings.backgroundRefreshDuration)
+        self.model.updateStatisticsTimeZone(settings.statisticsTimeZone)
         self.rebuildRootMenu()
         self.observeModel()
         self.observeSettings()
@@ -195,12 +196,18 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.theme
             _ = self.settings.recentSessionCount
             _ = self.settings.refreshInterval
+            _ = self.settings.statisticsTimeZone
             _ = self.settings.showsFullRequestContentOnHover
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.observeSettings()
                 self.model.updateBackgroundRefreshInterval(self.settings.backgroundRefreshDuration)
+                if self.model.updateStatisticsTimeZone(self.settings.statisticsTimeZone) {
+                    Task { @MainActor [weak self] in
+                        await self?.model.refreshActivity()
+                    }
+                }
             }
         }
     }

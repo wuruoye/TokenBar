@@ -22,6 +22,16 @@ struct TokenBarSettingsView: View {
             }
 
             Section("Activity") {
+                Picker("Statistics timezone", selection: self.$settings.statisticsTimeZone) {
+                    ForEach(TokenBarStatisticsTimeZone.allCases) { timeZone in
+                        Text(timeZone.displayName).tag(timeZone)
+                    }
+                }
+
+                Text("UTC aligns today and daily totals with the Codex usage dashboard.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Picker("Recent sessions", selection: self.$settings.recentSessionCount) {
                     ForEach(TokenBarRecentSessionCount.allCases) { count in
                         Text("\(count.rawValue)").tag(count)
@@ -49,7 +59,7 @@ struct TokenBarSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 390)
+        .frame(width: 440, height: 470)
     }
 }
 

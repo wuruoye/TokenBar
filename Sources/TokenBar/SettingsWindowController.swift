@@ -11,7 +11,7 @@ final class SettingsWindowController: NSWindowController {
         window.title = "TokenBar Settings"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 440, height: 390))
+        window.setContentSize(NSSize(width: 440, height: 470))
         window.center()
         super.init(window: window)
     }

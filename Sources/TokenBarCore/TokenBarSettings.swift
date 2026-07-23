@@ -44,6 +44,27 @@ public enum TokenBarRefreshInterval: Int, CaseIterable, Codable, Identifiable, S
     }
 }
 
+public enum TokenBarStatisticsTimeZone: String, CaseIterable, Codable, Identifiable, Sendable {
+    case utc
+    case local
+
+    public var id: Self { self }
+
+    public var displayName: String {
+        switch self {
+        case .utc: "UTC (matches Codex)"
+        case .local: "Local time"
+        }
+    }
+
+    var processEnvironmentValue: String {
+        switch self {
+        case .utc: "UTC"
+        case .local: TimeZone.autoupdatingCurrent.identifier
+        }
+    }
+}
+
 @MainActor
 @Observable
 public final class TokenBarSettings {
@@ -51,6 +72,7 @@ public final class TokenBarSettings {
     public static let defaultTheme = TokenBarTheme.system
     public static let defaultRecentSessionCount = TokenBarRecentSessionCount.ten
     public static let defaultRefreshInterval = TokenBarRefreshInterval.fiveMinutes
+    public static let defaultStatisticsTimeZone = TokenBarStatisticsTimeZone.utc
     public static let defaultShowsFullRequestContentOnHover = true
 
     public var theme: TokenBarTheme {
@@ -63,6 +85,14 @@ public final class TokenBarSettings {
 
     public var refreshInterval: TokenBarRefreshInterval {
         didSet { self.defaults.set(self.refreshInterval.rawValue, forKey: self.keys.refreshInterval) }
+    }
+
+    public var statisticsTimeZone: TokenBarStatisticsTimeZone {
+        didSet {
+            self.defaults.set(
+                self.statisticsTimeZone.rawValue,
+                forKey: self.keys.statisticsTimeZone)
+        }
     }
 
     public var showsFullRequestContentOnHover: Bool {
@@ -91,6 +121,8 @@ public final class TokenBarSettings {
             rawValue: defaults.integer(forKey: self.keys.recentSessionCount)) ?? Self.defaultRecentSessionCount
         self.refreshInterval = TokenBarRefreshInterval(
             rawValue: defaults.integer(forKey: self.keys.refreshInterval)) ?? Self.defaultRefreshInterval
+        self.statisticsTimeZone = defaults.string(forKey: self.keys.statisticsTimeZone)
+            .flatMap(TokenBarStatisticsTimeZone.init(rawValue:)) ?? Self.defaultStatisticsTimeZone
         self.showsFullRequestContentOnHover = defaults.object(
             forKey: self.keys.showsFullRequestContentOnHover) as? Bool
             ?? Self.defaultShowsFullRequestContentOnHover
@@ -100,6 +132,7 @@ public final class TokenBarSettings {
         self.theme = Self.defaultTheme
         self.recentSessionCount = Self.defaultRecentSessionCount
         self.refreshInterval = Self.defaultRefreshInterval
+        self.statisticsTimeZone = Self.defaultStatisticsTimeZone
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
     }
 
@@ -107,12 +140,14 @@ public final class TokenBarSettings {
         let theme: String
         let recentSessionCount: String
         let refreshInterval: String
+        let statisticsTimeZone: String
         let showsFullRequestContentOnHover: String
 
         init(prefix: String) {
             self.theme = "\(prefix).theme"
             self.recentSessionCount = "\(prefix).recentSessionCount"
             self.refreshInterval = "\(prefix).refreshInterval"
+            self.statisticsTimeZone = "\(prefix).statisticsTimeZone"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
         }
     }

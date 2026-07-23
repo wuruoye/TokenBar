@@ -29,7 +29,10 @@ struct DemoQuotaProvider: QuotaProviding {
 }
 
 struct DemoActivityProvider: ActivityProviding {
-    func fetchActivity(sinceWeeklyResetAt: Date?) async throws -> ActivitySnapshot {
+    func fetchActivity(
+        sinceWeeklyResetAt: Date?,
+        statisticsTimeZone _: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
         let now = Date()
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
         let prompts = [

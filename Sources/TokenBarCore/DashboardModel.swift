@@ -31,6 +31,7 @@ public final class DashboardModel {
     @ObservationIgnored private let cache: (any ActivitySnapshotCaching)?
     @ObservationIgnored private var quotaRefreshInterval: Duration
     @ObservationIgnored private var activityRefreshInterval: Duration
+    @ObservationIgnored private var statisticsTimeZone: TokenBarStatisticsTimeZone
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     @ObservationIgnored private let now: @Sendable () -> Date
     @ObservationIgnored private var quotaTimerTask: Task<Void, Never>?
@@ -42,13 +43,15 @@ public final class DashboardModel {
         activityService: any ActivityProviding = ActivityService(),
         cache: (any ActivitySnapshotCaching)? = SnapshotCache(),
         quotaRefreshInterval: Duration = DashboardModel.defaultQuotaRefreshInterval,
-        activityRefreshInterval: Duration = DashboardModel.defaultActivityRefreshInterval)
+        activityRefreshInterval: Duration = DashboardModel.defaultActivityRefreshInterval,
+        statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone)
     {
         self.quotaService = quotaService
         self.activityService = activityService
         self.cache = cache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
+        self.statisticsTimeZone = statisticsTimeZone
         self.sleep = { duration in
             try await Task.sleep(for: duration)
         }
@@ -61,6 +64,7 @@ public final class DashboardModel {
         cache: (any ActivitySnapshotCaching)?,
         quotaRefreshInterval: Duration,
         activityRefreshInterval: Duration,
+        statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone,
         sleep: @escaping @Sendable (Duration) async throws -> Void,
         now: @escaping @Sendable () -> Date = Date.init)
     {
@@ -69,6 +73,7 @@ public final class DashboardModel {
         self.cache = cache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
+        self.statisticsTimeZone = statisticsTimeZone
         self.sleep = sleep
         self.now = now
     }
@@ -106,6 +111,13 @@ public final class DashboardModel {
         if self.isStarted {
             self.startRefreshTimers()
         }
+    }
+
+    @discardableResult
+    public func updateStatisticsTimeZone(_ timeZone: TokenBarStatisticsTimeZone) -> Bool {
+        guard self.statisticsTimeZone != timeZone else { return false }
+        self.statisticsTimeZone = timeZone
+        return true
     }
 
     public func refreshAll() async {
@@ -151,23 +163,32 @@ public final class DashboardModel {
             value: self.activity.value,
             isRefreshing: true,
             errorMessage: nil)
-        do {
-            let weeklyResetAt = self.quota.value.flatMap { snapshot in
-                snapshot.weekly?.weeklyPacing(at: self.now())?.windowStart
+        while true {
+            let statisticsTimeZone = self.statisticsTimeZone
+            do {
+                let weeklyResetAt = self.quota.value.flatMap { snapshot in
+                    snapshot.weekly?.weeklyPacing(at: self.now())?.windowStart
+                }
+                let snapshot = try await self.activityService.fetchActivity(
+                    sinceWeeklyResetAt: weeklyResetAt,
+                    statisticsTimeZone: statisticsTimeZone)
+                try Task.checkCancellation()
+                guard statisticsTimeZone == self.statisticsTimeZone else { continue }
+                self.activity = DashboardSourceState(value: snapshot)
+                try? await self.cache?.saveActivity(snapshot)
+                return
+            } catch is CancellationError {
+                self.activity = DashboardSourceState(
+                    value: self.activity.value,
+                    errorMessage: self.activity.errorMessage)
+                return
+            } catch {
+                guard statisticsTimeZone == self.statisticsTimeZone else { continue }
+                self.activity = DashboardSourceState(
+                    value: self.activity.value,
+                    errorMessage: error.localizedDescription)
+                return
             }
-            let snapshot = try await self.activityService.fetchActivity(
-                sinceWeeklyResetAt: weeklyResetAt)
-            try Task.checkCancellation()
-            self.activity = DashboardSourceState(value: snapshot)
-            try? await self.cache?.saveActivity(snapshot)
-        } catch is CancellationError {
-            self.activity = DashboardSourceState(
-                value: self.activity.value,
-                errorMessage: self.activity.errorMessage)
-        } catch {
-            self.activity = DashboardSourceState(
-                value: self.activity.value,
-                errorMessage: error.localizedDescription)
         }
     }
 

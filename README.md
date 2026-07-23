@@ -134,6 +134,7 @@ Quota is the intentional network-facing part of the app. TokenBar asks the local
 Open **Settings** with `Command-,` to configure:
 
 - **Theme color:** System, Blue, Purple, Green, Orange, or Pink.
+- **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
 - **Background refresh:** 1, 5, 10, or 15 minutes.

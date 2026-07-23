@@ -1,12 +1,22 @@
 import Foundation
 
 public protocol ActivityProviding: Sendable {
-    func fetchActivity(sinceWeeklyResetAt: Date?) async throws -> ActivitySnapshot
+    func fetchActivity(
+        sinceWeeklyResetAt: Date?,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
 }
 
 public extension ActivityProviding {
     func fetchActivity() async throws -> ActivitySnapshot {
-        try await self.fetchActivity(sinceWeeklyResetAt: nil)
+        try await self.fetchActivity(
+            sinceWeeklyResetAt: nil,
+            statisticsTimeZone: .utc)
+    }
+
+    func fetchActivity(sinceWeeklyResetAt: Date?) async throws -> ActivitySnapshot {
+        try await self.fetchActivity(
+            sinceWeeklyResetAt: sinceWeeklyResetAt,
+            statisticsTimeZone: .utc)
     }
 }
 
@@ -99,12 +109,15 @@ public struct ActivityService: ActivityProviding, Sendable {
         self.runner = runner
     }
 
-    public func fetchActivity(sinceWeeklyResetAt: Date?) async throws -> ActivitySnapshot {
+    public func fetchActivity(
+        sinceWeeklyResetAt: Date?,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
         let helperURL = try self.resolveHelper()
         let data = try await self.runner.run(
             executableURL: helperURL,
             arguments: self.helperArguments(sinceWeeklyResetAt: sinceWeeklyResetAt),
-            environment: self.environment,
+            environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
         guard !data.isEmpty else {
             throw ActivityServiceError.emptyOutput
@@ -126,6 +139,14 @@ public struct ActivityService: ActivityProviding, Sendable {
             return self.arguments
         }
         return self.arguments + ["--weekly-reset-ms", String(Int64(milliseconds.rounded()))]
+    }
+
+    private func helperEnvironment(
+        statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String: String]
+    {
+        var environment = self.environment
+        environment["TZ"] = statisticsTimeZone.processEnvironmentValue
+        return environment
     }
 
     static func helperCandidates(

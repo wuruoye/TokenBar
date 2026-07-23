@@ -22,15 +22,59 @@ private actor QueueQuotaProvider: QuotaProviding {
 private actor QueueActivityProvider: ActivityProviding {
     private var results: [Result<ActivitySnapshot, StubFailure>]
     private(set) var weeklyResetDates: [Date?] = []
+    private(set) var statisticsTimeZones: [TokenBarStatisticsTimeZone] = []
 
     init(_ results: [Result<ActivitySnapshot, StubFailure>]) {
         self.results = results
     }
 
-    func fetchActivity(sinceWeeklyResetAt: Date?) async throws -> ActivitySnapshot {
+    func fetchActivity(
+        sinceWeeklyResetAt: Date?,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
         self.weeklyResetDates.append(sinceWeeklyResetAt)
+        self.statisticsTimeZones.append(statisticsTimeZone)
         guard !self.results.isEmpty else { throw StubFailure.failed }
         return try self.results.removeFirst().get()
+    }
+}
+
+private actor PausingActivityProvider: ActivityProviding {
+    private let snapshots: [ActivitySnapshot]
+    private(set) var statisticsTimeZones: [TokenBarStatisticsTimeZone] = []
+    private var firstRequestWaiter: CheckedContinuation<Void, Never>?
+    private var firstRequestRelease: CheckedContinuation<Void, Never>?
+
+    init(_ snapshots: [ActivitySnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func fetchActivity(
+        sinceWeeklyResetAt _: Date?,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        self.statisticsTimeZones.append(statisticsTimeZone)
+        let index = self.statisticsTimeZones.count - 1
+        if index == 0 {
+            self.firstRequestWaiter?.resume()
+            self.firstRequestWaiter = nil
+            await withCheckedContinuation { continuation in
+                self.firstRequestRelease = continuation
+            }
+        }
+        return self.snapshots[index]
+    }
+
+    func waitForFirstRequest() async {
+        guard self.statisticsTimeZones.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            self.firstRequestWaiter = continuation
+        }
+    }
+
+    func releaseFirstRequest() {
+        self.firstRequestRelease?.resume()
+        self.firstRequestRelease = nil
     }
 }
 
@@ -109,6 +153,7 @@ struct DashboardModelTests {
         let requested = await activity.weeklyResetDates
         #expect(requested.count == 1)
         #expect(abs((requested[0]?.timeIntervalSince(windowStart)) ?? .infinity) < 0.001)
+        #expect(await activity.statisticsTimeZones == [.utc])
     }
 
     @Test("expired weekly windows do not request stale reset activity")
@@ -183,6 +228,49 @@ struct DashboardModelTests {
         model.stop()
 
         #expect(await sleeps.values.contains(.seconds(60)))
+    }
+
+    @Test("activity refresh uses the selected statistics timezone")
+    @MainActor
+    func changesStatisticsTimeZone() async {
+        let activity = QueueActivityProvider([
+            .success(TestFixtures.activity()),
+            .success(TestFixtures.activity()),
+        ])
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([]),
+            activityService: activity,
+            cache: nil)
+
+        await model.refreshActivity()
+        #expect(model.updateStatisticsTimeZone(.local))
+        await model.refreshActivity()
+
+        #expect(await activity.statisticsTimeZones == [.utc, .local])
+    }
+
+    @Test("changing timezone during a refresh retries with the new timezone")
+    @MainActor
+    func retriesWhenStatisticsTimeZoneChanges() async {
+        let utcSnapshot = TestFixtures.activity(generatedAtMs: 1)
+        let localSnapshot = TestFixtures.activity(generatedAtMs: 2)
+        let activity = PausingActivityProvider([utcSnapshot, localSnapshot])
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([]),
+            activityService: activity,
+            cache: nil)
+
+        let refresh = Task { @MainActor in
+            await model.refreshActivity()
+        }
+        await activity.waitForFirstRequest()
+        #expect(model.updateStatisticsTimeZone(.local))
+        await model.refreshActivity()
+        await activity.releaseFirstRequest()
+        await refresh.value
+
+        #expect(await activity.statisticsTimeZones == [.utc, .local])
+        #expect(model.activity.value == localSnapshot)
     }
 }
 

@@ -18,6 +18,7 @@ private struct StubActivityHelperRunner: ActivityHelperRunning {
 private actor RecordingActivityHelperRunner: ActivityHelperRunning {
     let output: Data
     private(set) var arguments: [String] = []
+    private(set) var environments: [[String: String]] = []
 
     init(output: Data) {
         self.output = output
@@ -26,10 +27,11 @@ private actor RecordingActivityHelperRunner: ActivityHelperRunning {
     func run(
         executableURL _: URL,
         arguments: [String],
-        environment _: [String: String],
+        environment: [String: String],
         timeout _: TimeInterval) async throws -> Data
     {
         self.arguments = arguments
+        self.environments.append(environment)
         return self.output
     }
 }
@@ -71,6 +73,23 @@ struct ActivityServiceTests {
         _ = try await service.fetchActivity(sinceWeeklyResetAt: reset)
 
         #expect(await runner.arguments == ["--days", "30", "--weekly-reset-ms", "1720000000125"])
+        #expect(await runner.environments.last?["TZ"] == "UTC")
+    }
+
+    @Test("uses the selected statistics timezone for the helper")
+    func passesStatisticsTimeZone() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let service = ActivityService(
+            environment: ["PRESERVED": "yes", "TZ": "Old"],
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity(
+            sinceWeeklyResetAt: nil,
+            statisticsTimeZone: .local)
+
+        #expect(await runner.environments.last?["PRESERVED"] == "yes")
+        #expect(await runner.environments.last?["TZ"] == TimeZone.autoupdatingCurrent.identifier)
     }
 
     @Test("rejects malformed helper JSON")
