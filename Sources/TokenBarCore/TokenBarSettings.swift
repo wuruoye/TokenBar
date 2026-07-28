@@ -44,6 +44,33 @@ public enum TokenBarRefreshInterval: Int, CaseIterable, Codable, Identifiable, S
     }
 }
 
+public enum TokenBarResetCelebration: String, CaseIterable, Codable, Identifiable, Sendable {
+    case off
+    case session
+    case weekly
+    case both
+
+    public var id: Self { self }
+
+    public var displayName: String {
+        switch self {
+        case .off: "Off"
+        case .session: "5-hour resets"
+        case .weekly: "Weekly resets"
+        case .both: "5-hour and weekly resets"
+        }
+    }
+
+    public func includes(_ window: QuotaResetWindow) -> Bool {
+        switch (self, window) {
+        case (.session, .session), (.weekly, .weekly), (.both, _):
+            true
+        default:
+            false
+        }
+    }
+}
+
 public enum TokenBarStatisticsTimeZone: String, CaseIterable, Codable, Identifiable, Sendable {
     case utc
     case local
@@ -74,6 +101,7 @@ public final class TokenBarSettings {
     public static let defaultRefreshInterval = TokenBarRefreshInterval.fiveMinutes
     public static let defaultStatisticsTimeZone = TokenBarStatisticsTimeZone.utc
     public static let defaultShowsFullRequestContentOnHover = true
+    public static let defaultResetCelebration = TokenBarResetCelebration.off
 
     public var theme: TokenBarTheme {
         didSet { self.defaults.set(self.theme.rawValue, forKey: self.keys.theme) }
@@ -103,6 +131,14 @@ public final class TokenBarSettings {
         }
     }
 
+    public var resetCelebration: TokenBarResetCelebration {
+        didSet {
+            self.defaults.set(
+                self.resetCelebration.rawValue,
+                forKey: self.keys.resetCelebration)
+        }
+    }
+
     public var recentSessionLimit: Int { self.recentSessionCount.rawValue }
     public var backgroundRefreshDuration: Duration { self.refreshInterval.duration }
 
@@ -126,6 +162,8 @@ public final class TokenBarSettings {
         self.showsFullRequestContentOnHover = defaults.object(
             forKey: self.keys.showsFullRequestContentOnHover) as? Bool
             ?? Self.defaultShowsFullRequestContentOnHover
+        self.resetCelebration = defaults.string(forKey: self.keys.resetCelebration)
+            .flatMap(TokenBarResetCelebration.init(rawValue:)) ?? Self.defaultResetCelebration
     }
 
     public func resetToDefaults() {
@@ -134,6 +172,7 @@ public final class TokenBarSettings {
         self.refreshInterval = Self.defaultRefreshInterval
         self.statisticsTimeZone = Self.defaultStatisticsTimeZone
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
+        self.resetCelebration = Self.defaultResetCelebration
     }
 
     private struct Keys {
@@ -142,6 +181,7 @@ public final class TokenBarSettings {
         let refreshInterval: String
         let statisticsTimeZone: String
         let showsFullRequestContentOnHover: String
+        let resetCelebration: String
 
         init(prefix: String) {
             self.theme = "\(prefix).theme"
@@ -149,6 +189,7 @@ public final class TokenBarSettings {
             self.refreshInterval = "\(prefix).refreshInterval"
             self.statisticsTimeZone = "\(prefix).statisticsTimeZone"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
+            self.resetCelebration = "\(prefix).resetCelebration"
         }
     }
 }

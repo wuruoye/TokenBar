@@ -1,5 +1,33 @@
 import Foundation
 
+public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Identifiable, Sendable {
+    public let rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self.rawValue)
+    }
+
+    public var id: String { self.rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .codex: "Codex"
+        default: self.rawValue.capitalized
+        }
+    }
+
+    public static let codex = TokenPlatform(rawValue: "codex")
+}
+
 public struct TokenBreakdown: Codable, Equatable, Sendable {
     public let input: Int64
     public let output: Int64

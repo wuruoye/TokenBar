@@ -501,6 +501,7 @@ private struct TodaySummarySection: View {
                 HStack {
                     Text(
                         "Cache× \(totals.tokens.cacheReuseText) · "
+                            + self.averageTPSText
                             + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
                     Spacer()
                     Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
@@ -521,6 +522,10 @@ private struct TodaySummarySection: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var averageTPSText: String {
+        self.state.value?.menuAverageTPSText.map { "\($0) · " } ?? ""
     }
 }
 

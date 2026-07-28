@@ -14,7 +14,10 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         #endif
         return DashboardModel()
     }()
+    private let settings = TokenBarSettings.shared
+    private let confettiOverlayController = ScreenConfettiOverlayController()
     private var statusController: TokenBarStatusItemController?
+    private var settingsWindowController: SettingsWindowController?
     private var previewTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -72,16 +75,49 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         #endif
         let controller = TokenBarStatusItemController(
             model: self.model,
+            settings: self.settings,
+            showSettings: { [weak self] in
+                self?.showSettings()
+            },
             requestDetailService: requestDetailService)
         self.statusController = controller
+        self.model.quotaResetHandler = { [weak self] event in
+            self?.handleQuotaReset(event)
+        }
         controller.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         self.previewTask?.cancel()
         self.previewTask = nil
+        self.model.quotaResetHandler = nil
         self.model.stop()
+        self.confettiOverlayController.dismiss()
         self.statusController?.tearDown()
         self.statusController = nil
+        self.settingsWindowController?.close()
+        self.settingsWindowController = nil
+    }
+
+    private func showSettings() {
+        if self.settingsWindowController == nil {
+            self.settingsWindowController = SettingsWindowController(
+                settings: self.settings,
+                testResetAnimation: { [weak self] in
+                    self?.testResetAnimation()
+                })
+        }
+        self.settingsWindowController?.show()
+    }
+
+    func testResetAnimation() {
+        let origin = self.statusController?.celebrationOriginPoint(for: .codex)
+        self.confettiOverlayController.play(originInScreen: origin)
+    }
+
+    private func handleQuotaReset(_ event: QuotaResetEvent) {
+        guard self.settings.resetCelebration.includes(event.window) else { return }
+        let origin = self.statusController?.celebrationOriginPoint(for: event.platform)
+        self.confettiOverlayController.play(originInScreen: origin)
     }
 }

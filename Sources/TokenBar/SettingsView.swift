@@ -3,6 +3,15 @@ import TokenBarCore
 
 struct TokenBarSettingsView: View {
     @Bindable var settings: TokenBarSettings
+    let testResetAnimation: () -> Void
+
+    init(
+        settings: TokenBarSettings,
+        testResetAnimation: @escaping () -> Void = {})
+    {
+        self.settings = settings
+        self.testResetAnimation = testResetAnimation
+    }
 
     var body: some View {
         Form {
@@ -51,6 +60,27 @@ struct TokenBarSettingsView: View {
                 }
             }
 
+            Section("Celebrations") {
+                LabeledContent("Confetti when quota resets") {
+                    HStack(spacing: 8) {
+                        Picker("", selection: self.$settings.resetCelebration) {
+                            ForEach(TokenBarResetCelebration.allCases) { option in
+                                Text(option.displayName).tag(option)
+                            }
+                        }
+                        .labelsHidden()
+
+                        Button("Test Animation") {
+                            self.testResetAnimation()
+                        }
+                    }
+                }
+
+                Text("Plays a click-through animation from the menu bar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack {
                 Spacer()
                 Button("Restore Defaults") {
@@ -59,7 +89,7 @@ struct TokenBarSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 470)
+        .frame(width: 440, height: 570)
     }
 }
 

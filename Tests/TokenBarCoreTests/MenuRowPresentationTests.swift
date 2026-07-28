@@ -44,6 +44,68 @@ struct MenuRowPresentationTests {
         #expect(self.makeRequest(durationMs: 123_900).menuDurationText == "2m3s")
     }
 
+    @Test("Average TPS is weighted by valid physical request duration")
+    func averageTPS() {
+        let fast = self.makeRequest(
+            id: "fast",
+            durationMs: 1_000,
+            tokens: TokenBreakdown(
+                input: 10_000,
+                output: 80,
+                cacheRead: 5_000,
+                cacheWrite: 0,
+                reasoning: 20))
+        let slow = self.makeRequest(
+            id: "slow",
+            durationMs: 3_000,
+            tokens: TokenBreakdown(
+                input: 20_000,
+                output: 120,
+                cacheRead: 10_000,
+                cacheWrite: 0,
+                reasoning: 30))
+        let missingDuration = self.makeRequest(
+            id: "unknown",
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 10_000,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0))
+        let turn = self.makeRequest(
+            id: "turn",
+            contributions: [fast, slow, missingDuration])
+        let session = SessionSummary(
+            id: "session",
+            workspaceLabel: "TokenBar",
+            startedAtMs: fast.startedAtMs,
+            endedAtMs: slow.endedAtMs,
+            tokens: TokenBreakdown(
+                input: 30_000,
+                output: 200,
+                cacheRead: 15_000,
+                cacheWrite: 0,
+                reasoning: 50),
+            costUsd: 0,
+            models: [fast.model],
+            requests: [turn])
+        let activity = ActivitySnapshot(
+            schemaVersion: 3,
+            generatedAtMs: slow.endedAtMs,
+            timezone: "UTC",
+            today: .zero,
+            sessions: [session],
+            days: [])
+
+        #expect(fast.averageGenerationTokensPerSecond == 100)
+        #expect(turn.averageGenerationTokensPerSecond == 62.5)
+        #expect(turn.menuAverageTPSText == "Avg 62.5 tok/s")
+        #expect(turn.menuDetail.hasSuffix("Avg 62.5 tok/s"))
+        #expect(session.averageGenerationTokensPerSecond == 62.5)
+        #expect(activity.menuAverageTPSText == "Avg 62.5 tok/s")
+        #expect(missingDuration.averageGenerationTokensPerSecond == nil)
+    }
+
     @Test("Turn keeps real main and subagent requests for nested menus")
     func turnContributions() {
         let main = self.makeRequest(id: "main", physicalSessionId: "root")
@@ -130,6 +192,7 @@ struct MenuRowPresentationTests {
         isSubagent: Bool = false,
         agent: String? = nil,
         durationMs: Int64? = nil,
+        tokens: TokenBreakdown = .zero,
         costUsd: Double = 0,
         costSource: ActivityCostSource = .unknown,
         prompt: String? = "Prompt",
@@ -148,7 +211,7 @@ struct MenuRowPresentationTests {
             startedAtMs: 1_700_000_000_000,
             endedAtMs: 1_700_000_001_000,
             durationMs: durationMs,
-            tokens: .zero,
+            tokens: tokens,
             costUsd: costUsd,
             costSource: costSource,
             promptPreview: prompt,

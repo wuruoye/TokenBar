@@ -26,6 +26,7 @@ public final class DashboardModel {
     public var quotaSnapshot: QuotaSnapshot? { self.quota.value }
     public var activitySnapshot: ActivitySnapshot? { self.activity.value }
 
+    @ObservationIgnored public var quotaResetHandler: ((QuotaResetEvent) -> Void)?
     @ObservationIgnored private let quotaService: any QuotaProviding
     @ObservationIgnored private let activityService: any ActivityProviding
     @ObservationIgnored private let cache: (any ActivitySnapshotCaching)?
@@ -36,6 +37,7 @@ public final class DashboardModel {
     @ObservationIgnored private let now: @Sendable () -> Date
     @ObservationIgnored private var quotaTimerTask: Task<Void, Never>?
     @ObservationIgnored private var refreshAllTask: Task<Void, Never>?
+    @ObservationIgnored private var quotaResetDetector = QuotaResetDetector()
     @ObservationIgnored private var isStarted = false
 
     public init(
@@ -146,6 +148,10 @@ public final class DashboardModel {
             let snapshot = try await self.quotaService.fetchQuota()
             try Task.checkCancellation()
             self.quota = DashboardSourceState(value: snapshot)
+            let resetEvents = self.quotaResetDetector.observe(snapshot, for: .codex)
+            for event in resetEvents {
+                self.quotaResetHandler?(event)
+            }
         } catch is CancellationError {
             self.quota = DashboardSourceState(
                 value: self.quota.value,

@@ -27,11 +27,13 @@ TokenBar is a native, standalone macOS menu bar app focused on Codex. It combine
 
 - See today's token total and remaining weekly quota directly in the menu bar.
 - Track weekly and available 5-hour quota windows, their reset times, and extra reset credits. The 5-hour row stays hidden when Codex does not return that window.
+- Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from the menu bar.
 - Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - Browse recent sessions using Codex-generated titles when available.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
+- Compare weighted average generation throughput from local output, reasoning-token, and wall-duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
@@ -138,6 +140,7 @@ Open **Settings** with `Command-,` to configure:
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
 - **Background refresh:** 1, 5, 10, or 15 minutes.
+- **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.
 
 ## Development
 
@@ -284,7 +287,7 @@ Run `cargo build --manifest-path Helper/Cargo.toml` before `swift run TokenBar`,
 
 ## Acknowledgements
 
-- [CodexBar](https://github.com/steipete/CodexBar) inspired TokenBar's focused native menu bar experience; its quota protocol behavior informed TokenBar's standalone integration.
+- [CodexBar](https://github.com/steipete/CodexBar) inspired TokenBar's focused native menu bar experience; its quota protocol and reset-celebration behavior informed TokenBar's standalone integration.
 - [Tokscale](https://github.com/junhoyeo/tokscale) established many of the local Codex accounting and compatibility semantics used by TokenBar. Portions of TokenBar's Codex parsing logic are adapted under the MIT License; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 TokenBar is a standalone implementation: neither project is a build-time or runtime dependency. Adapted portions are retained under their MIT licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

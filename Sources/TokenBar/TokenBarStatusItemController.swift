@@ -16,6 +16,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private let model: DashboardModel
     private let settings: TokenBarSettings
     private let requestDetailService: any RequestDetailProviding
+    private let showSettingsAction: () -> Void
     private let statusItem: NSStatusItem
     private let rootMenu = TokenBarMenu()
     private var sessionItems: [String: NSMenuItem] = [:]
@@ -32,15 +33,16 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var isRootMenuOpen = false
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
-    private var settingsWindowController: SettingsWindowController?
 
     init(
         model: DashboardModel,
         settings: TokenBarSettings = .shared,
+        showSettings: @escaping () -> Void = {},
         requestDetailService: any RequestDetailProviding = CodexRequestDetailService())
     {
         self.model = model
         self.settings = settings
+        self.showSettingsAction = showSettings
         self.requestDetailService = requestDetailService
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -78,8 +80,6 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.discardRequestDetailMenus(in: self.rootMenu)
         self.rootMenu.delegate = nil
         self.rootMenu.persistentActionDelegate = nil
-        self.settingsWindowController?.close()
-        self.settingsWindowController = nil
         self.statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(self.statusItem)
     }
@@ -176,6 +176,18 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         button.image = StatusLabelRenderer.image(today: today, weekly: weekly)
         button.toolTip = "Today: \(today) tokens · Weekly: \(weekly) left"
         button.setAccessibilityLabel("Today, \(today) tokens. Weekly quota, \(weekly) remaining.")
+    }
+
+    func celebrationOriginPoint(for _: TokenPlatform) -> CGPoint? {
+        guard let button = self.statusItem.button,
+              let window = button.window
+        else {
+            return nil
+        }
+        let windowPoint = button.convert(
+            CGPoint(x: button.bounds.midX, y: button.bounds.midY),
+            to: nil)
+        return window.convertPoint(toScreen: windowPoint)
     }
 
     private func observeModel() {
@@ -424,7 +436,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func configureSessionItem(_ item: NSMenuItem, session: SessionSummary) {
         let title = session.menuTitle
-        let detail = session.tokens.sessionMenuDetail
+        let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
         item.title = "Session"
         item.toolTip = "\(title)\n\(detail)\nEnded \(time)"
@@ -508,7 +520,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         row.configure(
             title: turn.menuRowTitle,
             cost: turn.menuCostText,
-            detail: turn.tokens.requestMenuDetail,
+            detail: turn.menuDetail,
             trailing: "\(turn.startedAt.menuClockText) · \(turn.menuDurationText)",
             showsChevron: physicalRequests.count > 1 || self.settings.showsFullRequestContentOnHover,
             badge: turn.menuServiceTierBadge)
@@ -546,7 +558,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             row.configure(
                 title: request.agentRequestMenuTitle,
                 cost: request.menuCostText,
-                detail: request.tokens.requestMenuDetail,
+                detail: request.menuDetail,
                 trailing: "\(request.startedAt.menuClockText) · \(request.menuDurationText)",
                 showsChevron: self.settings.showsFullRequestContentOnHover,
                 badge: request.menuServiceTierBadge)
@@ -682,10 +694,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     @objc private func requestDetailNoOp() {}
 
     @objc private func showSettings() {
-        if self.settingsWindowController == nil {
-            self.settingsWindowController = SettingsWindowController(settings: self.settings)
-        }
-        self.settingsWindowController?.show()
+        self.showSettingsAction()
     }
 
     @objc private func refreshNow() {

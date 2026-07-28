@@ -7,7 +7,11 @@ struct TokenBarApp: App {
 
     var body: some Scene {
         Settings {
-            TokenBarSettingsView(settings: .shared)
+            TokenBarSettingsView(
+                settings: .shared,
+                testResetAnimation: {
+                    self.appDelegate.testResetAnimation()
+                })
         }
     }
 }

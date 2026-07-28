@@ -4,14 +4,19 @@ import TokenBarCore
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    init(settings: TokenBarSettings = .shared) {
+    init(
+        settings: TokenBarSettings = .shared,
+        testResetAnimation: @escaping () -> Void = {})
+    {
         let hostingController = NSHostingController(
-            rootView: TokenBarSettingsView(settings: settings))
+            rootView: TokenBarSettingsView(
+                settings: settings,
+                testResetAnimation: testResetAnimation))
         let window = NSWindow(contentViewController: hostingController)
         window.title = "TokenBar Settings"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 440, height: 470))
+        window.setContentSize(NSSize(width: 440, height: 570))
         window.center()
         super.init(window: window)
     }

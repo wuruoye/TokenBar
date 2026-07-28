@@ -16,6 +16,7 @@ struct TokenBarSettingsTests {
             #expect(settings.backgroundRefreshDuration == .seconds(5 * 60))
             #expect(settings.statisticsTimeZone == .utc)
             #expect(settings.showsFullRequestContentOnHover)
+            #expect(settings.resetCelebration == .off)
         }
     }
 
@@ -28,6 +29,7 @@ struct TokenBarSettingsTests {
             settings?.refreshInterval = .fifteenMinutes
             settings?.statisticsTimeZone = .local
             settings?.showsFullRequestContentOnHover = false
+            settings?.resetCelebration = .both
             settings = nil
 
             let restored = TokenBarSettings(defaults: defaults, keyPrefix: prefix)
@@ -36,6 +38,7 @@ struct TokenBarSettingsTests {
             #expect(restored.refreshInterval == .fifteenMinutes)
             #expect(restored.statisticsTimeZone == .local)
             #expect(!restored.showsFullRequestContentOnHover)
+            #expect(restored.resetCelebration == .both)
         }
     }
 
@@ -46,12 +49,14 @@ struct TokenBarSettingsTests {
             defaults.set(7, forKey: "\(prefix).recentSessionCount")
             defaults.set(3, forKey: "\(prefix).refreshInterval")
             defaults.set("mars", forKey: "\(prefix).statisticsTimeZone")
+            defaults.set("fireworks", forKey: "\(prefix).resetCelebration")
 
             let settings = TokenBarSettings(defaults: defaults, keyPrefix: prefix)
             #expect(settings.theme == .system)
             #expect(settings.recentSessionCount == .ten)
             #expect(settings.refreshInterval == .fiveMinutes)
             #expect(settings.statisticsTimeZone == .utc)
+            #expect(settings.resetCelebration == .off)
         }
     }
 
@@ -64,6 +69,7 @@ struct TokenBarSettingsTests {
             settings.refreshInterval = .oneMinute
             settings.statisticsTimeZone = .local
             settings.showsFullRequestContentOnHover = false
+            settings.resetCelebration = .session
 
             settings.resetToDefaults()
 
@@ -73,6 +79,7 @@ struct TokenBarSettingsTests {
             #expect(restored.refreshInterval == .fiveMinutes)
             #expect(restored.statisticsTimeZone == .utc)
             #expect(restored.showsFullRequestContentOnHover)
+            #expect(restored.resetCelebration == .off)
         }
     }
 

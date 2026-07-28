@@ -10,7 +10,11 @@ let package = Package(
         .library(name: "TokenBarCore", targets: ["TokenBarCore"]),
         .executable(name: "TokenBar", targets: ["TokenBar"]),
     ],
-    dependencies: [],
+    dependencies: [
+        .package(
+            url: "https://github.com/zats/Vortex",
+            revision: "ef5392088d4aeb255c4eee83157dbdafcd31bf07"),
+    ],
     targets: [
         .target(
             name: "TokenBarCore",
@@ -20,7 +24,10 @@ let package = Package(
             ]),
         .executableTarget(
             name: "TokenBar",
-            dependencies: ["TokenBarCore"],
+            dependencies: [
+                "TokenBarCore",
+                .product(name: "Vortex", package: "Vortex"),
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),

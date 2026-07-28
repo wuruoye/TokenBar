@@ -52,6 +52,20 @@ public extension TokenBreakdown {
 }
 
 public extension RequestSummary {
+    var averageGenerationTokensPerSecond: Double? {
+        weightedAverageGenerationTokensPerSecond(for: self.physicalRequests)
+    }
+
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+
+    var menuDetail: String {
+        [self.tokens.requestMenuDetail, self.menuAverageTPSText]
+            .compactMap(\.self)
+            .joined(separator: " · ")
+    }
+
     var menuServiceTier: ActivityServiceTier {
         let physicalTier = ActivityServiceTier.combining(
             self.physicalRequests.map { $0.serviceTier ?? .unknown })
@@ -105,6 +119,21 @@ public extension RequestSummary {
 }
 
 public extension SessionSummary {
+    var averageGenerationTokensPerSecond: Double? {
+        weightedAverageGenerationTokensPerSecond(
+            for: self.requests.flatMap(\.physicalRequests))
+    }
+
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+
+    var menuDetail: String {
+        [self.tokens.sessionMenuDetail, self.menuAverageTPSText]
+            .compactMap(\.self)
+            .joined(separator: " · ")
+    }
+
     var menuServiceTier: ActivityServiceTier {
         ActivityServiceTier.combining(self.requests.map(\.menuServiceTier))
     }
@@ -123,6 +152,46 @@ public extension SessionSummary {
     }
 }
 
+public extension ActivitySnapshot {
+    var averageGenerationTokensPerSecond: Double? {
+        weightedAverageGenerationTokensPerSecond(
+            for: self.sessions.flatMap { session in
+                session.requests.flatMap(\.physicalRequests)
+            })
+    }
+
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+}
+
+private func weightedAverageGenerationTokensPerSecond(
+    for requests: [RequestSummary]) -> Double?
+{
+    var generatedTokens = 0.0
+    var durationMs = 0.0
+    for request in requests {
+        guard let requestDurationMs = request.durationMs,
+              requestDurationMs > 0
+        else {
+            continue
+        }
+        let requestGeneratedTokens = Double(max(0, request.tokens.output))
+            + Double(max(0, request.tokens.reasoning))
+        guard requestGeneratedTokens > 0 else { continue }
+        generatedTokens += requestGeneratedTokens
+        durationMs += Double(requestDurationMs)
+    }
+    guard generatedTokens.isFinite,
+          durationMs.isFinite,
+          generatedTokens > 0,
+          durationMs > 0
+    else {
+        return nil
+    }
+    return generatedTokens * 1_000 / durationMs
+}
+
 private extension ActivityServiceTier {
     var menuBadge: String? {
         switch self {
@@ -130,6 +199,40 @@ private extension ActivityServiceTier {
         case .mixed: "MIXED"
         case .unknown, .standard: nil
         }
+    }
+}
+
+private extension Double {
+    var menuAverageTPSText: String? {
+        guard self.isFinite, self >= 0 else { return nil }
+        let value: String
+        if self >= 1_000_000 {
+            value = String(
+                format: "%.1fM",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self / 1_000_000)
+        } else if self >= 1_000 {
+            value = String(
+                format: "%.1fK",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self / 1_000)
+        } else if self >= 100 {
+            value = String(
+                format: "%.0f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self)
+        } else if self >= 10 {
+            value = String(
+                format: "%.1f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self)
+        } else {
+            value = String(
+                format: "%.2f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self)
+        }
+        return "Avg \(value) tok/s"
     }
 }
 

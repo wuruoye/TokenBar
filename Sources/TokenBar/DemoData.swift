@@ -361,7 +361,7 @@ enum DemoPreviewRenderer {
         sessionRow.configure(
             title: session.menuTitle,
             cost: session.menuCostText,
-            detail: session.tokens.sessionMenuDetail,
+            detail: session.menuDetail,
             trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
             showsChevron: true,
             badge: session.menuServiceTierBadge)
@@ -370,7 +370,7 @@ enum DemoPreviewRenderer {
         requestRow.configure(
             title: request.menuRowTitle,
             cost: request.menuCostText,
-            detail: request.tokens.requestMenuDetail,
+            detail: request.menuDetail,
             trailing: "\(request.startedAt.demoClockText) · \(request.menuDurationText)",
             showsChevron: true,
             badge: request.menuServiceTierBadge)
@@ -381,7 +381,7 @@ enum DemoPreviewRenderer {
             row.configure(
                 title: physicalRequest.agentRequestMenuTitle,
                 cost: physicalRequest.menuCostText,
-                detail: physicalRequest.tokens.requestMenuDetail,
+                detail: physicalRequest.menuDetail,
                 trailing: "\(physicalRequest.startedAt.demoClockText) · \(physicalRequest.menuDurationText)",
                 showsChevron: true,
                 badge: physicalRequest.menuServiceTierBadge)
@@ -455,7 +455,7 @@ enum DemoPreviewRenderer {
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .light)
         let host = NSHostingView(rootView: content)
-        host.frame = NSRect(x: 0, y: 0, width: 440, height: 390)
+        host.frame = NSRect(x: 0, y: 0, width: 440, height: 570)
         let canvas = DemoRowPreviewCanvas(frame: host.bounds)
         host.frame = canvas.bounds
         canvas.addSubview(host)
