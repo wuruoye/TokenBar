@@ -15,6 +15,7 @@ struct TokenBarSettingsTests {
             #expect(settings.refreshInterval == .fiveMinutes)
             #expect(settings.backgroundRefreshDuration == .seconds(5 * 60))
             #expect(settings.statisticsTimeZone == .utc)
+            #expect(settings.showsClaude)
             #expect(settings.showsFullRequestContentOnHover)
             #expect(settings.resetCelebration == .off)
         }
@@ -28,6 +29,7 @@ struct TokenBarSettingsTests {
             settings?.recentSessionCount = .five
             settings?.refreshInterval = .fifteenMinutes
             settings?.statisticsTimeZone = .local
+            settings?.showsClaude = false
             settings?.showsFullRequestContentOnHover = false
             settings?.resetCelebration = .both
             settings = nil
@@ -37,6 +39,7 @@ struct TokenBarSettingsTests {
             #expect(restored.recentSessionLimit == 5)
             #expect(restored.refreshInterval == .fifteenMinutes)
             #expect(restored.statisticsTimeZone == .local)
+            #expect(!restored.showsClaude)
             #expect(!restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .both)
         }
@@ -68,6 +71,7 @@ struct TokenBarSettingsTests {
             settings.recentSessionCount = .five
             settings.refreshInterval = .oneMinute
             settings.statisticsTimeZone = .local
+            settings.showsClaude = false
             settings.showsFullRequestContentOnHover = false
             settings.resetCelebration = .session
 
@@ -78,6 +82,7 @@ struct TokenBarSettingsTests {
             #expect(restored.recentSessionCount == .ten)
             #expect(restored.refreshInterval == .fiveMinutes)
             #expect(restored.statisticsTimeZone == .utc)
+            #expect(restored.showsClaude)
             #expect(restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .off)
         }

@@ -100,6 +100,7 @@ public final class TokenBarSettings {
     public static let defaultRecentSessionCount = TokenBarRecentSessionCount.ten
     public static let defaultRefreshInterval = TokenBarRefreshInterval.fiveMinutes
     public static let defaultStatisticsTimeZone = TokenBarStatisticsTimeZone.utc
+    public static let defaultShowsClaude = true
     public static let defaultShowsFullRequestContentOnHover = true
     public static let defaultResetCelebration = TokenBarResetCelebration.off
 
@@ -120,6 +121,14 @@ public final class TokenBarSettings {
             self.defaults.set(
                 self.statisticsTimeZone.rawValue,
                 forKey: self.keys.statisticsTimeZone)
+        }
+    }
+
+    public var showsClaude: Bool {
+        didSet {
+            self.defaults.set(
+                self.showsClaude,
+                forKey: self.keys.showsClaude)
         }
     }
 
@@ -159,6 +168,9 @@ public final class TokenBarSettings {
             rawValue: defaults.integer(forKey: self.keys.refreshInterval)) ?? Self.defaultRefreshInterval
         self.statisticsTimeZone = defaults.string(forKey: self.keys.statisticsTimeZone)
             .flatMap(TokenBarStatisticsTimeZone.init(rawValue:)) ?? Self.defaultStatisticsTimeZone
+        self.showsClaude = defaults.object(
+            forKey: self.keys.showsClaude) as? Bool
+            ?? Self.defaultShowsClaude
         self.showsFullRequestContentOnHover = defaults.object(
             forKey: self.keys.showsFullRequestContentOnHover) as? Bool
             ?? Self.defaultShowsFullRequestContentOnHover
@@ -171,6 +183,7 @@ public final class TokenBarSettings {
         self.recentSessionCount = Self.defaultRecentSessionCount
         self.refreshInterval = Self.defaultRefreshInterval
         self.statisticsTimeZone = Self.defaultStatisticsTimeZone
+        self.showsClaude = Self.defaultShowsClaude
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
         self.resetCelebration = Self.defaultResetCelebration
     }
@@ -180,6 +193,7 @@ public final class TokenBarSettings {
         let recentSessionCount: String
         let refreshInterval: String
         let statisticsTimeZone: String
+        let showsClaude: String
         let showsFullRequestContentOnHover: String
         let resetCelebration: String
 
@@ -188,6 +202,7 @@ public final class TokenBarSettings {
             self.recentSessionCount = "\(prefix).recentSessionCount"
             self.refreshInterval = "\(prefix).refreshInterval"
             self.statisticsTimeZone = "\(prefix).statisticsTimeZone"
+            self.showsClaude = "\(prefix).showsClaude"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
             self.resetCelebration = "\(prefix).resetCelebration"
         }

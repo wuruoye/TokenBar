@@ -23,7 +23,7 @@ public enum RequestDetailServiceError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .missingSessionPath:
-            return "The original Codex session file is unavailable. Refresh TokenBar and try again."
+            return "The original session file is unavailable. Refresh TokenBar and try again."
         case let .helperNotFound(paths):
             let searched = paths.isEmpty ? "no candidate paths" : paths.joined(separator: ", ")
             return "tokenbar-helper was not found (searched: \(searched))."
@@ -85,6 +85,7 @@ public struct CodexRequestDetailService: RequestDetailProviding, Sendable {
             executableURL: helperURL,
             arguments: [
                 "request-detail",
+                "--platform", request.platformID.rawValue,
                 "--session-path", sessionPath,
                 "--start-ms", String(request.startedAtMs),
                 "--end-ms", String(request.endedAtMs),

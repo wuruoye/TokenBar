@@ -4,7 +4,7 @@ import TokenBarCore
 
 struct ActivityDetailView: View {
     static let preferredWidth: CGFloat = 580
-    static let preferredHeight: CGFloat = 450
+    static let preferredHeight: CGFloat = 540
 
     @Bindable var model: DashboardModel
     let accentColor: Color
@@ -12,7 +12,7 @@ struct ActivityDetailView: View {
     @State private var selectedDate: String?
 
     private var days: [DailySummary] {
-        Array((self.model.activitySnapshot?.days ?? []).sorted { $0.date < $1.date }.suffix(30))
+        Array((self.model.visibleActivitySnapshot?.days ?? []).sorted { $0.date < $1.date }.suffix(30))
     }
 
     private var selectedDay: DailySummary? {
@@ -24,11 +24,38 @@ struct ActivityDetailView: View {
         return self.days.last(where: { $0.tokens.total > 0 }) ?? self.days.last
     }
 
+    private var rangeTotals: ActivityTotals? {
+        guard let snapshot = self.model.visibleActivitySnapshot else { return nil }
+        if let totals = snapshot.rangeTotals {
+            return totals
+        }
+
+        let tokens = self.days.reduce(TokenBreakdown.zero) { total, day in
+            TokenBreakdown(
+                input: total.input.saturatingAdd(day.tokens.input),
+                output: total.output.saturatingAdd(day.tokens.output),
+                cacheRead: total.cacheRead.saturatingAdd(day.tokens.cacheRead),
+                cacheWrite: total.cacheWrite.saturatingAdd(day.tokens.cacheWrite),
+                reasoning: total.reasoning.saturatingAdd(day.tokens.reasoning))
+        }
+        return ActivityTotals(
+            tokens: tokens,
+            costUsd: self.days.reduce(0) { $0 + $1.costUsd },
+            requestCount: self.days.reduce(0) { $0 + $1.requestCount },
+            sessionCount: self.days.reduce(0) { $0 + $1.sessionCount })
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             self.header
             self.chart
                 .frame(height: 150)
+            if let totals = self.rangeTotals {
+                ActivityTotalsBreakdown(
+                    totals: totals,
+                    averageTPSText: totals.menuAverageTPSText,
+                    accentColor: self.accentColor)
+            }
             Divider()
             if let day = self.selectedDay {
                 self.dayDetail(day)
@@ -36,7 +63,7 @@ struct ActivityDetailView: View {
                 ContentUnavailableView(
                     "No activity",
                     systemImage: "chart.bar",
-                    description: Text("Activity will appear after Codex sessions are scanned."))
+                    description: Text("Activity will appear after local sessions are scanned."))
             }
         }
         .padding(16)
@@ -55,11 +82,8 @@ struct ActivityDetailView: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
             Spacer()
-            if let snapshot = self.model.activitySnapshot {
-                Text(
-                    snapshot.days.suffix(30)
-                        .reduce(Int64(0)) { $0.saturatingAdd($1.tokens.total) }
-                        .compactCount)
+            if let totals = self.rangeTotals {
+                Text(totals.tokens.total.compactCount)
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Text("tokens")

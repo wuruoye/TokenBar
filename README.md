@@ -5,7 +5,7 @@
 <h1 align="center">TokenBar</h1>
 
 <p align="center">
-  Codex quota and token activity, at a glance in your macOS menu bar.
+  Codex and Claude Code quota and token activity, at a glance in your macOS menu bar.
 </p>
 
 <p align="center">
@@ -19,21 +19,25 @@
   <img src="docs/images/dashboard.png" width="460" alt="TokenBar dashboard showing Codex quota, today's token usage, weekly-reset totals, and recent activity">
 </p>
 
-TokenBar is a native, standalone macOS menu bar app focused on Codex. It combines live quota windows with local token accounting, cost estimates, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
+TokenBar is a native, standalone macOS menu bar app for Codex and Claude Code. It combines each platform's live quota windows with local token accounting, cost estimates, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
 
 > TokenBar is an independent project and is not affiliated with or endorsed by OpenAI.
 
 ## Highlights
 
-- See today's token total and remaining weekly quota directly in the menu bar.
-- Track weekly and available 5-hour quota windows, their reset times, and extra reset credits. The 5-hour row stays hidden when Codex does not return that window.
-- Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from the menu bar.
+- See one compact menu bar item with separate Codex-icon `T/W` and Claude-icon `T/W` sections.
+- Click either section to open TokenBar directly on that platform's tab.
+- Switch between the **Codex** and **Claude** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
+- Hide or restore the Claude section and tab immediately from Settings, without restarting TokenBar.
+- Track Codex and Claude quota windows independently without mixing percentages or reset cycles.
+- Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
+- Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
 - Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
-- Browse recent sessions using Codex-generated titles when available.
+- Browse the selected platform's recent sessions, using Codex-generated titles when available, or click one to open the existing matching thread directly in the desktop app. Claude links reuse Claude Desktop's indexed local-session mapping and never import or duplicate the CLI transcript; an unindexed CLI session falls back to Claude's Local Sessions page.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
-- Compare weighted average generation throughput from local output, reasoning-token, and wall-duration data at the day, session, turn, and physical-request levels.
+- Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
@@ -50,7 +54,9 @@ _The screenshots use generated demo data and contain no real account or session 
 ## Requirements
 
 - macOS 14 or later.
-- [Codex CLI](https://developers.openai.com/codex/cli/) installed and authenticated. Running `codex` in Terminal should work before starting TokenBar; `CODEX_CLI_PATH` can point to a nonstandard installation.
+- At least one supported client:
+  - [Codex CLI](https://developers.openai.com/codex/cli/) installed and authenticated. Running `codex` in Terminal should work before starting TokenBar; `CODEX_CLI_PATH` can point to a nonstandard installation.
+  - Claude Code installed, used at least once, and authenticated. TokenBar reads its local projects from `~/.claude/projects` (or `CLAUDE_CONFIG_DIR`) and its existing OAuth credential for quota.
 - To build from source: Apple Swift 6.2 command-line tools and a recent stable Rust toolchain with Cargo.
 
 TokenBar is currently distributed from source. There is no prebuilt, notarized GitHub release yet.
@@ -80,11 +86,12 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 ## Usage
 
 1. Launch `TokenBar.app`. TokenBar appears only in the menu bar; it has no Dock icon.
-2. Open the menu to refresh quota and local activity immediately.
-3. Hover **Activity** for the daily chart and per-model breakdowns.
-4. Hover a recent session to see its turns. A turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
-5. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
-6. Use **Copy Session** or click a request row to copy its stable locator.
+2. Click the Codex-icon `T/W` section to open the **Codex** tab, or the Claude-icon `T/W` section to open the **Claude** tab. Opening the menu refreshes local activity and any quota data older than one minute.
+3. Use the two tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
+4. Hover **Activity** for the daily chart and per-model breakdowns.
+5. Click a recent session to open it in the matching Codex or Claude desktop app. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
+6. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
+7. Use **Copy Session** or click a request row to copy its stable locator.
 
 Useful shortcuts:
 
@@ -96,13 +103,17 @@ The default background refresh interval is five minutes. Opening the menu always
 
 ## How counting works
 
-TokenBar presents local Codex activity in three levels:
+TokenBar normalizes Codex and Claude Code into the same three activity levels:
 
-1. **Session** — a root Codex conversation. TokenBar prefers the Codex-generated title and falls back to the first useful prompt.
+1. **Session** — a root conversation within one platform. TokenBar prefers the Codex-generated title when available and otherwise falls back to the first useful prompt.
 2. **Turn** — the interval beginning with a root user prompt and ending before the next root user prompt. Main-thread and subagent requests launched for that prompt are aggregated into the turn, including subagent work that finishes later.
-3. **Physical request** — the original main or subagent activity recorded in a specific Codex session log. These rows retain their own model, token, cache, cost, duration, prompt/output detail, and copy locator.
+3. **Physical request** — the original main or subagent activity recorded in a specific client session log. These rows retain their own platform, model, token, cache, cost, duration, prompt/output detail, and copy locator.
+
+Platform is part of every aggregation and identity key, so a Codex session and a Claude session with the same raw ID remain separate. Claude Code's repeated streaming snapshots are deduplicated by message/request identity before totals are calculated.
 
 Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex reports reasoning tokens as part of output tokens; TokenBar normalizes that breakdown before aggregation so reasoning is counted and priced once.
+
+`Avg tok/s` divides generated output plus reasoning tokens by the summed active duration of the underlying model requests. Tool execution, polling, and other time between model requests stay in the displayed turn duration but are excluded from TPS. TokenBar omits TPS when a local transcript does not expose enough request-boundary timing to calculate it reliably.
 
 Codex records Fast mode as the `priority` service tier (`fast` is also accepted for older logs); `default` and `standard` are treated as Standard. When every service-tier snapshot in one physical session agrees, TokenBar applies that tier to the whole session, including usage written before the first snapshot. If a session switches tier, TokenBar follows the timeline from each snapshot and leaves any prefix before the first snapshot unknown. Subagents inherit the last tier from their replayed parent context without counting the parent's earlier tier history as their own. A turn containing both Fast and Standard physical requests is marked `MIXED`.
 
@@ -120,22 +131,25 @@ Fast pricing never changes raw token/cache counts. Quota percentages come from C
 
 ## Privacy
 
-TokenBar is designed to keep Codex session content local:
+TokenBar is designed to keep session content local:
 
 - The Rust helper reads Codex JSONL logs under `~/.codex/sessions` and `~/.codex/archived_sessions`, or the equivalent directory selected by `CODEX_HOME`.
+- It reads Claude Code JSONL logs under `~/.claude/projects`, or the equivalent directory selected by `CLAUDE_CONFIG_DIR`.
 - Codex-generated titles are read from `session_index.jsonl` in the same Codex home directory.
 - Local activity parsing, turn attribution, and pricing do not upload session content, fetch remote pricing, or read a Tokscale runtime cache.
 - Full prompt and output text is read lazily when a request detail menu opens and is retained in memory only for the current process.
 - The persistent activity cache omits titles, prompt/output previews, and source paths, including those nested under physical requests. It is stored at `~/Library/Application Support/TokenBar/activity-snapshot.json` with owner-only permissions.
+- The last successful provider quota snapshots are stored at `~/Library/Application Support/TokenBar/quota-snapshots.json`, also with owner-only permissions, so a temporary provider rate limit does not blank the menu.
 - TokenBar contains no telemetry or analytics integration.
 
-Quota is the intentional network-facing part of the app. TokenBar asks the locally installed Codex app-server for current rate limits. The optional extra-reset lookup uses the existing Codex OAuth credentials in the user's Codex home to query the Codex usage service; TokenBar does not write or copy those credentials into its own cache. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
+Quota is the intentional network-facing part of the app. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when that endpoint rate-limits a refresh, TokenBar can use Claude Desktop's recent local usage sample. TokenBar does not refresh, rewrite, or copy either provider's credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
 
 ## Settings
 
 Open **Settings** with `Command-,` to configure:
 
 - **Theme color:** System, Blue, Purple, Green, Orange, or Pink.
+- **Show Claude Code:** add or remove the Claude `T/W` section and Claude tab immediately. When hidden, TokenBar skips Claude quota refreshes and does not read the Claude credential from disk or the macOS Keychain.
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
@@ -144,7 +158,7 @@ Open **Settings** with `Command-,` to configure:
 
 ## Development
 
-No sibling repository checkout is required. The Swift package contains the menu bar UI and standalone Codex quota client; `Helper` contains the Codex-only Rust parser and activity aggregator.
+No sibling repository checkout is required. The Swift package contains the menu bar UI and independent Codex/Claude quota clients; `Helper` contains the platform adapters and shared Rust activity aggregator.
 
 ### Build and run
 
@@ -164,7 +178,7 @@ cargo build --locked --manifest-path Helper/Cargo.toml
 
 ### Test
 
-The test suites use fixtures and do not require a live Codex account:
+The test suites use fixtures and do not require live provider accounts:
 
 ```bash
 swift test
@@ -244,7 +258,7 @@ TokenBar does not embed Sparkle yet, so GitHub Releases are the update channel f
 ```text
 Sources/TokenBar/             AppKit/SwiftUI menu bar UI
 Sources/TokenBarCore/         Models, quota client, caching, and presentation logic
-Helper/                       Codex-only Rust parser and activity aggregator
+Helper/                       Codex/Claude parsers and shared activity aggregator
 Tests/TokenBarCoreTests/      Swift behavior and fixture tests
 Resources/                    Bundle metadata and app icon assets
 Scripts/package_app.sh        Build, embed, sign, and verify TokenBar.app
@@ -253,7 +267,7 @@ Scripts/build_icon.sh         Regenerate AppIcon.icns from the 1024 px source
 Scripts/generate_licenses.sh  Refresh the bundled Rust dependency licenses
 ```
 
-The quota and activity sources maintain independent state. A local-log parsing failure does not erase the last valid quota snapshot, and a quota failure does not hide local activity.
+Each platform's quota and the shared activity source maintain independent state. One provider's authentication failure does not erase another provider's last valid quota snapshot, and a quota failure does not hide local activity.
 
 ## Troubleshooting
 
@@ -267,7 +281,7 @@ This is intentional when Codex returns no 5-hour window. Weekly quota can still 
 
 ### No local activity appears
 
-Confirm that Codex has created JSONL files under `~/.codex/sessions` or `~/.codex/archived_sessions`. If you use a custom Codex home, launch TokenBar with the same `CODEX_HOME` environment.
+Confirm that the client has created JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, or `~/.claude/projects`. If you use a custom home, launch TokenBar with the same `CODEX_HOME` or `CLAUDE_CONFIG_DIR` environment.
 
 ### An extra reset count is missing
 
@@ -288,7 +302,7 @@ Run `cargo build --manifest-path Helper/Cargo.toml` before `swift run TokenBar`,
 ## Acknowledgements
 
 - [CodexBar](https://github.com/steipete/CodexBar) inspired TokenBar's focused native menu bar experience; its quota protocol and reset-celebration behavior informed TokenBar's standalone integration.
-- [Tokscale](https://github.com/junhoyeo/tokscale) established many of the local Codex accounting and compatibility semantics used by TokenBar. Portions of TokenBar's Codex parsing logic are adapted under the MIT License; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- [Tokscale](https://github.com/junhoyeo/tokscale) established many of the local Codex and Claude Code accounting, parsing, quota, and compatibility semantics used by TokenBar. Adapted portions are used under the MIT License; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 TokenBar is a standalone implementation: neither project is a build-time or runtime dependency. Adapted portions are retained under their MIT licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

@@ -29,19 +29,25 @@ struct SessionMenuTests {
 
     @Test("session title prefers Codex title, then root prompt, then workspace")
     func sessionTitle() {
-        let session = Self.session(
+        let session = SessionSummary(
             id: "session",
-            endedAtMs: 3,
             workspaceLabel: "workspace",
+            startedAtMs: 0,
+            endedAtMs: 3,
+            tokens: .zero,
+            costUsd: 0,
+            models: ["gpt-test"],
             requests: [
                 Self.request(id: "later", startedAtMs: 2, prompt: "later prompt", isSubagent: false),
                 Self.request(id: "subagent", startedAtMs: 0, prompt: "subagent prompt", isSubagent: true),
                 Self.request(id: "first", startedAtMs: 1, prompt: "  first\n prompt  ", isSubagent: false),
             ],
-            title: "  generated\n title  ")
+            title: "  generated\n title  ",
+            workspacePath: "/tmp/private-workspace")
 
         #expect(session.menuTitle == "generated title")
         #expect(session.redactedForCache().menuTitle == "workspace")
+        #expect(session.redactedForCache().workspacePath == nil)
 
         let promptFallback = Self.session(
             id: "fallback",

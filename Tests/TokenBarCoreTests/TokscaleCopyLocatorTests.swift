@@ -29,6 +29,33 @@ struct TokscaleCopyLocatorTests {
         #expect(!request.tokscaleCopyText.contains("\n"))
     }
 
+    @Test("Claude copy uses the Claude platform locator")
+    func claudeLocator() {
+        let codex = self.makeRequest()
+        let request = RequestSummary(
+            id: codex.id,
+            sessionId: codex.sessionId,
+            physicalSessionId: codex.physicalSessionId,
+            isSubagent: codex.isSubagent,
+            agent: codex.agent,
+            model: "claude-sonnet-4-5",
+            provider: "anthropic",
+            startedAtMs: codex.startedAtMs,
+            endedAtMs: codex.endedAtMs,
+            durationMs: codex.durationMs,
+            tokens: codex.tokens,
+            costUsd: codex.costUsd,
+            costSource: codex.costSource,
+            promptPreview: codex.promptPreview,
+            outputPreview: codex.outputPreview,
+            sessionPath: codex.sessionPath,
+            platform: .claude)
+
+        #expect(
+            request.tokscaleCopyText
+                == "platform=claude session_id=child-session request_range=1779000000000..1779000003000")
+    }
+
     private func makeRequest() -> RequestSummary {
         RequestSummary(
             id: "request",

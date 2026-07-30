@@ -87,6 +87,12 @@ mkdir -p \
 
 cp "$ROOT/Resources/Info.plist" "$STAGING_PATH/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$STAGING_PATH/Contents/Resources/AppIcon.icns"
+RESOURCE_BUNDLE_PATH="$SWIFT_BIN_DIR/TokenBar_TokenBar.bundle"
+if [[ ! -d "$RESOURCE_BUNDLE_PATH" ]]; then
+  echo "Missing TokenBar resource bundle: $RESOURCE_BUNDLE_PATH" >&2
+  exit 1
+fi
+cp -R "$RESOURCE_BUNDLE_PATH" "$STAGING_PATH/Contents/Resources/"
 for notice in LICENSE THIRD_PARTY_NOTICES.md; do
   if [[ -f "$ROOT/$notice" ]]; then
     cp "$ROOT/$notice" "$STAGING_PATH/Contents/Resources/$notice"

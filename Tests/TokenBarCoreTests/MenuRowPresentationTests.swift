@@ -44,11 +44,12 @@ struct MenuRowPresentationTests {
         #expect(self.makeRequest(durationMs: 123_900).menuDurationText == "2m3s")
     }
 
-    @Test("Average TPS is weighted by valid physical request duration")
+    @Test("Average TPS is weighted by active model request duration")
     func averageTPS() {
         let fast = self.makeRequest(
             id: "fast",
-            durationMs: 1_000,
+            durationMs: 60_000,
+            modelDurationMs: 1_000,
             tokens: TokenBreakdown(
                 input: 10_000,
                 output: 80,
@@ -57,7 +58,8 @@ struct MenuRowPresentationTests {
                 reasoning: 20))
         let slow = self.makeRequest(
             id: "slow",
-            durationMs: 3_000,
+            durationMs: 120_000,
+            modelDurationMs: 3_000,
             tokens: TokenBreakdown(
                 input: 20_000,
                 output: 120,
@@ -66,6 +68,7 @@ struct MenuRowPresentationTests {
                 reasoning: 30))
         let missingDuration = self.makeRequest(
             id: "unknown",
+            durationMs: 1_000,
             tokens: TokenBreakdown(
                 input: 0,
                 output: 10_000,
@@ -96,6 +99,12 @@ struct MenuRowPresentationTests {
             today: .zero,
             sessions: [session],
             days: [])
+        let rangeTotals = ActivityTotals(
+            tokens: session.tokens,
+            costUsd: 0,
+            requestCount: 2,
+            sessionCount: 1,
+            averageGenerationTokensPerSecond: 62.5)
 
         #expect(fast.averageGenerationTokensPerSecond == 100)
         #expect(turn.averageGenerationTokensPerSecond == 62.5)
@@ -103,6 +112,7 @@ struct MenuRowPresentationTests {
         #expect(turn.menuDetail.hasSuffix("Avg 62.5 tok/s"))
         #expect(session.averageGenerationTokensPerSecond == 62.5)
         #expect(activity.menuAverageTPSText == "Avg 62.5 tok/s")
+        #expect(rangeTotals.menuAverageTPSText == "Avg 62.5 tok/s")
         #expect(missingDuration.averageGenerationTokensPerSecond == nil)
     }
 
@@ -192,6 +202,7 @@ struct MenuRowPresentationTests {
         isSubagent: Bool = false,
         agent: String? = nil,
         durationMs: Int64? = nil,
+        modelDurationMs: Int64? = nil,
         tokens: TokenBreakdown = .zero,
         costUsd: Double = 0,
         costSource: ActivityCostSource = .unknown,
@@ -211,6 +222,7 @@ struct MenuRowPresentationTests {
             startedAtMs: 1_700_000_000_000,
             endedAtMs: 1_700_000_001_000,
             durationMs: durationMs,
+            modelDurationMs: modelDurationMs,
             tokens: tokens,
             costUsd: costUsd,
             costSource: costSource,

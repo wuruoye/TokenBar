@@ -3,6 +3,7 @@ import Foundation
 import Testing
 
 private actor ResetSequenceQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.codex
     private var snapshots: [QuotaSnapshot]
 
     init(_ snapshots: [QuotaSnapshot]) {
@@ -107,7 +108,8 @@ struct QuotaResetDetectorTests {
         ])
         let model = DashboardModel(
             quotaService: provider,
-            cache: nil)
+            cache: nil,
+            quotaCache: nil)
         var events: [QuotaResetEvent] = []
         model.quotaResetHandler = { events.append($0) }
 

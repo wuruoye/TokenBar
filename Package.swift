@@ -28,6 +28,9 @@ let package = Package(
                 "TokenBarCore",
                 .product(name: "Vortex", package: "Vortex"),
             ],
+            resources: [
+                .process("Resources"),
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),

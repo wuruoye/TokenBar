@@ -171,6 +171,9 @@ struct CodexParseState {
     service_tier_consensus: Option<ServiceTier>,
     service_tier_conflicted: bool,
     current_turn_start_ms: Option<i64>,
+    current_model_request_start_ms: Option<i64>,
+    current_model_response_end_ms: Option<i64>,
+    pending_next_model_request_start_ms: Option<i64>,
     previous_totals: Option<CodexTotals>,
     session_is_headless: bool,
     session_id_from_meta: Option<String>,
@@ -192,7 +195,19 @@ struct CodexParseState {
     forked_child_is_user_fork: bool,
 }
 
-pub fn parse_codex_file(path: &Path) -> Result<Vec<UnifiedMessage>, String> {
+#[derive(Debug)]
+pub(super) struct ParsedCodexFile {
+    pub(super) messages: Vec<UnifiedMessage>,
+    pub(super) service_tier_snapshots: Vec<ServiceTierSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ServiceTierSnapshot {
+    pub(super) timestamp_ms: i64,
+    pub(super) tier: ServiceTier,
+}
+
+pub(super) fn parse_codex_file(path: &Path) -> Result<ParsedCodexFile, String> {
     let file = File::open(path)
         .map_err(|error| format!("could not open Codex session {}: {error}", path.display()))?;
     let session_id = session_id_from_path(path);
@@ -210,8 +225,9 @@ fn parse_codex_reader<R: BufRead>(
     session_id: &str,
     fallback_timestamp: i64,
     mut state: CodexParseState,
-) -> Result<Vec<UnifiedMessage>, String> {
+) -> Result<ParsedCodexFile, String> {
     let mut messages = Vec::with_capacity(64);
+    let mut service_tier_snapshots = Vec::new();
     let mut pending_model_messages = Vec::new();
     let mut line = String::with_capacity(4096);
 
@@ -236,9 +252,14 @@ fn parse_codex_reader<R: BufRead>(
             let entry_timestamp = entry.timestamp;
 
             if let Some(payload) = entry.payload {
+                let parsed_entry_timestamp =
+                    parse_codex_entry_timestamp(entry_timestamp.as_deref());
                 let payload_model = extract_model(&payload);
                 let is_token_count = entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("token_count");
+                let is_response_item = entry_type == "response_item";
+                let response_item_is_tool_output =
+                    is_response_item && codex_response_item_is_tool_output(&payload);
                 let is_thread_settings_applied = entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("thread_settings_applied");
                 let service_tier_snapshot = is_thread_settings_applied
@@ -305,6 +326,7 @@ fn parse_codex_reader<R: BufRead>(
                     && event_model.is_none()
                     && !is_token_count
                     && entry_type != "session_meta"
+                    && !is_response_item
                 {
                     flush_pending_model_messages(
                         &mut pending_model_messages,
@@ -318,14 +340,24 @@ fn parse_codex_reader<R: BufRead>(
                 }
 
                 if is_thread_settings_applied {
+                    if let Some(timestamp_ms) =
+                        parse_codex_entry_timestamp(entry_timestamp.as_deref())
+                    {
+                        service_tier_snapshots.push(ServiceTierSnapshot {
+                            timestamp_ms,
+                            tier: service_tier_from_raw(service_tier_snapshot),
+                        });
+                    }
                     record_service_tier_snapshot(&mut state, service_tier_snapshot, true);
                     handled = true;
                 }
 
                 if entry_type == "turn_context" {
                     state.current_model = payload_model.clone();
-                    state.current_turn_start_ms =
-                        parse_codex_entry_timestamp(entry_timestamp.as_deref());
+                    state.current_turn_start_ms = parsed_entry_timestamp;
+                    state.current_model_request_start_ms = parsed_entry_timestamp;
+                    state.current_model_response_end_ms = None;
+                    state.pending_next_model_request_start_ms = None;
                     if let Some(model) = state.current_model.as_ref() {
                         flush_pending_model_messages(
                             &mut pending_model_messages,
@@ -341,6 +373,10 @@ fn parse_codex_reader<R: BufRead>(
                 {
                     if codex_message_is_human_turn(payload.message.as_deref()) {
                         state.pending_turn_start = true;
+                        state.current_model_request_start_ms =
+                            parsed_entry_timestamp.or(state.current_turn_start_ms);
+                        state.current_model_response_end_ms = None;
+                        state.pending_next_model_request_start_ms = None;
                         state.pending_content_preview = payload
                             .message
                             .as_deref()
@@ -361,8 +397,48 @@ fn parse_codex_reader<R: BufRead>(
                     handled = true;
                 }
 
+                if is_response_item {
+                    if let Some(timestamp_ms) = parsed_entry_timestamp {
+                        if response_item_is_tool_output {
+                            state.pending_next_model_request_start_ms = Some(
+                                state
+                                    .pending_next_model_request_start_ms
+                                    .map_or(timestamp_ms, |existing| existing.max(timestamp_ms)),
+                            );
+                        } else {
+                            if let Some(next_start_ms) =
+                                state.pending_next_model_request_start_ms.take()
+                            {
+                                state.current_model_request_start_ms = Some(next_start_ms);
+                            } else if state.current_model_request_start_ms.is_none() {
+                                state.current_model_request_start_ms =
+                                    state.current_turn_start_ms;
+                            }
+                            state.current_model_response_end_ms = Some(
+                                state
+                                    .current_model_response_end_ms
+                                    .map_or(timestamp_ms, |existing| existing.max(timestamp_ms)),
+                            );
+                        }
+                    }
+                    handled = true;
+                }
+
                 if is_token_count {
                     handled = true;
+                    let model_duration_ms = duration_between_ms(
+                        state
+                            .current_model_request_start_ms
+                            .or(state.current_turn_start_ms),
+                        state.current_model_response_end_ms,
+                    );
+                    state.current_model_request_start_ms = latest_timestamp_ms(
+                        parsed_entry_timestamp,
+                        state.pending_next_model_request_start_ms,
+                    );
+                    state.current_model_response_end_ms = None;
+                    state.pending_next_model_request_start_ms = None;
+
                     let Some(info) = payload.info else {
                         continue;
                     };
@@ -427,7 +503,7 @@ fn parse_codex_reader<R: BufRead>(
                     }
                     state.previous_totals = next_totals;
 
-                    let parsed_timestamp = parse_codex_entry_timestamp(entry_timestamp.as_deref());
+                    let parsed_timestamp = parsed_entry_timestamp;
                     let timestamp = parsed_timestamp.unwrap_or(fallback_timestamp);
                     let duration_ms =
                         duration_between_ms(state.current_turn_start_ms, parsed_timestamp);
@@ -454,6 +530,7 @@ fn parse_codex_reader<R: BufRead>(
                     );
                     message.service_tier = state.current_service_tier;
                     message.duration_ms = duration_ms;
+                    message.model_duration_ms = model_duration_ms;
                     if state.pending_turn_start {
                         message.is_turn_start = true;
                         state.pending_turn_start = false;
@@ -525,7 +602,10 @@ fn parse_codex_reader<R: BufRead>(
 
     flush_pending_model_messages(&mut pending_model_messages, &mut messages, "unknown");
     backfill_homogeneous_service_tier(&mut messages, &state);
-    Ok(messages)
+    Ok(ParsedCodexFile {
+        messages,
+        service_tier_snapshots,
+    })
 }
 
 fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
@@ -565,6 +645,9 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.current_service_tier = ServiceTier::Unknown;
             state.service_tier_consensus = None;
             state.service_tier_conflicted = false;
+            state.current_model_request_start_ms = None;
+            state.current_model_response_end_ms = None;
+            state.pending_next_model_request_start_ms = None;
         }
     }
     if let Some(provider) = payload.model_provider.as_ref() {
@@ -751,6 +834,21 @@ fn parse_codex_entry_timestamp(timestamp: Option<&str>) -> Option<i64> {
 fn duration_between_ms(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<i64> {
     let duration = end_ms?.saturating_sub(start_ms?);
     (duration > 0).then_some(duration)
+}
+
+fn latest_timestamp_ms(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(timestamp), None) | (None, Some(timestamp)) => Some(timestamp),
+        (None, None) => None,
+    }
+}
+
+fn codex_response_item_is_tool_output(payload: &CodexPayload) -> bool {
+    payload
+        .payload_type
+        .as_deref()
+        .is_some_and(|payload_type| payload_type.ends_with("_output"))
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -1025,6 +1123,7 @@ mod tests {
             CodexParseState::default(),
         )
         .unwrap()
+        .messages
     }
 
     fn token_line(
@@ -1063,6 +1162,15 @@ mod tests {
                 "type": "thread_settings_applied",
                 "thread_settings": {"service_tier": service_tier}
             }
+        })
+        .to_string()
+    }
+
+    fn response_item_line(timestamp: &str, payload_type: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {"type": payload_type}
         })
         .to_string()
     }
@@ -1185,7 +1293,8 @@ mod tests {
             1_700_000_000_000,
             CodexParseState::default(),
         )
-        .unwrap();
+        .unwrap()
+        .messages;
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tokens.input, 10);
@@ -1207,12 +1316,60 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_read, 60);
         assert_eq!(messages[0].tokens.output, 20);
         assert_eq!(messages[0].tokens.reasoning, 5);
+        assert_eq!(messages[0].model_duration_ms, None);
         assert!(messages[0].is_turn_start);
         assert_eq!(
             messages[0].content_preview.as_deref(),
             Some("Build this now")
         );
         assert_eq!(messages[0].workspace_label.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn model_request_duration_excludes_tool_execution() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Run it"}}"#,
+            response_item_line("2026-01-01T00:00:01.500Z", "reasoning"),
+            response_item_line("2026-01-01T00:00:03Z", "function_call"),
+            response_item_line("2026-01-01T00:00:53Z", "function_call_output"),
+            token_line("2026-01-01T00:00:53.010Z", (100, 100, 0, 20), (100, 100, 0, 20)),
+            response_item_line("2026-01-01T00:00:54Z", "reasoning"),
+            response_item_line("2026-01-01T00:00:55.500Z", "function_call"),
+            response_item_line("2026-01-01T00:01:55.500Z", "function_call_output"),
+            token_line("2026-01-01T00:01:55.510Z", (200, 150, 0, 30), (100, 50, 0, 10))
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].model_duration_ms, Some(2_000));
+        assert_eq!(messages[1].model_duration_ms, Some(2_490));
+        assert_eq!(messages[0].duration_ms, Some(53_010));
+        assert_eq!(messages[1].duration_ms, Some(115_510));
+    }
+
+    #[test]
+    fn steering_message_resets_the_next_model_request_start() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00.100Z","type":"event_msg","payload":{"type":"user_message","message":"Original"}}"#,
+            response_item_line("2026-01-01T00:00:01Z", "message"),
+            token_line("2026-01-01T00:00:01.100Z", (100, 20, 0, 5), (100, 20, 0, 5)),
+            r#"{"timestamp":"2026-01-01T00:01:40Z","type":"event_msg","payload":{"type":"user_message","message":"Steer"}}"#,
+            response_item_line("2026-01-01T00:01:42Z", "function_call"),
+            response_item_line("2026-01-01T00:02:42Z", "function_call_output"),
+            token_line("2026-01-01T00:02:42.010Z", (200, 50, 0, 10), (100, 30, 0, 5))
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content_preview.as_deref(), Some("Steer"));
+        assert!(messages[1].is_turn_start);
+        assert_eq!(messages[1].model_duration_ms, Some(2_000));
     }
 
     #[test]

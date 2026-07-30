@@ -51,7 +51,11 @@ struct ActivityServiceTests {
         #expect(snapshot.today.tokenCosts?.input == 0.05)
         #expect(snapshot.today.tokenCosts?.cache == 0.05)
         #expect(abs((snapshot.today.tokenCosts?.total ?? 0) - 0.25) < 0.000_000_001)
+        #expect(snapshot.today.averageGenerationTokensPerSecond == 6)
+        #expect(snapshot.rangeTotals?.tokens.total == 84)
+        #expect(snapshot.rangeTotals?.averageGenerationTokensPerSecond == 7.5)
         #expect(snapshot.weeklySinceReset?.totals.tokens.total == 84)
+        #expect(snapshot.weeklySinceReset?.totals.averageGenerationTokensPerSecond == 7.5)
         #expect(snapshot.sessions.first?.requests.first?.model == "gpt-test")
         #expect(snapshot.sessions.first?.requests.first?.promptPreview == "private prompt")
         #expect(snapshot.sessions.first?.requests.first?.sessionPath == "/tmp/private-session.jsonl")
@@ -74,6 +78,28 @@ struct ActivityServiceTests {
 
         #expect(await runner.arguments == ["--days", "30", "--weekly-reset-ms", "1720000000125"])
         #expect(await runner.environments.last?["TZ"] == "UTC")
+    }
+
+    @Test("passes independent Codex and Claude reset timestamps")
+    func passesPlatformResetTimestamps() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let service = ActivityService(
+            arguments: ["--days", "30"],
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity(
+            sinceWeeklyResetAtByPlatform: [
+                .codex: Date(timeIntervalSince1970: 1_720_000_000.125),
+                .claude: Date(timeIntervalSince1970: 1_730_000_000.5),
+            ],
+            statisticsTimeZone: .utc)
+
+        #expect(await runner.arguments == [
+            "--days", "30",
+            "--weekly-reset-ms", "1720000000125",
+            "--claude-weekly-reset-ms", "1730000000500",
+        ])
     }
 
     @Test("uses the selected statistics timezone for the helper")
@@ -136,7 +162,9 @@ struct ActivityServiceTests {
         let snapshot = try JSONDecoder().decode(ActivitySnapshot.self, from: data)
 
         #expect(snapshot.weeklySinceReset == nil)
+        #expect(snapshot.rangeTotals == nil)
         #expect(snapshot.today.tokenCosts == nil)
+        #expect(snapshot.today.averageGenerationTokensPerSecond == nil)
     }
 
     @Test("decodes legacy requests without turn contributions")
@@ -167,6 +195,7 @@ struct ActivityServiceTests {
 
         #expect(request.contributions == nil)
         #expect(request.serviceTier == nil)
+        #expect(request.modelDurationMs == nil)
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
     }
 
@@ -180,8 +209,17 @@ struct ActivityServiceTests {
             "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
             "costUsd": 0.25,
             "tokenCosts": {"input": 0.05, "output": 0.10, "cacheRead": 0.03, "cacheWrite": 0.02, "reasoning": 0.05},
+            "averageGenerationTokensPerSecond": 6.0,
             "requestCount": 1,
             "sessionCount": 1
+          },
+          "rangeTotals": {
+            "tokens": {"input": 40, "output": 20, "cacheRead": 12, "cacheWrite": 8, "reasoning": 4},
+            "costUsd": 1.0,
+            "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
+            "averageGenerationTokensPerSecond": 7.5,
+            "requestCount": 4,
+            "sessionCount": 2
           },
           "weeklySinceReset": {
             "startedAtMs": 1719700000000,
@@ -189,6 +227,7 @@ struct ActivityServiceTests {
               "tokens": {"input": 40, "output": 20, "cacheRead": 12, "cacheWrite": 8, "reasoning": 4},
               "costUsd": 1.0,
               "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
+              "averageGenerationTokensPerSecond": 7.5,
               "requestCount": 4,
               "sessionCount": 2
             }

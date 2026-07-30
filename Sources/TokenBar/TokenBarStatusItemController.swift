@@ -16,11 +16,16 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private let model: DashboardModel
     private let settings: TokenBarSettings
     private let requestDetailService: any RequestDetailProviding
+    private let sessionLauncher: SessionLauncher
     private let showSettingsAction: () -> Void
     private let statusItem: NSStatusItem
     private let rootMenu = TokenBarMenu()
-    private var sessionItems: [String: NSMenuItem] = [:]
+    private var statusLabelLayout: StatusLabelLayout?
+    private var nextMenuScopeOverride: DashboardScope?
+    private var sessionItems: [NSMenuItem] = []
     private var renderedSessionProjection: RenderedSessionProjection?
+    private var renderedSessions: [SessionSummary] = []
+    private var renderedMenuScope: DashboardScope?
     private var submenuSessionIDs: [ObjectIdentifier: String] = [:]
     private var requestDetailMenus: [ObjectIdentifier: RequestDetailMenuContext] = [:]
     private var requestDetailTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
@@ -28,6 +33,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var requestDetailCacheOrder: [String] = []
     private var sessionExpansionItem: NSMenuItem?
     private var sessionExpansionView: PersistentMenuActionRowView?
+    private var sessionEmptyItem: NSMenuItem?
+    private var overviewHost: FixedMenuHostingView?
     private var highlightedRows: [ObjectIdentifier: any TokenMenuHighlighting] = [:]
     private var showsAllSessions = false
     private var isRootMenuOpen = false
@@ -37,13 +44,15 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     init(
         model: DashboardModel,
         settings: TokenBarSettings = .shared,
-        showSettings: @escaping () -> Void = {},
-        requestDetailService: any RequestDetailProviding = CodexRequestDetailService())
+        showSettings: @escaping () -> Void,
+        requestDetailService: any RequestDetailProviding = CodexRequestDetailService(),
+        sessionLauncher: SessionLauncher = SessionLauncher())
     {
         self.model = model
         self.settings = settings
         self.showSettingsAction = showSettings
         self.requestDetailService = requestDetailService
+        self.sessionLauncher = sessionLauncher
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
@@ -55,8 +64,10 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.configureStatusButton()
         self.model.updateBackgroundRefreshInterval(settings.backgroundRefreshDuration)
         self.model.updateStatisticsTimeZone(settings.statisticsTimeZone)
+        self.model.updateQuotaRefreshEnabled(settings.showsClaude, for: .claude)
         self.rebuildRootMenu()
         self.observeModel()
+        self.observeScope()
         self.observeSettings()
     }
 
@@ -65,7 +76,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             guard let self else { return }
             await self.model.start()
             #if DEBUG
-            if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_OPEN_MENU"] == "1" {
+            let environment = ProcessInfo.processInfo.environment
+            let demoScope = environment["TOKENBAR_DEMO_SCOPE"]
+                .flatMap(DashboardScope.init(rawValue:)) ?? .codex
+            if environment["TOKENBAR_DEMO_OPEN_MENU"] == "1" {
+                self.nextMenuScopeOverride = demoScope
                 try? await Task.sleep(for: .milliseconds(250))
                 self.statusItem.button?.performClick(nil)
             }
@@ -86,6 +101,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === self.rootMenu {
+            let requestedScope = self.nextMenuScopeOverride ?? self.scopeForCurrentStatusClick()
+            self.nextMenuScopeOverride = nil
+            if let requestedScope {
+                self.model.scope = requestedScope
+            }
+            if !self.settings.showsClaude {
+                self.model.scope = .codex
+            }
             self.rebuildRootMenu()
             return
         }
@@ -97,7 +120,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
 
         guard let sessionID = self.submenuSessionIDs[menuID] else { return }
-        self.rebuildRequestMenu(menu, sessionID: sessionID)
+        self.rebuildRequestMenu(menu, sessionScopedID: sessionID)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -105,7 +128,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             self.isRootMenuOpen = true
             self.installShortcutMonitor()
             Task { @MainActor [weak self] in
-                await self?.model.refreshAll()
+                await self?.model.refreshAll(forceQuota: false)
             }
             return
         }
@@ -169,30 +192,86 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func updateStatusButton() {
         guard let button = self.statusItem.button else { return }
-        let today = self.model.activitySnapshot?.today.tokens.total.statusBarCompactCount ?? "—"
-        let weekly = self.model.quotaSnapshot?.weekly.map {
-            "\(Int($0.remainingPercent.clamped(to: 0 ... 100).rounded()))%"
-        } ?? "—"
-        button.image = StatusLabelRenderer.image(today: today, weekly: weekly)
-        button.toolTip = "Today: \(today) tokens · Weekly: \(weekly) left"
-        button.setAccessibilityLabel("Today, \(today) tokens. Weekly quota, \(weekly) remaining.")
+        let codex = self.statusValues(for: .codex)
+        let claude = self.settings.showsClaude ? self.statusValues(for: .claude) : nil
+        let layout = StatusLabelRenderer.layout(
+            codexToday: codex.today,
+            codexWeekly: codex.weekly,
+            claudeToday: claude?.today,
+            claudeWeekly: claude?.weekly)
+        self.statusLabelLayout = layout
+        button.image = layout.image
+
+        var toolTips = [
+            "Codex · Today: \(codex.today) tokens · Weekly: \(codex.weekly) left",
+        ]
+        var accessibilityLabels = [
+            "Codex. Today, \(codex.today) tokens. Weekly quota, \(codex.weekly) remaining.",
+        ]
+        if let claude {
+            toolTips.append(
+                "Claude Code · Today: \(claude.today) tokens · Weekly: \(claude.weekly) left")
+            accessibilityLabels.append(
+                "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.")
+        }
+        button.toolTip = toolTips.joined(separator: "\n")
+        button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
     }
 
-    func celebrationOriginPoint(for _: TokenPlatform) -> CGPoint? {
+    private func statusValues(for platform: TokenPlatform) -> (today: String, weekly: String) {
+        let today = self.model.activitySnapshot?
+            .scoped(to: platform).today.tokens.total.statusBarCompactCount ?? "—"
+        let weekly = self.model.quotaState(for: platform).value?.weekly.map {
+            "\(Int($0.remainingPercent.clamped(to: 0 ... 100).rounded()))%"
+        } ?? "—"
+        return (today, weekly)
+    }
+
+    func celebrationOriginPoint(for platform: TokenPlatform) -> CGPoint? {
         guard let button = self.statusItem.button,
-              let window = button.window
+              let window = button.window,
+              let image = button.image,
+              let layout = self.statusLabelLayout
         else {
             return nil
         }
-        let windowPoint = button.convert(
-            CGPoint(x: button.bounds.midX, y: button.bounds.midY),
-            to: nil)
+
+        let imageX: CGFloat = switch (platform, layout.claudeBoundaryX) {
+        case (.codex, let boundary?):
+            boundary / 2
+        case (.claude, let boundary?):
+            (boundary + image.size.width) / 2
+        default:
+            image.size.width / 2
+        }
+        let imageMinX = button.bounds.midX - image.size.width / 2
+        let buttonPoint = CGPoint(x: imageMinX + imageX, y: button.bounds.midY)
+        let windowPoint = button.convert(buttonPoint, to: nil)
         return window.convertPoint(toScreen: windowPoint)
+    }
+
+    private func scopeForCurrentStatusClick() -> DashboardScope? {
+        guard self.settings.showsClaude,
+              let event = NSApp.currentEvent,
+              event.type == .leftMouseDown || event.type == .leftMouseUp,
+              let button = self.statusItem.button,
+              let window = button.window,
+              let image = button.image,
+              let layout = self.statusLabelLayout
+        else {
+            return nil
+        }
+
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let point = button.convert(windowPoint, from: nil)
+        guard button.bounds.contains(point) else { return nil }
+        let imageMinX = button.bounds.midX - image.size.width / 2
+        return layout.scope(at: point.x - imageMinX)
     }
 
     private func observeModel() {
         withObservationTracking {
-            _ = self.model.quota
+            _ = self.model.quotas
             _ = self.model.activity
         } onChange: { [weak self] in
             Task { @MainActor in
@@ -203,12 +282,31 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
     }
 
+    private func observeScope() {
+        withObservationTracking {
+            _ = self.model.scope
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.observeScope()
+                guard self.isRootMenuOpen,
+                      self.renderedMenuScope != self.model.scope
+                else {
+                    return
+                }
+                self.updateOverviewHeight()
+                self.updateVisibleSessionItems()
+            }
+        }
+    }
+
     private func observeSettings() {
         withObservationTracking {
             _ = self.settings.theme
             _ = self.settings.recentSessionCount
             _ = self.settings.refreshInterval
             _ = self.settings.statisticsTimeZone
+            _ = self.settings.showsClaude
             _ = self.settings.showsFullRequestContentOnHover
         } onChange: { [weak self] in
             Task { @MainActor in
@@ -220,6 +318,21 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                         await self?.model.refreshActivity()
                     }
                 }
+                let claudeQuotaSettingChanged = self.model.updateQuotaRefreshEnabled(
+                    self.settings.showsClaude,
+                    for: .claude)
+                if claudeQuotaSettingChanged, self.settings.showsClaude {
+                    Task { @MainActor [weak self] in
+                        await self?.model.refreshQuota(for: .claude)
+                    }
+                }
+                if !self.settings.showsClaude, self.model.scope == .claude {
+                    self.model.scope = .codex
+                }
+                self.updateStatusButton()
+                if self.isRootMenuOpen {
+                    self.rebuildRootMenu()
+                }
             }
         }
     }
@@ -227,7 +340,28 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private func modelDidChange() {
         self.updateStatusButton()
         guard self.isRootMenuOpen else { return }
+        self.updateOverviewHeight()
         self.updateVisibleSessionItems()
+    }
+
+    private func updateOverviewHeight() {
+        let quota = self.model.quotaState(for: self.model.scope.platform).value
+        self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
+    }
+
+    private func selectScope(_ scope: DashboardScope) {
+        guard scope != self.model.scope else { return }
+        let window = self.overviewHost?.window
+        window?.disableScreenUpdatesUntilFlush()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            let quota = self.model.quotaState(for: scope.platform).value
+            self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
+            self.updateSessionProjectionAndVisibility(scope: scope)
+            self.model.scope = scope
+            window?.layoutIfNeeded()
+        }
     }
 
     private func rebuildRootMenu() {
@@ -239,42 +373,57 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.rootMenu.removeAllItems()
         self.sessionItems.removeAll()
         self.renderedSessionProjection = nil
+        self.renderedSessions.removeAll()
+        self.renderedMenuScope = nil
         self.sessionExpansionItem = nil
         self.sessionExpansionView = nil
+        self.sessionEmptyItem = nil
+        self.overviewHost = nil
         self.submenuSessionIDs.removeAll()
 
-        let showsFiveHour = self.model.quotaSnapshot?.session != nil
-        let showsResetCredits = self.model.quotaSnapshot?.resetCredits != nil
         let accentColor = self.settings.theme.color
-        let overviewHeight = DashboardOverviewView.preferredHeight(
-            showsFiveHour: showsFiveHour,
-            showsResetCredits: showsResetCredits)
-        let overview = DashboardOverviewView(
+        let headerHeight = DashboardOverviewView.headerHeight(
+            showsClaude: self.settings.showsClaude)
+        let header = DashboardHeaderView(
             model: self.model,
-            showsFiveHour: showsFiveHour,
-            showsResetCredits: showsResetCredits,
-            accentColor: accentColor)
+            showsClaude: self.settings.showsClaude,
+            accentColor: accentColor,
+            onSelectScope: { [weak self] scope in
+                self?.selectScope(scope)
+            })
             .frame(
                 width: Self.menuWidth,
-                height: overviewHeight,
+                height: headerHeight,
                 alignment: .top)
+        let headerHost = FixedMenuHostingView(
+            rootView: AnyView(header),
+            width: Self.menuWidth,
+            height: headerHeight)
+        let headerItem = NSMenuItem()
+        headerItem.view = headerHost
+        headerItem.isEnabled = true
+        self.rootMenu.addItem(headerItem)
+
+        let quota = self.model.quotaState(for: self.model.scope.platform).value
+        let overviewHeight = DashboardOverviewView.contentHeight(quota: quota)
+        let overview = DashboardOverviewContentView(
+            model: self.model,
+            accentColor: accentColor)
+            .frame(width: Self.menuWidth, alignment: .top)
         let overviewHost = FixedMenuHostingView(
             rootView: AnyView(overview),
             width: Self.menuWidth,
             height: overviewHeight)
+        self.overviewHost = overviewHost
         let overviewItem = NSMenuItem()
         overviewItem.view = overviewHost
-        overviewItem.isEnabled = false
+        overviewItem.isEnabled = true
         self.rootMenu.addItem(overviewItem)
 
         let activityHeight = ActivitySummarySection.preferredHeight + 1
-        let activity = VStack(spacing: 0) {
-            Divider().padding(.horizontal, 12)
-            ActivitySummarySection(
-                state: self.model.activity,
-                accentColor: accentColor,
-                showsChevron: true)
-        }
+        let activity = MenuActivitySummaryView(
+            model: self.model,
+            accentColor: accentColor)
         .allowsHitTesting(false)
         .frame(width: Self.menuWidth, height: activityHeight, alignment: .top)
         let activityHost = FixedMenuHostingView(
@@ -327,50 +476,50 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func addSessionItems() {
-        guard let snapshot = self.model.activitySnapshot, !snapshot.sessions.isEmpty else {
-            let empty = NSMenuItem(title: "No sessions today", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            self.rootMenu.addItem(empty)
-            return
-        }
+        let sessions = self.model.activitySnapshot?
+            .sessionMenu(limit: nil).visibleSessions ?? []
+        let empty = NSMenuItem(title: "No sessions today", action: nil, keyEquivalent: "")
+        empty.isEnabled = false
+        empty.isHidden = !sessions.isEmpty
+        self.sessionEmptyItem = empty
+        self.rootMenu.addItem(empty)
 
-        let sessions = snapshot.sessionMenu(limit: nil).visibleSessions
-        let projection = RenderedSessionProjection(
-            ids: sessions.map(\.id),
-            collapsedLimit: self.settings.recentSessionLimit)
-        self.renderedSessionProjection = projection
-        for (index, session) in sessions.enumerated() {
-            let item = self.makeSessionItem(session)
-            item.isHidden = !self.showsAllSessions && index >= projection.collapsedLimit
-            self.sessionItems[session.id] = item
+        let maximumPlatformSessionCount = Dictionary(grouping: sessions, by: \.platformID)
+            .values
+            .map(\.count)
+            .max() ?? 0
+        let slotCount = max(self.settings.recentSessionLimit, maximumPlatformSessionCount)
+        for _ in 0 ..< slotCount {
+            let item = self.makeSessionItem()
+            item.isHidden = true
+            self.sessionItems.append(item)
             self.rootMenu.addItem(item)
         }
 
-        if sessions.count > projection.collapsedLimit {
-            let title = self.sessionExpansionTitle(projection: projection)
-            let expansion = PersistentMenuActionRowView(
-                width: Self.menuWidth,
-                title: title,
-                systemImageName: self.showsAllSessions ? "chevron.up" : "chevron.down",
-                accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
-            expansion.onActivate = { [weak self] in
-                self?.toggleSessionExpansion()
-            }
-            let expansionItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            expansionItem.isEnabled = true
-            expansionItem.view = expansion
-            self.sessionExpansionItem = expansionItem
-            self.sessionExpansionView = expansion
-            self.rootMenu.addItem(expansionItem)
+        let expansion = PersistentMenuActionRowView(
+            width: Self.menuWidth,
+            title: "Show More…",
+            systemImageName: "chevron.down",
+            accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
+        expansion.onActivate = { [weak self] in
+            self?.toggleSessionExpansion()
         }
+        let expansionItem = NSMenuItem(title: "Show More…", action: nil, keyEquivalent: "")
+        expansionItem.isEnabled = true
+        expansionItem.isHidden = true
+        expansionItem.view = expansion
+        self.sessionExpansionItem = expansionItem
+        self.sessionExpansionView = expansion
+        self.rootMenu.addItem(expansionItem)
+        self.updateSessionProjectionAndVisibility()
     }
 
     private func toggleSessionExpansion() {
         guard let projection = self.renderedSessionProjection else { return }
         self.showsAllSessions.toggle()
-        for (index, sessionID) in projection.ids.enumerated() {
-            self.sessionItems[sessionID]?.isHidden = !self.showsAllSessions
-                && index >= projection.collapsedLimit
+        for (index, item) in self.sessionItems.enumerated() {
+            item.isHidden = index >= projection.ids.count
+                || (!self.showsAllSessions && index >= projection.collapsedLimit)
         }
         let title = self.sessionExpansionTitle(projection: projection)
         self.sessionExpansionItem?.title = title
@@ -414,22 +563,21 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         return menu
     }
 
-    private func makeSessionItem(_ session: SessionSummary) -> NSMenuItem {
+    private func makeSessionItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Session",
-            action: #selector(self.sessionNoOp),
+            action: #selector(self.openSession(_:)),
             keyEquivalent: "")
         item.target = self
         item.isEnabled = true
-        self.configureSessionItem(item, session: session)
+        item.view = TokenMenuRowView(width: Self.menuWidth)
 
-        let submenu = TokenBarMenu(title: session.menuTitle)
+        let submenu = TokenBarMenu(title: "Session")
         submenu.autoenablesItems = false
         submenu.minimumWidth = Self.menuWidth
         submenu.delegate = self
         submenu.persistentActionDelegate = self
         submenu.addItem(NSMenuItem(title: "Loading turns…", action: nil, keyEquivalent: ""))
-        self.submenuSessionIDs[ObjectIdentifier(submenu)] = session.id
         item.submenu = submenu
         return item
     }
@@ -438,8 +586,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let title = session.menuTitle
         let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
-        item.title = "Session"
-        item.toolTip = "\(title)\n\(detail)\nEnded \(time)"
+        item.representedObject = session
 
         let row = (item.view as? TokenMenuRowView) ?? TokenMenuRowView(width: Self.menuWidth)
         row.configure(
@@ -449,23 +596,86 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             trailing: time,
             showsChevron: true,
             badge: session.menuServiceTierBadge)
+        row.toolTip = "\(title)\n\(detail)\nEnded \(time)\nClick to open in "
+            + "\(session.platformID.displayName) · Hover to inspect turns"
+        row.onActivate = { [weak self, weak item] in
+            guard let self else { return }
+            item?.menu?.cancelTracking()
+            self.rootMenu.cancelTracking()
+            self.openSessionInApp(session)
+        }
         item.view = row
     }
 
     private func updateVisibleSessionItems() {
-        guard let sessions = self.model.activitySnapshot?.sessions else { return }
-        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        for (id, item) in self.sessionItems {
-            guard let session = sessionsByID[id] else { continue }
-            self.configureSessionItem(item, session: session)
-            item.submenu?.title = session.menuTitle
-        }
+        self.updateSessionProjectionAndVisibility()
     }
 
-    private func rebuildRequestMenu(_ menu: NSMenu, sessionID: String) {
+    private func updateSessionProjectionAndVisibility(scope: DashboardScope? = nil) {
+        let scope = scope ?? self.model.scope
+        self.renderedMenuScope = scope
+        let visibleSessions = self.model.activitySnapshot?
+            .scoped(to: scope.platform)
+            .sessionMenu(limit: nil).visibleSessions ?? []
+        let projection = RenderedSessionProjection(
+            ids: visibleSessions.map(\.platformScopedID),
+            collapsedLimit: self.settings.recentSessionLimit)
+        self.renderedSessionProjection = projection
+        let sessionsChanged = self.renderedSessions != visibleSessions
+
+        for (index, item) in self.sessionItems.enumerated() {
+            if sessionsChanged, index < visibleSessions.count {
+                let session = visibleSessions[index]
+                self.configureSessionItem(item, session: session)
+                if let submenu = item.submenu {
+                    if submenu.title != session.menuTitle {
+                        submenu.title = session.menuTitle
+                    }
+                    self.submenuSessionIDs[ObjectIdentifier(submenu)] = session.platformScopedID
+                }
+            } else if sessionsChanged {
+                item.representedObject = nil
+                if let submenu = item.submenu {
+                    self.submenuSessionIDs.removeValue(forKey: ObjectIdentifier(submenu))
+                }
+            }
+            let isHidden = index >= visibleSessions.count
+                || (!self.showsAllSessions && index >= projection.collapsedLimit)
+            if item.isHidden != isHidden {
+                item.isHidden = isHidden
+            }
+        }
+        self.renderedSessions = visibleSessions
+
+        let hasSessions = !projection.ids.isEmpty
+        let emptyTitle = "No \(scope.displayName) sessions today"
+        if self.sessionEmptyItem?.title != emptyTitle {
+            self.sessionEmptyItem?.title = emptyTitle
+        }
+        if self.sessionEmptyItem?.isHidden != hasSessions {
+            self.sessionEmptyItem?.isHidden = hasSessions
+        }
+
+        let canExpand = projection.ids.count > projection.collapsedLimit
+            && self.sessionItems.count > projection.collapsedLimit
+        if self.sessionExpansionItem?.isHidden != !canExpand {
+            self.sessionExpansionItem?.isHidden = !canExpand
+        }
+        guard canExpand else { return }
+        let title = self.sessionExpansionTitle(projection: projection)
+        self.sessionExpansionItem?.title = title
+        self.sessionExpansionView?.configure(
+            title: title,
+            systemImageName: self.showsAllSessions ? "chevron.up" : "chevron.down",
+            accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
+    }
+
+    private func rebuildRequestMenu(_ menu: NSMenu, sessionScopedID: String) {
         self.discardRequestDetailMenus(in: menu)
         menu.removeAllItems()
-        guard let session = self.model.activitySnapshot?.sessions.first(where: { $0.id == sessionID }) else {
+        guard let session = self.model.activitySnapshot?.sessions
+            .first(where: { $0.platformScopedID == sessionScopedID })
+        else {
             let unavailable = NSMenuItem(title: "Session is no longer available", action: nil, keyEquivalent: "")
             unavailable.isEnabled = false
             menu.addItem(unavailable)
@@ -687,8 +897,6 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
     }
 
-    @objc private func sessionNoOp() {}
-
     @objc private func activityNoOp() {}
 
     @objc private func requestDetailNoOp() {}
@@ -706,6 +914,25 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     @objc private func copySession(_ sender: NSMenuItem) {
         guard let session = sender.representedObject as? SessionSummary else { return }
         self.copyToPasteboard(session.tokscaleCopyText)
+    }
+
+    @objc private func openSession(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? SessionSummary else { return }
+        self.openSessionInApp(session)
+    }
+
+    private func openSessionInApp(_ session: SessionSummary) {
+        do {
+            try self.sessionLauncher.open(session)
+        } catch {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn’t Open Session"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     @objc private func copyRequest(_ sender: NSMenuItem) {
@@ -763,12 +990,100 @@ private final class FixedMenuHostingView: NSHostingView<AnyView> {
     override var intrinsicContentSize: NSSize {
         self.fixedSize
     }
+
+    func updateHeight(_ height: CGFloat) {
+        guard self.fixedSize.height != height else { return }
+        self.fixedSize.height = height
+        self.setFrameSize(self.fixedSize)
+        self.invalidateIntrinsicContentSize()
+        self.needsLayout = true
+        self.superview?.needsLayout = true
+    }
+
 }
 
+private struct MenuActivitySummaryView: View {
+    @Bindable var model: DashboardModel
+    let accentColor: Color
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider().padding(.horizontal, 12)
+            ActivitySummarySection(
+                state: self.model.visibleActivity,
+                accentColor: self.accentColor,
+                showsChevron: true)
+        }
+    }
+}
+
+@MainActor
+struct StatusLabelLayout {
+    let image: NSImage
+    let claudeBoundaryX: CGFloat?
+
+    func scope(at imageX: CGFloat) -> DashboardScope {
+        guard let claudeBoundaryX else { return .codex }
+        return imageX < claudeBoundaryX ? .codex : .claude
+    }
+}
+
+@MainActor
 enum StatusLabelRenderer {
-    static func image(today: String, weekly: String) -> NSImage {
-        let topLabel = "T" as NSString
-        let bottomLabel = "W" as NSString
+    static func layout(
+        codexToday: String,
+        codexWeekly: String,
+        claudeToday: String? = nil,
+        claudeWeekly: String? = nil) -> StatusLabelLayout
+    {
+        let codexImage = self.image(
+            platform: .codex,
+            today: codexToday,
+            weekly: codexWeekly)
+        guard let claudeToday, let claudeWeekly else {
+            return StatusLabelLayout(image: codexImage, claudeBoundaryX: nil)
+        }
+
+        let claudeImage = self.image(
+            platform: .claude,
+            today: claudeToday,
+            weekly: claudeWeekly)
+        let gap: CGFloat = 7
+        let size = NSSize(
+            width: codexImage.size.width + gap + claudeImage.size.width,
+            height: max(codexImage.size.height, claudeImage.size.height))
+        let image = NSImage(size: size, flipped: false) { _ in
+            codexImage.draw(
+                in: NSRect(
+                    x: 0,
+                    y: floor((size.height - codexImage.size.height) / 2),
+                    width: codexImage.size.width,
+                    height: codexImage.size.height),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1)
+            claudeImage.draw(
+                in: NSRect(
+                    x: codexImage.size.width + gap,
+                    y: floor((size.height - claudeImage.size.height) / 2),
+                    width: claudeImage.size.width,
+                    height: claudeImage.size.height),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1)
+            return true
+        }
+        image.isTemplate = true
+        return StatusLabelLayout(
+            image: image,
+            claudeBoundaryX: codexImage.size.width + gap / 2)
+    }
+
+    static func image(
+        platform: TokenPlatform? = nil,
+        today: String,
+        weekly: String) -> NSImage
+    {
         let topValue = today as NSString
         let bottomValue = weekly as NSString
         let baseAttributes: [NSAttributedString.Key: Any] = [
@@ -776,21 +1091,18 @@ enum StatusLabelRenderer {
             .foregroundColor: NSColor.black,
         ]
 
-        let labelWidth = ceil(max(
-            topLabel.size(withAttributes: baseAttributes).width,
-            bottomLabel.size(withAttributes: baseAttributes).width))
         let valueWidth = ceil(max(
             topValue.size(withAttributes: baseAttributes).width,
             bottomValue.size(withAttributes: baseAttributes).width))
-        let columnGap: CGFloat = 5
-        let contentWidth = labelWidth + columnGap + valueWidth
+        let platformIcon = platform.flatMap { platform in
+            PlatformStatusIcon.image(for: platform)
+        }
+        let iconWidth: CGFloat = platformIcon == nil ? 0 : 15
+        let iconGap: CGFloat = platformIcon == nil ? 0 : 4
+        let contentWidth = iconWidth + iconGap + valueWidth
         let size = NSSize(width: max(30, contentWidth + 4), height: 20)
         let contentX = floor((size.width - contentWidth) / 2)
-
-        let labelParagraph = NSMutableParagraphStyle()
-        labelParagraph.alignment = .center
-        var labelAttributes = baseAttributes
-        labelAttributes[.paragraphStyle] = labelParagraph
+        let textX = contentX + iconWidth + iconGap
 
         let valueParagraph = NSMutableParagraphStyle()
         valueParagraph.alignment = .left
@@ -798,16 +1110,18 @@ enum StatusLabelRenderer {
         valueAttributes[.paragraphStyle] = valueParagraph
 
         let image = NSImage(size: size, flipped: false) { _ in
-            let labelRect = NSRect(x: contentX, y: 0, width: labelWidth, height: 10)
-            let valueRect = NSRect(
-                x: contentX + labelWidth + columnGap,
-                y: 0,
-                width: valueWidth,
-                height: 10)
-            topLabel.draw(
-                in: labelRect.offsetBy(dx: 0, dy: 10),
-                withAttributes: labelAttributes)
-            bottomLabel.draw(in: labelRect, withAttributes: labelAttributes)
+            if let platformIcon {
+                platformIcon.draw(
+                    in: NSRect(
+                        x: contentX,
+                        y: floor((size.height - iconWidth) / 2),
+                        width: iconWidth,
+                        height: iconWidth),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1)
+            }
+            let valueRect = NSRect(x: textX, y: 0, width: valueWidth, height: 10)
             topValue.draw(
                 in: valueRect.offsetBy(dx: 0, dy: 10),
                 withAttributes: valueAttributes)
@@ -816,5 +1130,48 @@ enum StatusLabelRenderer {
         }
         image.isTemplate = true
         return image
+    }
+}
+
+@MainActor
+enum PlatformStatusIcon {
+    private static let size = NSSize(width: 16, height: 16)
+    private static var cache: [TokenPlatform: NSImage] = [:]
+
+    private static let resourceBundle: Bundle = {
+        if let bundleURL = Bundle.main.url(
+            forResource: "TokenBar_TokenBar",
+            withExtension: "bundle"),
+           let bundle = Bundle(url: bundleURL)
+        {
+            return bundle
+        }
+        return Bundle.module
+    }()
+
+    static func image(for platform: TokenPlatform) -> NSImage? {
+        if let cached = self.cache[platform] {
+            return cached
+        }
+        guard let resourceName = self.resourceName(for: platform),
+              let url = self.resourceBundle.url(
+                  forResource: resourceName,
+                  withExtension: "svg"),
+              let image = NSImage(contentsOf: url)
+        else {
+            return nil
+        }
+        image.size = self.size
+        image.isTemplate = true
+        self.cache[platform] = image
+        return image
+    }
+
+    private static func resourceName(for platform: TokenPlatform) -> String? {
+        switch platform {
+        case .codex: "ProviderIcon-codex"
+        case .claude: "ProviderIcon-claude"
+        default: nil
+        }
     }
 }

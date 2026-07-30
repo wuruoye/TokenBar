@@ -6,22 +6,27 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use chrono::{Days, Local};
+use tokenbar_helper::claude::{
+    extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
+    LocalParseOptions as ClaudeParseOptions,
+};
 use tokenbar_helper::codex::{parse_local_codex_messages, LocalParseOptions};
 use serde::Deserialize;
-use tokenbar_helper::pricing::{CodexPricing, FastPricingBasis};
+use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
-    build_snapshot_with_session_titles, extract_request_detail, load_codex_session_titles,
-    normalize_codex_reasoning_usage,
+    build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
+    load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS]\n       tokenbar-helper request-detail --session-path PATH --start-ms MS --end-ms MS";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude] --session-path PATH --start-ms MS --end-ms MS";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
     days: usize,
     home_dir: Option<PathBuf>,
     weekly_reset_ms: Option<i64>,
+    claude_weekly_reset_ms: Option<i64>,
 }
 
 impl Default for SnapshotConfig {
@@ -30,12 +35,14 @@ impl Default for SnapshotConfig {
             days: DEFAULT_DAYS,
             home_dir: None,
             weekly_reset_ms: None,
+            claude_weekly_reset_ms: None,
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct RequestDetailConfig {
+    platform: String,
     session_path: PathBuf,
     start_ms: i64,
     end_ms: i64,
@@ -56,9 +63,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     match parse_args(env::args_os().skip(1))? {
         Command::Snapshot(config) => run_snapshot(config),
         Command::RequestDetail(config) => {
-            let detail =
-                extract_request_detail(&config.session_path, config.start_ms, config.end_ms)
-                    .map_err(io::Error::other)?;
+            let detail = match config.platform.as_str() {
+                "codex" => {
+                    extract_codex_request_detail(
+                        &config.session_path,
+                        config.start_ms,
+                        config.end_ms,
+                    )
+                }
+                "claude" => {
+                    extract_claude_request_detail(
+                        &config.session_path,
+                        config.start_ms,
+                        config.end_ms,
+                    )
+                }
+                platform => Err(format!("unsupported request-detail platform: {platform}")),
+            }
+            .map_err(io::Error::other)?;
             write_json(&detail)
         }
     }
@@ -70,11 +92,12 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let first_day = today
         .checked_sub_days(Days::new((config.days - 1) as u64))
         .ok_or("day range is too large")?;
-    let scan_first_day = config
-        .weekly_reset_ms
-        .and_then(chrono::DateTime::from_timestamp_millis)
+    let scan_first_day = [config.weekly_reset_ms, config.claude_weekly_reset_ms]
+        .into_iter()
+        .flatten()
+        .filter_map(chrono::DateTime::from_timestamp_millis)
         .map(|timestamp| timestamp.with_timezone(&Local).date_naive())
-        .map_or(first_day, |reset_day| first_day.min(reset_day));
+        .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
     let session_index_path = codex_session_index_path(&config);
     let home_dir = config
         .home_dir
@@ -88,9 +111,9 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let use_env_roots = home_dir.is_none();
 
     let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config));
-    let mut messages = parse_local_codex_messages(
+    let mut codex_messages = parse_local_codex_messages(
         LocalParseOptions {
-            home_dir,
+            home_dir: home_dir.clone(),
             use_env_roots,
             since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
             until: Some(today.format("%Y-%m-%d").to_string()),
@@ -98,7 +121,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         &pricing,
     )
     .map_err(io::Error::other)?;
-    normalize_codex_reasoning_usage(&mut messages, |message| {
+    normalize_codex_reasoning_usage(&mut codex_messages, |message| {
         pricing.calculate_token_costs_with_service_tier(
             &message.model_id,
             Some(&message.provider_id),
@@ -106,20 +129,40 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
             message.service_tier,
         )
     });
-    let session_titles = session_index_path
+    let mut session_titles = session_index_path
         .as_deref()
-        .map(|path| load_codex_session_titles(&messages, path))
+        .map(|path| load_codex_session_titles(&codex_messages, path))
         .unwrap_or_default();
+    let claude_messages = parse_local_claude_messages(
+        ClaudeParseOptions {
+            home_dir,
+            use_env_roots,
+            since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
+            until: Some(today.format("%Y-%m-%d").to_string()),
+        },
+        &AnthropicPricing,
+    )
+    .map_err(io::Error::other)?;
+    session_titles.extend(load_claude_session_titles(&claude_messages));
+    let mut messages = codex_messages;
+    messages.extend(claude_messages);
 
     let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| now.offset().to_string());
-    let snapshot = build_snapshot_with_session_titles(
+    let mut weekly_resets = std::collections::HashMap::new();
+    if let Some(timestamp) = config.weekly_reset_ms {
+        weekly_resets.insert("codex".to_string(), timestamp);
+    }
+    if let Some(timestamp) = config.claude_weekly_reset_ms {
+        weekly_resets.insert("claude".to_string(), timestamp);
+    }
+    let snapshot = build_snapshot_with_platform_resets(
         messages,
         today,
         now.timestamp_millis(),
         timezone,
         config.days,
         &session_titles,
-        config.weekly_reset_ms,
+        &weekly_resets,
     )
     .map_err(io::Error::other)?;
 
@@ -211,6 +254,19 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .map_err(|_| "--weekly-reset-ms must be an integer")?,
                 );
             }
+            Some("--claude-weekly-reset-ms") => {
+                let value = args
+                    .next()
+                    .ok_or("--claude-weekly-reset-ms requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--claude-weekly-reset-ms must be valid UTF-8")?;
+                config.claude_weekly_reset_ms = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| "--claude-weekly-reset-ms must be an integer")?,
+                );
+            }
             Some("--help" | "-h") => {
                 return Err(USAGE.to_string());
             }
@@ -225,6 +281,7 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
 fn parse_request_detail_args(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<RequestDetailConfig, String> {
+    let mut platform = "codex".to_string();
     let mut session_path = None;
     let mut start_ms = None;
     let mut end_ms = None;
@@ -232,6 +289,14 @@ fn parse_request_detail_args(
 
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            Some("--platform") => {
+                let value = args.next().ok_or("--platform requires a value")?;
+                let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
+                if !matches!(value, "codex" | "claude") {
+                    return Err("--platform must be codex or claude".to_string());
+                }
+                platform = value.to_string();
+            }
             Some("--session-path") => {
                 let value = args.next().ok_or("--session-path requires a path")?;
                 session_path = Some(PathBuf::from(value));
@@ -261,6 +326,7 @@ fn parse_request_detail_args(
     }
 
     let config = RequestDetailConfig {
+        platform,
         session_path: session_path.ok_or("request-detail requires --session-path")?,
         start_ms: start_ms.ok_or("request-detail requires --start-ms")?,
         end_ms: end_ms.ok_or("request-detail requires --end-ms")?,
@@ -292,6 +358,8 @@ mod tests {
             OsString::from("/tmp/home"),
             OsString::from("--weekly-reset-ms"),
             OsString::from("1800000000000"),
+            OsString::from("--claude-weekly-reset-ms"),
+            OsString::from("1799000000000"),
         ])
         .unwrap();
 
@@ -301,6 +369,7 @@ mod tests {
                 days: 7,
                 home_dir: Some(PathBuf::from("/tmp/home")),
                 weekly_reset_ms: Some(1_800_000_000_000),
+                claude_weekly_reset_ms: Some(1_799_000_000_000),
             })
         );
     }
@@ -309,6 +378,8 @@ mod tests {
     fn accepts_request_detail_mode() {
         let command = parse_args([
             OsString::from("request-detail"),
+            OsString::from("--platform"),
+            OsString::from("claude"),
             OsString::from("--session-path"),
             OsString::from("/tmp/session.jsonl"),
             OsString::from("--start-ms"),
@@ -321,6 +392,7 @@ mod tests {
         assert_eq!(
             command,
             Command::RequestDetail(RequestDetailConfig {
+                platform: "claude".to_string(),
                 session_path: PathBuf::from("/tmp/session.jsonl"),
                 start_ms: 1000,
                 end_ms: 2000,

@@ -154,12 +154,19 @@ public extension SessionSummary {
 
 public extension ActivitySnapshot {
     var averageGenerationTokensPerSecond: Double? {
-        weightedAverageGenerationTokensPerSecond(
-            for: self.sessions.flatMap { session in
-                session.requests.flatMap(\.physicalRequests)
-            })
+        self.today.averageGenerationTokensPerSecond
+            ?? weightedAverageGenerationTokensPerSecond(
+                for: self.sessions.flatMap { session in
+                    session.requests.flatMap(\.physicalRequests)
+                })
     }
 
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+}
+
+public extension ActivityTotals {
     var menuAverageTPSText: String? {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
@@ -171,7 +178,7 @@ private func weightedAverageGenerationTokensPerSecond(
     var generatedTokens = 0.0
     var durationMs = 0.0
     for request in requests {
-        guard let requestDurationMs = request.durationMs,
+        guard let requestDurationMs = request.modelDurationMs,
               requestDurationMs > 0
         else {
             continue

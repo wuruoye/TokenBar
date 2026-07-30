@@ -94,6 +94,75 @@ private actor MemoryActivityCache: ActivitySnapshotCaching {
     }
 }
 
+private actor MemoryQuotaCache: QuotaSnapshotCaching {
+    var snapshots: [TokenPlatform: QuotaSnapshot]
+
+    init(snapshots: [TokenPlatform: QuotaSnapshot] = [:]) {
+        self.snapshots = snapshots
+    }
+
+    func loadQuotas() async throws -> [TokenPlatform: QuotaSnapshot] {
+        self.snapshots
+    }
+
+    func saveQuotas(_ snapshots: [TokenPlatform: QuotaSnapshot]) async throws {
+        self.snapshots = snapshots
+    }
+}
+
+private struct StaticPlatformQuotaProvider: QuotaProviding {
+    let platform: TokenPlatform
+    let snapshot: QuotaSnapshot
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        self.snapshot
+    }
+}
+
+private actor QuotaFetchRecorder {
+    private(set) var count = 0
+
+    func record() {
+        self.count += 1
+    }
+}
+
+private struct RecordingPlatformQuotaProvider: QuotaProviding {
+    let platform: TokenPlatform
+    let snapshot: QuotaSnapshot
+    let recorder: QuotaFetchRecorder
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        await self.recorder.record()
+        return self.snapshot
+    }
+}
+
+private actor PlatformResetActivityProvider: ActivityProviding {
+    let snapshot: ActivitySnapshot
+    private(set) var resets: [TokenPlatform: Date] = [:]
+
+    init(snapshot: ActivitySnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func fetchActivity(
+        sinceWeeklyResetAt: Date?,
+        statisticsTimeZone _: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        self.resets = [.codex: sinceWeeklyResetAt].compactMapValues { $0 }
+        return self.snapshot
+    }
+
+    func fetchActivity(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        statisticsTimeZone _: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        self.resets = sinceWeeklyResetAtByPlatform
+        return self.snapshot
+    }
+}
+
 @Suite("DashboardModel")
 struct DashboardModelTests {
     @Test("background refresh defaults to five minutes for both data sources")
@@ -101,6 +170,77 @@ struct DashboardModelTests {
     func defaultBackgroundRefreshInterval() {
         #expect(DashboardModel.defaultQuotaRefreshInterval == .seconds(300))
         #expect(DashboardModel.defaultActivityRefreshInterval == .seconds(300))
+    }
+
+    @Test("refreshes platform quotas independently and forwards both cycle starts")
+    @MainActor
+    func refreshesPlatformQuotas() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let codexReset = now.addingTimeInterval(4 * 86_400)
+        let claudeReset = now.addingTimeInterval(6 * 86_400)
+        let codexQuota = self.quota(reset: codexReset, updatedAt: now)
+        let claudeQuota = self.quota(reset: claudeReset, updatedAt: now)
+        let activity = PlatformResetActivityProvider(snapshot: TestFixtures.activity())
+        let model = DashboardModel(
+            quotaService: StaticPlatformQuotaProvider(
+                platform: .codex,
+                snapshot: codexQuota),
+            additionalQuotaServices: [
+                StaticPlatformQuotaProvider(platform: .claude, snapshot: claudeQuota),
+            ],
+            activityService: activity,
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.refreshAll()
+
+        #expect(model.quotaState(for: .codex).value == codexQuota)
+        #expect(model.quotaState(for: .claude).value == claudeQuota)
+        let resets = await activity.resets
+        #expect(resets[.codex] == codexReset.addingTimeInterval(-7 * 86_400))
+        #expect(resets[.claude] == claudeReset.addingTimeInterval(-7 * 86_400))
+    }
+
+    @Test("disabled quota platform is skipped at startup and refreshes after enabling")
+    @MainActor
+    func skipsDisabledQuotaPlatform() async {
+        let codexRecorder = QuotaFetchRecorder()
+        let claudeRecorder = QuotaFetchRecorder()
+        let snapshot = TestFixtures.quota(usedPercent: 20)
+        let model = DashboardModel(
+            quotaService: RecordingPlatformQuotaProvider(
+                platform: .codex,
+                snapshot: snapshot,
+                recorder: codexRecorder),
+            additionalQuotaServices: [
+                RecordingPlatformQuotaProvider(
+                    platform: .claude,
+                    snapshot: snapshot,
+                    recorder: claudeRecorder),
+            ],
+            activityService: QueueActivityProvider([
+                .success(TestFixtures.activity()),
+            ]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() })
+
+        #expect(model.updateQuotaRefreshEnabled(false, for: .claude))
+        await model.start()
+        model.stop()
+
+        #expect(await codexRecorder.count == 1)
+        #expect(await claudeRecorder.count == 0)
+        #expect(model.updateQuotaRefreshEnabled(true, for: .claude))
+
+        await model.refreshQuota(for: .claude)
+
+        #expect(await claudeRecorder.count == 1)
+        #expect(model.quotaState(for: .claude).value == snapshot)
     }
 
     @Test("independent refresh errors retain each lane's last good value")
@@ -207,6 +347,32 @@ struct DashboardModelTests {
         #expect(model.activity.errorMessage != nil)
     }
 
+    @Test("startup hydrates quota cache and retains it when a forced refresh fails")
+    @MainActor
+    func startsWithQuotaCache() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cachedQuota = self.quota(
+            reset: now.addingTimeInterval(4 * 86_400),
+            updatedAt: now)
+        let quotaCache = MemoryQuotaCache(snapshots: [.codex: cachedQuota])
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([.failure(.failed)]),
+            activityService: QueueActivityProvider([.success(TestFixtures.activity())]),
+            cache: nil,
+            quotaCache: quotaCache,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.start()
+        await model.refreshQuotas()
+        model.stop()
+
+        #expect(model.quota.value == cachedQuota)
+        #expect(model.quota.errorMessage != nil)
+    }
+
     @Test("changing the background interval restarts the combined refresh timer")
     @MainActor
     func changesBackgroundInterval() async {
@@ -271,6 +437,17 @@ struct DashboardModelTests {
 
         #expect(await activity.statisticsTimeZones == [.utc, .local])
         #expect(model.activity.value == localSnapshot)
+    }
+
+    private func quota(reset: Date, updatedAt: Date) -> QuotaSnapshot {
+        QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 30,
+                windowMinutes: 10_080,
+                resetsAt: reset),
+            resetCredits: nil,
+            updatedAt: updatedAt)
     }
 }
 

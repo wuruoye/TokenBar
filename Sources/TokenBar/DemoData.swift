@@ -5,6 +5,8 @@ import SwiftUI
 import TokenBarCore
 
 struct DemoQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.codex
+
     func fetchQuota() async throws -> QuotaSnapshot {
         let now = Date()
         let object: [String: Any] = [
@@ -28,10 +30,49 @@ struct DemoQuotaProvider: QuotaProviding {
     }
 }
 
+struct DemoClaudeQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.claude
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        let now = Date()
+        let object: [String: Any] = [
+            "session": [
+                "usedPercent": 54,
+                "windowMinutes": 300,
+                "resetsAt": now.addingTimeInterval(1.6 * 3600).timeIntervalSinceReferenceDate,
+            ],
+            "weekly": [
+                "usedPercent": 46,
+                "windowMinutes": 10_080,
+                "resetsAt": now.addingTimeInterval(5.1 * 86_400).timeIntervalSinceReferenceDate,
+            ],
+            "updatedAt": now.timeIntervalSinceReferenceDate,
+        ]
+        return try JSONDecoder().decode(
+            QuotaSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object))
+    }
+}
+
 struct DemoActivityProvider: ActivityProviding {
     func fetchActivity(
         sinceWeeklyResetAt: Date?,
         statisticsTimeZone _: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        var resets: [TokenPlatform: Date] = [:]
+        resets[.codex] = sinceWeeklyResetAt
+        return try self.makeSnapshot(sinceWeeklyResetAtByPlatform: resets)
+    }
+
+    func fetchActivity(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        statisticsTimeZone _: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        try self.makeSnapshot(sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform)
+    }
+
+    private func makeSnapshot(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date]) throws -> ActivitySnapshot
     {
         let now = Date()
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
@@ -52,8 +93,20 @@ struct DemoActivityProvider: ActivityProviding {
 
         var sessions: [[String: Any]] = []
         var today = DemoTokenCounter()
+        var todayByPlatform: [TokenPlatform: DemoTokenCounter] = [
+            .codex: DemoTokenCounter(),
+            .claude: DemoTokenCounter(),
+        ]
+        var requestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var sessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
         var requestCount = 0
         for (sessionIndex, prompt) in prompts.enumerated() {
+            let platform = sessionIndex.isMultiple(of: 2)
+                ? TokenPlatform.codex
+                : TokenPlatform.claude
+            let model = platform == .codex ? "gpt-5" : "claude-sonnet-4-5"
+            let provider = platform == .codex ? "openai" : "anthropic"
+            let agent = platform == .codex ? "codex" : "claude"
             var requests: [[String: Any]] = []
             var sessionTokens = DemoTokenCounter()
             for requestIndex in 0 ..< 3 {
@@ -65,7 +118,9 @@ struct DemoActivityProvider: ActivityProviding {
                     reasoning: Int64(90 + requestIndex * 25))
                 sessionTokens.add(tokens)
                 today.add(tokens)
+                todayByPlatform[platform]?.add(tokens)
                 requestCount += 1
+                requestCountByPlatform[platform, default: 0] += 1
                 let startedAtMs = nowMs
                     - Int64(sessionIndex * 29 * 60 * 1000)
                     - Int64((2 - requestIndex) * 4 * 60 * 1000)
@@ -75,15 +130,17 @@ struct DemoActivityProvider: ActivityProviding {
                 let serviceTier = sessionIndex.isMultiple(of: 3) ? "fast" : "standard"
                 var request: [String: Any] = [
                     "id": "request-\(sessionIndex)-\(requestIndex)",
+                    "platform": platform.rawValue,
                     "sessionId": "session-\(sessionIndex)",
                     "physicalSessionId": "physical-\(sessionIndex)",
                     "isSubagent": false,
-                    "agent": "codex",
-                    "model": "gpt-5",
-                    "provider": "openai",
+                    "agent": agent,
+                    "model": model,
+                    "provider": provider,
                     "startedAtMs": startedAtMs,
                     "endedAtMs": startedAtMs + 82_000,
                     "durationMs": 82_000,
+                    "modelDurationMs": 12_000,
                     "tokens": tokens.object,
                     "costUsd": Double(tokens.total) / 1_000_000 * 4.2,
                     "costSource": "estimated",
@@ -101,15 +158,17 @@ struct DemoActivityProvider: ActivityProviding {
                     request["contributions"] = [
                         [
                             "id": "main-\(sessionIndex)-\(requestIndex)",
+                            "platform": platform.rawValue,
                             "sessionId": "session-\(sessionIndex)",
                             "physicalSessionId": "physical-\(sessionIndex)",
                             "isSubagent": false,
-                            "agent": "codex",
-                            "model": "gpt-5",
-                            "provider": "openai",
+                            "agent": agent,
+                            "model": model,
+                            "provider": provider,
                             "startedAtMs": startedAtMs,
                             "endedAtMs": startedAtMs + 48_000,
                             "durationMs": 48_000,
+                            "modelDurationMs": 7_500,
                             "tokens": mainTokens.object,
                             "costUsd": Double(mainTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
@@ -119,15 +178,17 @@ struct DemoActivityProvider: ActivityProviding {
                         ],
                         [
                             "id": "child-\(sessionIndex)-\(requestIndex)",
+                            "platform": platform.rawValue,
                             "sessionId": "session-\(sessionIndex)",
                             "physicalSessionId": "child-\(sessionIndex)",
                             "isSubagent": true,
                             "agent": "reviewer",
-                            "model": "gpt-5",
-                            "provider": "openai",
+                            "model": model,
+                            "provider": provider,
                             "startedAtMs": startedAtMs + 16_000,
                             "endedAtMs": startedAtMs + 82_000,
                             "durationMs": 66_000,
+                            "modelDurationMs": 9_000,
                             "tokens": childTokens.object,
                             "costUsd": Double(childTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
@@ -140,14 +201,16 @@ struct DemoActivityProvider: ActivityProviding {
                 requests.append(request)
             }
 
+            sessionCountByPlatform[platform, default: 0] += 1
             sessions.append([
                 "id": "session-\(sessionIndex)",
-                "workspaceLabel": sessionIndex.isMultiple(of: 2) ? "TokenBar" : "CodexBar",
+                "platform": platform.rawValue,
+                "workspaceLabel": sessionIndex.isMultiple(of: 3) ? "TokenBar" : "Platform Adapter",
                 "startedAtMs": nowMs - Int64((sessionIndex * 29 + 12) * 60 * 1000),
                 "endedAtMs": nowMs - Int64(sessionIndex * 29 * 60 * 1000),
                 "tokens": sessionTokens.object,
                 "costUsd": Double(sessionTokens.total) / 1_000_000 * 4.2,
-                "models": ["gpt-5"],
+                "models": [model],
                 "requests": Array(requests.reversed()),
             ])
         }
@@ -157,9 +220,22 @@ struct DemoActivityProvider: ActivityProviding {
         formatter.dateFormat = "yyyy-MM-dd"
         let calendar = Calendar(identifier: .gregorian)
         var days: [[String: Any]] = []
-        var weekly = DemoTokenCounter()
-        var weeklyRequestCount = 0
-        var weeklySessionCount = 0
+        var sourceDays: [TokenPlatform: [[String: Any]]] = [.codex: [], .claude: []]
+        var range = DemoTokenCounter()
+        var rangeByPlatform: [TokenPlatform: DemoTokenCounter] = [
+            .codex: DemoTokenCounter(),
+            .claude: DemoTokenCounter(),
+        ]
+        var rangeRequestCount = 0
+        var rangeSessionCount = 0
+        var rangeRequestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var rangeSessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var weeklyByPlatform: [TokenPlatform: DemoTokenCounter] = [
+            .codex: DemoTokenCounter(),
+            .claude: DemoTokenCounter(),
+        ]
+        var weeklyRequestCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var weeklySessionCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
         for offset in (0 ..< 30).reversed() {
             let date = calendar.date(byAdding: .day, value: -offset, to: now) ?? now
             let wave = Int64((29 - offset) % 7)
@@ -174,10 +250,67 @@ struct DemoActivityProvider: ActivityProviding {
             let dayCost = Double(tokens.total) / 1_000_000 * 4.2
             let dayRequestCount = 12 + Int(wave)
             let daySessionCount = 4 + Int(wave % 3)
-            if let sinceWeeklyResetAt, date >= sinceWeeklyResetAt {
-                weekly.add(tokens)
-                weeklyRequestCount += dayRequestCount
-                weeklySessionCount += daySessionCount
+            let codexRequestCount = 8 + Int(wave / 2)
+            let claudeRequestCount = 4 + Int(wave - wave / 2)
+            let codexSessionCount = 3 + Int(wave % 2)
+            let claudeSessionCount = 1 + Int(wave % 2)
+            let codexCost = dayCost * Double(primaryModel.total) / Double(max(1, tokens.total))
+            let claudeCost = dayCost * Double(secondaryModel.total) / Double(max(1, tokens.total))
+            range.add(tokens)
+            rangeRequestCount += dayRequestCount
+            rangeSessionCount += daySessionCount
+            for (
+                platform,
+                platformTokens,
+                platformCost,
+                platformRequestCount,
+                platformSessionCount,
+                model,
+                provider
+            ) in [
+                (
+                    TokenPlatform.codex,
+                    primaryModel,
+                    codexCost,
+                    codexRequestCount,
+                    codexSessionCount,
+                    "gpt-5",
+                    "openai"
+                ),
+                (
+                    TokenPlatform.claude,
+                    secondaryModel,
+                    claudeCost,
+                    claudeRequestCount,
+                    claudeSessionCount,
+                    "claude-sonnet-4-5",
+                    "anthropic"
+                ),
+            ] {
+                rangeByPlatform[platform]?.add(platformTokens)
+                rangeRequestCountByPlatform[platform, default: 0] += platformRequestCount
+                rangeSessionCountByPlatform[platform, default: 0] += platformSessionCount
+                if let reset = sinceWeeklyResetAtByPlatform[platform], date >= reset {
+                    weeklyByPlatform[platform]?.add(platformTokens)
+                    weeklyRequestCount[platform, default: 0] += platformRequestCount
+                    weeklySessionCount[platform, default: 0] += platformSessionCount
+                }
+                sourceDays[platform, default: []].append([
+                    "date": formatter.string(from: date),
+                    "tokens": platformTokens.object,
+                    "costUsd": platformCost,
+                    "requestCount": platformRequestCount,
+                    "sessionCount": platformSessionCount,
+                    "models": [[
+                        "platform": platform.rawValue,
+                        "model": model,
+                        "provider": provider,
+                        "tokens": platformTokens.object,
+                        "costUsd": platformCost,
+                        "requestCount": platformRequestCount,
+                        "sessionCount": platformSessionCount,
+                    ]],
+                ])
             }
             days.append([
                 "date": formatter.string(from: date),
@@ -187,27 +320,70 @@ struct DemoActivityProvider: ActivityProviding {
                 "sessionCount": daySessionCount,
                 "models": [
                     [
+                        "platform": TokenPlatform.codex.rawValue,
                         "model": "gpt-5",
                         "provider": "openai",
                         "tokens": primaryModel.object,
-                        "costUsd": dayCost * Double(primaryModel.total) / Double(max(1, tokens.total)),
-                        "requestCount": 8 + Int(wave / 2),
-                        "sessionCount": 3 + Int(wave % 2),
+                        "costUsd": codexCost,
+                        "requestCount": codexRequestCount,
+                        "sessionCount": codexSessionCount,
                     ],
                     [
-                        "model": "gpt-5-mini",
-                        "provider": "openai",
+                        "platform": TokenPlatform.claude.rawValue,
+                        "model": "claude-sonnet-4-5",
+                        "provider": "anthropic",
                         "tokens": secondaryModel.object,
-                        "costUsd": dayCost * Double(secondaryModel.total) / Double(max(1, tokens.total)),
-                        "requestCount": 4 + Int(wave - wave / 2),
-                        "sessionCount": 1 + Int(wave % 2),
+                        "costUsd": claudeCost,
+                        "requestCount": claudeRequestCount,
+                        "sessionCount": claudeSessionCount,
                     ],
                 ],
             ])
         }
 
-        var object: [String: Any] = [
-            "schemaVersion": 3,
+        var sources: [[String: Any]] = []
+        for platform in [TokenPlatform.codex, .claude] {
+            let platformToday = todayByPlatform[platform] ?? DemoTokenCounter()
+            let platformRange = rangeByPlatform[platform] ?? DemoTokenCounter()
+            let averageTPS = platform == .codex ? 31.2 : 23.4
+            var source: [String: Any] = [
+                "platform": platform.rawValue,
+                "today": [
+                    "tokens": platformToday.object,
+                    "costUsd": Double(platformToday.total) / 1_000_000 * 4.2,
+                    "tokenCosts": platformToday.costObject,
+                    "requestCount": requestCountByPlatform[platform] ?? 0,
+                    "sessionCount": sessionCountByPlatform[platform] ?? 0,
+                ],
+                "rangeTotals": [
+                    "tokens": platformRange.object,
+                    "costUsd": Double(platformRange.total) / 1_000_000 * 4.2,
+                    "tokenCosts": platformRange.costObject,
+                    "averageGenerationTokensPerSecond": averageTPS,
+                    "requestCount": rangeRequestCountByPlatform[platform] ?? 0,
+                    "sessionCount": rangeSessionCountByPlatform[platform] ?? 0,
+                ],
+                "days": sourceDays[platform] ?? [],
+            ]
+            if let reset = sinceWeeklyResetAtByPlatform[platform] {
+                let weekly = weeklyByPlatform[platform] ?? DemoTokenCounter()
+                source["weeklySinceReset"] = [
+                    "startedAtMs": Int64(reset.timeIntervalSince1970 * 1000),
+                    "totals": [
+                        "tokens": weekly.object,
+                        "costUsd": Double(weekly.total) / 1_000_000 * 4.2,
+                        "tokenCosts": weekly.costObject,
+                        "averageGenerationTokensPerSecond": averageTPS,
+                        "requestCount": weeklyRequestCount[platform] ?? 0,
+                        "sessionCount": weeklySessionCount[platform] ?? 0,
+                    ],
+                ]
+            }
+            sources.append(source)
+        }
+
+        let object: [String: Any] = [
+            "schemaVersion": 7,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [
@@ -217,21 +393,18 @@ struct DemoActivityProvider: ActivityProviding {
                 "requestCount": requestCount,
                 "sessionCount": sessions.count,
             ],
+            "rangeTotals": [
+                "tokens": range.object,
+                "costUsd": Double(range.total) / 1_000_000 * 4.2,
+                "tokenCosts": range.costObject,
+                "averageGenerationTokensPerSecond": 27.3,
+                "requestCount": rangeRequestCount,
+                "sessionCount": rangeSessionCount,
+            ],
             "sessions": sessions,
             "days": days,
+            "sources": sources,
         ]
-        if let sinceWeeklyResetAt {
-            object["weeklySinceReset"] = [
-                "startedAtMs": Int64(sinceWeeklyResetAt.timeIntervalSince1970 * 1000),
-                "totals": [
-                    "tokens": weekly.object,
-                    "costUsd": Double(weekly.total) / 1_000_000 * 4.2,
-                    "tokenCosts": weekly.costObject,
-                    "requestCount": weeklyRequestCount,
-                    "sessionCount": weeklySessionCount,
-                ],
-            ]
-        }
         return try JSONDecoder().decode(ActivitySnapshot.self, from: JSONSerialization.data(withJSONObject: object))
     }
 }
@@ -318,15 +491,21 @@ private struct DemoTokenCounter {
 @MainActor
 enum DemoPreviewRenderer {
     static func render(model: DashboardModel, path: String) throws {
-        let showsFiveHour = model.quotaSnapshot?.session != nil
-        let showsResetCredits = model.quotaSnapshot?.resetCredits != nil
+        if let rawScope = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SCOPE"],
+           let scope = DashboardScope(rawValue: rawScope)
+        {
+            model.scope = scope
+        }
+        let showsClaude = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_CLAUDE"] != "0"
+        if !showsClaude {
+            model.scope = .codex
+        }
         let height = DashboardSummaryView.preferredHeight(
-            showsFiveHour: showsFiveHour,
-            showsResetCredits: showsResetCredits)
+            quota: model.quotaState(for: model.scope.platform).value,
+            showsClaude: showsClaude)
         let content = DashboardSummaryView(
             model: model,
-            showsFiveHour: showsFiveHour,
-            showsResetCredits: showsResetCredits,
+            showsClaude: showsClaude,
             accentColor: .purple)
             .frame(width: 384, height: height, alignment: .top)
             .background(Color.white)
@@ -455,7 +634,7 @@ enum DemoPreviewRenderer {
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .light)
         let host = NSHostingView(rootView: content)
-        host.frame = NSRect(x: 0, y: 0, width: 440, height: 570)
+        host.frame = NSRect(x: 0, y: 0, width: 440, height: 620)
         let canvas = DemoRowPreviewCanvas(frame: host.bounds)
         host.frame = canvas.bounds
         canvas.addSubview(host)
@@ -463,14 +642,22 @@ enum DemoPreviewRenderer {
     }
 
     static func renderStatus(path: String) throws {
-        let statusImage = StatusLabelRenderer.image(today: "359M", weekly: "68%")
+        let statusImage = StatusLabelRenderer.layout(
+            codexToday: "359M",
+            codexWeekly: "68%",
+            claudeToday: "141K",
+            claudeWeekly: "54%").image
         let padding: CGFloat = 4
         let canvas = DemoRowPreviewCanvas(frame: NSRect(
             x: 0,
             y: 0,
             width: statusImage.size.width + padding * 2,
             height: statusImage.size.height + padding * 2))
-        let imageView = NSImageView(frame: canvas.bounds.insetBy(dx: padding, dy: padding))
+        let imageView = NSImageView(frame: NSRect(
+            x: padding,
+            y: padding,
+            width: statusImage.size.width,
+            height: statusImage.size.height))
         imageView.image = statusImage
         imageView.imageScaling = .scaleNone
         imageView.contentTintColor = .labelColor

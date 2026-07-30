@@ -11,10 +11,13 @@ use crate::usage::{
 };
 
 pub mod codex;
+pub mod claude;
 pub mod pricing;
 pub mod usage;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 7;
+
+pub type SessionTitleMap = HashMap<(String, String), String>;
 
 const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
     "<environment_context>",
@@ -110,6 +113,7 @@ impl From<ServiceTier> for ActivityServiceTier {
 #[serde(rename_all = "camelCase")]
 pub struct RequestSummary {
     pub id: String,
+    pub platform: String,
     pub session_id: String,
     pub physical_session_id: String,
     pub is_subagent: bool,
@@ -119,6 +123,8 @@ pub struct RequestSummary {
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
     pub duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_duration_ms: Option<i64>,
     pub tokens: TokenBreakdown,
     pub cost_usd: f64,
     pub cost_source: ActivityCostSource,
@@ -136,8 +142,11 @@ pub struct RequestSummary {
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub id: String,
+    pub platform: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     pub workspace_label: Option<String>,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
@@ -154,6 +163,8 @@ pub struct ActivityTotals {
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_costs: Option<TokenCostBreakdown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_generation_tokens_per_second: Option<f64>,
     pub request_count: usize,
     pub session_count: usize,
 }
@@ -168,6 +179,7 @@ pub struct ActivityRangeSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyModelSummary {
+    pub platform: String,
     pub model: String,
     pub provider: String,
     pub tokens: TokenBreakdown,
@@ -196,8 +208,24 @@ pub struct ActivitySnapshot {
     pub timezone: String,
     pub today: ActivityTotals,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_totals: Option<ActivityTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekly_since_reset: Option<ActivityRangeSummary>,
     pub sessions: Vec<SessionSummary>,
+    pub days: Vec<DailySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ActivitySourceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySourceSnapshot {
+    pub platform: String,
+    pub today: ActivityTotals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_totals: Option<ActivityTotals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_since_reset: Option<ActivityRangeSummary>,
     pub days: Vec<DailySummary>,
 }
 
@@ -222,6 +250,7 @@ struct RequestRow {
     session_id: String,
     physical_session_id: String,
     is_subagent: bool,
+    workspace_path: Option<String>,
     workspace_label: Option<String>,
     agent: Option<String>,
     session_path: Option<String>,
@@ -233,6 +262,7 @@ struct RequestRow {
     cost_source: ActivityCostSource,
     service_tier: ActivityServiceTier,
     duration_ms: Option<i64>,
+    model_duration_ms: Option<i64>,
     request_start_timestamp: Option<i64>,
     request_end_timestamp: i64,
     is_turn_start: bool,
@@ -269,8 +299,8 @@ struct DailyAccumulator {
     cost: f64,
     token_costs: OptionalTokenCostAccumulator,
     turn_ids: HashSet<String>,
-    session_ids: HashSet<String>,
-    models: BTreeMap<(String, String), DailyModelAccumulator>,
+    session_ids: HashSet<(String, String)>,
+    models: BTreeMap<(String, String, String), DailyModelAccumulator>,
 }
 
 #[derive(Default)]
@@ -303,7 +333,7 @@ struct DailyModelAccumulator {
     tokens: TokenBreakdown,
     cost: f64,
     turn_ids: HashSet<String>,
-    session_ids: HashSet<String>,
+    session_ids: HashSet<(String, String)>,
 }
 
 /// Reads the unabridged prompt and assistant messages for one Codex request.
@@ -457,7 +487,7 @@ pub fn normalize_codex_reasoning_usage(
 pub fn load_codex_session_titles(
     messages: &[UnifiedMessage],
     session_index_path: &Path,
-) -> HashMap<String, String> {
+) -> SessionTitleMap {
     let titles_by_upstream = read_codex_title_index(session_index_path);
     if titles_by_upstream.is_empty() {
         return HashMap::new();
@@ -481,11 +511,67 @@ pub fn load_codex_session_titles(
             continue;
         };
         if let Some(title) = titles_by_upstream.get(&upstream_id) {
-            titles_by_session.insert(message.session_id.clone(), title.clone());
+            titles_by_session.insert(
+                ("codex".to_string(), message.session_id.clone()),
+                title.clone(),
+            );
         }
     }
 
     titles_by_session
+}
+
+/// Reads the latest custom title written into each root Claude Code transcript.
+///
+/// Claude appends `custom-title` records directly to the CLI JSONL. Subagent
+/// transcripts share the parent logical session id, so only the physical root
+/// transcript is allowed to name the grouped session.
+pub fn load_claude_session_titles(messages: &[UnifiedMessage]) -> SessionTitleMap {
+    let mut seen_paths = HashSet::new();
+    let mut titles_by_session = HashMap::new();
+    for message in messages {
+        if message.client != "claude" {
+            continue;
+        }
+
+        let Some(path) = message.session_path.as_deref() else {
+            continue;
+        };
+        if physical_session_id(message) != message.session_id || !seen_paths.insert(path) {
+            continue;
+        }
+
+        if let Some(title) = read_claude_custom_title(Path::new(path)) {
+            titles_by_session.insert(
+                ("claude".to_string(), message.session_id.clone()),
+                title,
+            );
+        }
+    }
+
+    titles_by_session
+}
+
+fn read_claude_custom_title(path: &Path) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    let mut title = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(serde_json::Value::as_str) != Some("custom-title") {
+            continue;
+        }
+        let Some(value) = entry
+            .get("customTitle")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let value = value.trim();
+        title = (!value.is_empty()).then(|| value.to_string());
+    }
+    title
 }
 
 fn read_codex_title_index(path: &Path) -> HashMap<String, String> {
@@ -559,7 +645,88 @@ pub fn build_snapshot_with_session_titles(
     generated_at_ms: i64,
     timezone: String,
     day_count: usize,
-    session_titles: &HashMap<String, String>,
+    session_titles: &SessionTitleMap,
+    weekly_reset_at_ms: Option<i64>,
+) -> Result<ActivitySnapshot, String> {
+    let weekly_resets = weekly_reset_at_ms
+        .map(|timestamp| HashMap::from([("codex".to_string(), timestamp)]))
+        .unwrap_or_default();
+    build_snapshot_with_platform_resets(
+        messages,
+        today,
+        generated_at_ms,
+        timezone,
+        day_count,
+        session_titles,
+        &weekly_resets,
+    )
+}
+
+pub fn build_snapshot_with_platform_resets(
+    messages: Vec<UnifiedMessage>,
+    today: NaiveDate,
+    generated_at_ms: i64,
+    timezone: String,
+    day_count: usize,
+    session_titles: &SessionTitleMap,
+    weekly_reset_at_ms: &HashMap<String, i64>,
+) -> Result<ActivitySnapshot, String> {
+    let discovered_platforms = messages
+        .iter()
+        .map(|message| message.client.clone())
+        .collect::<BTreeSet<_>>();
+    let mut platforms = vec!["codex".to_string(), "claude".to_string()];
+    platforms.extend(
+        discovered_platforms
+            .into_iter()
+            .filter(|platform| platform != "codex" && platform != "claude"),
+    );
+
+    let mut snapshot = build_snapshot_core(
+        messages.clone(),
+        today,
+        generated_at_ms,
+        timezone.clone(),
+        day_count,
+        session_titles,
+        weekly_reset_at_ms.get("codex").copied(),
+    )?;
+    snapshot.sources = platforms
+        .into_iter()
+        .map(|platform| {
+            let source_messages = messages
+                .iter()
+                .filter(|message| message.client == platform)
+                .cloned()
+                .collect();
+            build_snapshot_core(
+                source_messages,
+                today,
+                generated_at_ms,
+                timezone.clone(),
+                day_count,
+                session_titles,
+                weekly_reset_at_ms.get(&platform).copied(),
+            )
+            .map(|source| ActivitySourceSnapshot {
+                platform,
+                today: source.today,
+                range_totals: source.range_totals,
+                weekly_since_reset: source.weekly_since_reset,
+                days: source.days,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(snapshot)
+}
+
+fn build_snapshot_core(
+    messages: Vec<UnifiedMessage>,
+    today: NaiveDate,
+    generated_at_ms: i64,
+    timezone: String,
+    day_count: usize,
+    session_titles: &SessionTitleMap,
     weekly_reset_at_ms: Option<i64>,
 ) -> Result<ActivitySnapshot, String> {
     if day_count == 0 {
@@ -608,29 +775,31 @@ pub fn build_snapshot_with_session_titles(
             entry.cost = add_cost(entry.cost, request.cost);
             entry.token_costs.add(request.token_costs.as_ref());
             entry.turn_ids.insert(turn.id.clone());
-            entry.session_ids.insert(request.session_id.clone());
+            entry
+                .session_ids
+                .insert((request.source.clone(), request.session_id.clone()));
 
             let model = entry
                 .models
-                .entry((request.provider.clone(), request.model.clone()))
+                .entry((
+                    request.source.clone(),
+                    request.provider.clone(),
+                    request.model.clone(),
+                ))
                 .or_default();
             model.tokens.add_assign(&request.tokens);
             model.cost = add_cost(model.cost, request.cost);
             model.turn_ids.insert(turn.id.clone());
-            model.session_ids.insert(request.session_id.clone());
+            model
+                .session_ids
+                .insert((request.source.clone(), request.session_id.clone()));
         }
     }
 
-    let today_totals = daily
-        .get(&today)
-        .map(|entry| ActivityTotals {
-            tokens: entry.tokens.clone(),
-            cost_usd: entry.cost,
-            token_costs: entry.token_costs.complete_costs(),
-            request_count: entry.turn_ids.len(),
-            session_count: entry.session_ids.len(),
-        })
-        .unwrap_or_default();
+    let today_totals = activity_totals(&turns, |request| request.date == today);
+    let range_totals = activity_totals(&turns, |request| {
+        request.date >= first_day && request.date <= today
+    });
 
     let mut days = Vec::with_capacity(day_count);
     for offset in 0..day_count {
@@ -643,7 +812,8 @@ pub fn build_snapshot_with_session_titles(
                 value
                     .models
                     .iter()
-                    .map(|((provider, model), usage)| DailyModelSummary {
+                    .map(|((platform, provider, model), usage)| DailyModelSummary {
+                        platform: platform.clone(),
                         model: model.clone(),
                         provider: provider.clone(),
                         tokens: usage.tokens.clone(),
@@ -680,9 +850,11 @@ pub fn build_snapshot_with_session_titles(
         generated_at_ms,
         timezone,
         today: today_totals,
+        range_totals: Some(range_totals),
         weekly_since_reset,
         sessions,
         days,
+        sources: Vec::new(),
     })
 }
 
@@ -692,13 +864,23 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
     let mut token_costs = OptionalTokenCostAccumulator::default();
     let mut session_ids = HashSet::new();
     let mut turn_count = 0_usize;
+    let mut generated_tokens = 0.0;
+    let mut model_duration_ms = 0.0;
     for turn in turns {
         let mut included_turn = false;
         for request in turn.contributions.iter().filter(|request| include(request)) {
             tokens.add_assign(&request.tokens);
             cost_usd = add_cost(cost_usd, request.cost);
             token_costs.add(request.token_costs.as_ref());
-            session_ids.insert(request.session_id.clone());
+            session_ids.insert((request.source.clone(), request.session_id.clone()));
+            if let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) {
+                let request_generated_tokens =
+                    request.tokens.output.max(0).saturating_add(request.tokens.reasoning.max(0));
+                if request_generated_tokens > 0 {
+                    generated_tokens += request_generated_tokens as f64;
+                    model_duration_ms += duration_ms as f64;
+                }
+            }
             included_turn = true;
         }
         if included_turn {
@@ -709,6 +891,11 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
         tokens,
         cost_usd,
         token_costs: token_costs.complete_costs(),
+        average_generation_tokens_per_second: (generated_tokens.is_finite()
+            && model_duration_ms.is_finite()
+            && generated_tokens > 0.0
+            && model_duration_ms > 0.0)
+            .then_some(generated_tokens * 1_000.0 / model_duration_ms),
         request_count: turn_count,
         session_count: session_ids.len(),
     }
@@ -724,11 +911,16 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
 
     let model = normalize_model_for_grouping(&message.model_id);
     let physical_session_id = physical_session_id(&message);
-    let is_subagent = message.client == "codex" && physical_session_id != message.session_id;
+    let is_subagent = message.is_subagent || physical_session_id != message.session_id;
     let request_start_timestamp = message
         .duration_ms
         .filter(|duration| *duration > 0)
         .map(|duration| message.timestamp.saturating_sub(duration));
+    let model_duration_ms = if tokens.output.saturating_add(tokens.reasoning) > 0 {
+        message.model_duration_ms.filter(|duration| *duration > 0)
+    } else {
+        Some(0)
+    };
 
     Some(RequestRow {
         date,
@@ -739,6 +931,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         session_id: message.session_id,
         physical_session_id,
         is_subagent,
+        workspace_path: nonempty(message.workspace_key),
         workspace_label: nonempty(message.workspace_label),
         agent: nonempty(message.agent),
         session_path: nonempty(message.session_path),
@@ -750,6 +943,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         cost_source: message.cost_source.into(),
         service_tier: message.service_tier.into(),
         duration_ms: message.duration_ms,
+        model_duration_ms,
         request_start_timestamp,
         request_end_timestamp: message.timestamp,
         is_turn_start: message.is_turn_start,
@@ -757,8 +951,12 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
 }
 
 fn physical_session_id(message: &UnifiedMessage) -> String {
-    if message.client != "codex" {
-        return message.session_id.clone();
+    if let Some(physical_session_id) = message
+        .physical_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return physical_session_id.to_string();
     }
 
     message
@@ -881,6 +1079,10 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
         (None, Some(right)) => Some(right),
         (None, None) => None,
     };
+    target.model_duration_ms = match (target.model_duration_ms, row.model_duration_ms) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    };
     target.request_start_timestamp =
         match (target.request_start_timestamp, row.request_start_timestamp) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -905,6 +1107,9 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
     if target.workspace_label.is_none() {
         target.workspace_label = row.workspace_label;
     }
+    if target.workspace_path.is_none() {
+        target.workspace_path = row.workspace_path;
+    }
     if target.session_path.is_none() {
         target.session_path = row.session_path;
     }
@@ -926,22 +1131,25 @@ fn merge_token_costs(
 fn build_today_sessions(
     turns: Vec<TurnRow>,
     today: NaiveDate,
-    session_titles: &HashMap<String, String>,
+    session_titles: &SessionTitleMap,
 ) -> Vec<SessionSummary> {
-    let mut grouped: HashMap<String, Vec<TurnRow>> = HashMap::new();
+    let mut grouped: HashMap<(String, String), Vec<TurnRow>> = HashMap::new();
     for mut turn in turns {
         turn.contributions.retain(|row| row.date == today);
         if turn.contributions.is_empty() {
             continue;
         }
         grouped
-            .entry(turn.anchor.session_id.clone())
+            .entry((
+                turn.anchor.source.clone(),
+                turn.anchor.session_id.clone(),
+            ))
             .or_default()
             .push(turn);
     }
 
     let mut sessions = Vec::with_capacity(grouped.len());
-    for (session_id, session_turns) in grouped {
+    for ((platform, session_id), session_turns) in grouped {
         let rows = session_turns
             .iter()
             .flat_map(|turn| turn.contributions.iter())
@@ -952,6 +1160,11 @@ fn build_today_sessions(
             .filter(|row| !row.is_subagent)
             .find_map(|row| row.workspace_label.clone())
             .or_else(|| rows.iter().find_map(|row| row.workspace_label.clone()));
+        let workspace_path = rows
+            .iter()
+            .filter(|row| !row.is_subagent)
+            .find_map(|row| row.workspace_path.clone())
+            .or_else(|| rows.iter().find_map(|row| row.workspace_path.clone()));
         let started_at_ms = rows
             .iter()
             .map(|row| row.started_at_ms())
@@ -984,8 +1197,12 @@ fn build_today_sessions(
         });
 
         sessions.push(SessionSummary {
-            title: session_titles.get(&session_id).cloned(),
+            title: session_titles
+                .get(&(platform.clone(), session_id.clone()))
+                .cloned(),
             id: session_id,
+            platform,
+            workspace_path,
             workspace_label,
             started_at_ms,
             ended_at_ms,
@@ -1000,6 +1217,7 @@ fn build_today_sessions(
         right
             .ended_at_ms
             .cmp(&left.ended_at_ms)
+            .then_with(|| left.platform.cmp(&right.platform))
             .then_with(|| left.id.cmp(&right.id))
     });
     sessions
@@ -1038,6 +1256,10 @@ fn turn_summary(turn: TurnRow, occurrences: &mut HashMap<String, usize>) -> Requ
         .iter()
         .filter(|row| !row.is_subagent)
         .find_map(|row| row.workspace_label.clone());
+    let root_workspace_path = rows
+        .iter()
+        .filter(|row| !row.is_subagent)
+        .find_map(|row| row.workspace_path.clone());
     let root_session_path = rows
         .iter()
         .filter(|row| !row.is_subagent)
@@ -1055,6 +1277,11 @@ fn turn_summary(turn: TurnRow, occurrences: &mut HashMap<String, usize>) -> Requ
     aggregate.agent = None;
     aggregate.model.clone_from(&turn.anchor.model);
     aggregate.provider.clone_from(&turn.anchor.provider);
+    aggregate.workspace_path = turn
+        .anchor
+        .workspace_path
+        .clone()
+        .or(root_workspace_path);
     aggregate.workspace_label = turn.anchor.workspace_label.clone().or(root_workspace);
     aggregate.session_path = turn.anchor.session_path.clone().or(root_session_path);
     aggregate
@@ -1093,6 +1320,7 @@ fn request_summary_with_id(
     let started_at_ms = row.started_at_ms();
     RequestSummary {
         id,
+        platform: row.source,
         session_id: row.session_id,
         physical_session_id: row.physical_session_id,
         is_subagent: row.is_subagent,
@@ -1102,6 +1330,7 @@ fn request_summary_with_id(
         started_at_ms,
         ended_at_ms: row.request_end_timestamp,
         duration_ms: row.duration_ms,
+        model_duration_ms: row.model_duration_ms,
         tokens: row.tokens,
         cost_usd: row.cost,
         cost_source: row.cost_source,
@@ -1117,6 +1346,7 @@ fn request_base_id(row: &RequestRow) -> String {
     let mut id = String::from("request");
     for component in [
         row.date.format("%Y-%m-%d").to_string(),
+        row.source.clone(),
         row.session_id.clone(),
         row.physical_session_id.clone(),
         row.provider.clone(),
@@ -1228,11 +1458,18 @@ mod tests {
         input: i64,
         output: i64,
     ) -> UnifiedMessage {
+        let physical_session_id = Path::new(path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(session_id)
+            .to_string();
         UnifiedMessage {
             client: "codex".to_string(),
             model_id: "gpt-5.4(high)".to_string(),
             provider_id: "openai".to_string(),
             session_id: session_id.to_string(),
+            physical_session_id: Some(physical_session_id.clone()),
+            is_subagent: physical_session_id != session_id,
             workspace_key: Some("/tmp/project".to_string()),
             workspace_label: Some("project".to_string()),
             session_path: Some(path.to_string()),
@@ -1250,6 +1487,7 @@ mod tests {
             cost_source: CostSource::Estimated,
             service_tier: ServiceTier::Unknown,
             duration_ms: Some(2_000),
+            model_duration_ms: Some(1_000),
             message_count: 1,
             agent: None,
             dedup_key: None,
@@ -1320,6 +1558,10 @@ mod tests {
         assert_eq!(snapshot.today.request_count, 2);
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].id, "root-session");
+        assert_eq!(
+            snapshot.sessions[0].workspace_path.as_deref(),
+            Some("/tmp/project")
+        );
         assert_eq!(snapshot.sessions[0].requests.len(), 2);
 
         let merged = snapshot.sessions[0]
@@ -1332,6 +1574,7 @@ mod tests {
         assert_eq!(merged.started_at_ms, 598_000);
         assert_eq!(merged.ended_at_ms, 610_000);
         assert_eq!(merged.duration_ms, Some(12_000));
+        assert_eq!(merged.model_duration_ms, Some(1_000));
         assert_eq!(merged.output_preview.as_deref(), Some("First answer"));
         assert_eq!(
             merged.session_path.as_deref(),
@@ -1783,7 +2026,9 @@ mod tests {
 
         let titles = load_codex_session_titles(&messages, &index);
         assert_eq!(
-            titles.get("root-session").map(String::as_str),
+            titles
+                .get(&("codex".to_string(), "root-session".to_string()))
+                .map(String::as_str),
             Some("Latest title")
         );
         assert_eq!(titles.len(), 1);
@@ -1800,6 +2045,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.sessions[0].title.as_deref(), Some("Latest title"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn loads_latest_claude_custom_title_and_attaches_it_to_the_root_session() {
+        let directory = temporary_test_directory("claude-session-title");
+        let transcript = directory.join("claude-root.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "not json\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"Old title\",\"sessionId\":\"claude-root\"}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\" Latest Claude title \",\"sessionId\":\"claude-root\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let transcript_path = transcript.to_string_lossy().into_owned();
+        let mut root = message(
+            "2026-07-13",
+            1_000,
+            "claude-root",
+            &transcript_path,
+            100,
+            30,
+        );
+        root.client = "claude".to_string();
+        root.model_id = "claude-sonnet-4-5".to_string();
+        root.provider_id = "anthropic".to_string();
+        let messages = vec![root];
+
+        let titles = load_claude_session_titles(&messages);
+        assert_eq!(
+            titles
+                .get(&("claude".to_string(), "claude-root".to_string()))
+                .map(String::as_str),
+            Some("Latest Claude title")
+        );
+
+        let snapshot = build_snapshot_with_session_titles(
+            messages,
+            today,
+            3_000,
+            "UTC".to_string(),
+            1,
+            &titles,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.sessions[0].title.as_deref(),
+            Some("Latest Claude title")
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1850,8 +2150,23 @@ mod tests {
         assert_eq!(weekly.totals.request_count, 2);
         assert_eq!(weekly.totals.session_count, 2);
         assert_eq!(weekly.totals.cost_usd, 0.5);
+        assert_eq!(
+            weekly.totals.average_generation_tokens_per_second,
+            Some(7.5)
+        );
         assert_eq!(snapshot.today.tokens.input, 170);
         assert_eq!(snapshot.today.tokens.output, 45);
+        assert_eq!(
+            snapshot.today.average_generation_tokens_per_second,
+            Some(15.0)
+        );
+        assert_eq!(
+            snapshot
+                .range_totals
+                .as_ref()
+                .and_then(|totals| totals.average_generation_tokens_per_second),
+            Some(15.0)
+        );
     }
 
     #[test]
@@ -1889,6 +2204,7 @@ mod tests {
         assert_eq!(snapshot.days.len(), 1);
         assert_eq!(snapshot.days[0].date, "2026-07-13");
         assert_eq!(snapshot.today.tokens.input, 20);
+        assert_eq!(snapshot.range_totals.as_ref().unwrap().tokens.input, 20);
         assert_eq!(weekly.totals.tokens.input, 60);
         assert_eq!(weekly.totals.tokens.output, 15);
         assert_eq!(weekly.totals.session_count, 2);
@@ -2076,6 +2392,67 @@ mod tests {
     }
 
     #[test]
+    fn range_totals_deduplicate_sessions_and_weight_generation_speed() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut first = message(
+            "2026-07-12",
+            1_000,
+            "shared-session",
+            "/tmp/shared-session.jsonl",
+            100,
+            80,
+        );
+        first.tokens.reasoning = 20;
+        first.model_duration_ms = Some(1_000);
+        first.token_costs = Some(TokenCostBreakdown {
+            input: 0.1,
+            output: 0.2,
+            cache_read: 0.3,
+            cache_write: 0.4,
+            reasoning: 0.5,
+        });
+        first.is_turn_start = true;
+
+        let mut second = message(
+            "2026-07-13",
+            2_000,
+            "shared-session",
+            "/tmp/shared-session.jsonl",
+            200,
+            120,
+        );
+        second.tokens.reasoning = 30;
+        second.model_duration_ms = Some(3_000);
+        second.token_costs = Some(TokenCostBreakdown {
+            input: 0.2,
+            output: 0.4,
+            cache_read: 0.6,
+            cache_write: 0.8,
+            reasoning: 1.0,
+        });
+        second.is_turn_start = true;
+
+        let snapshot = build_snapshot(
+            vec![first, second],
+            today,
+            3_000,
+            "UTC".to_string(),
+            2,
+        )
+        .unwrap();
+        let totals = snapshot.range_totals.unwrap();
+
+        assert_eq!(totals.tokens.input, 300);
+        assert_eq!(totals.tokens.output, 200);
+        assert_eq!(totals.tokens.reasoning, 50);
+        assert_eq!(totals.request_count, 2);
+        assert_eq!(totals.session_count, 1);
+        assert_eq!(totals.average_generation_tokens_per_second, Some(62.5));
+        assert!((totals.token_costs.unwrap().total() - 4.5).abs() < 1e-12);
+        assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(50.0));
+    }
+
+    #[test]
     fn daily_models_aggregate_requests_by_provider_and_model() {
         let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
         let mut messages = vec![
@@ -2145,15 +2522,116 @@ mod tests {
     }
 
     #[test]
+    fn keeps_identical_session_ids_separate_across_platforms() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut codex = message(
+            "2026-07-13",
+            100_000,
+            "shared-id",
+            "/tmp/shared-id.jsonl",
+            100,
+            10,
+        );
+        codex.content_preview = Some("Codex prompt".to_string());
+        codex.is_turn_start = true;
+
+        let mut claude = message(
+            "2026-07-13",
+            200_000,
+            "shared-id",
+            "/tmp/shared-id.jsonl",
+            200,
+            20,
+        );
+        claude.client = "claude".to_string();
+        claude.model_id = "claude-sonnet-4-5".to_string();
+        claude.provider_id = "anthropic".to_string();
+        claude.content_preview = Some("Claude prompt".to_string());
+        claude.is_turn_start = true;
+        let titles = HashMap::from([
+            (
+                ("codex".to_string(), "shared-id".to_string()),
+                "Codex title".to_string(),
+            ),
+            (
+                ("claude".to_string(), "shared-id".to_string()),
+                "Claude title".to_string(),
+            ),
+        ]);
+
+        let snapshot = build_snapshot_with_platform_resets(
+            vec![codex, claude],
+            today,
+            300_000,
+            "UTC".to_string(),
+            1,
+            &titles,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.platform.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["codex", "claude"])
+        );
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.platform == "codex")
+                .and_then(|session| session.title.as_deref()),
+            Some("Codex title")
+        );
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.platform == "claude")
+                .and_then(|session| session.title.as_deref()),
+            Some("Claude title")
+        );
+        assert_eq!(snapshot.today.session_count, 2);
+        assert_eq!(snapshot.sources.len(), 2);
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .find(|source| source.platform == "codex")
+                .unwrap()
+                .today
+                .tokens
+                .input,
+            100
+        );
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .find(|source| source.platform == "claude")
+                .unwrap()
+                .today
+                .tokens
+                .input,
+            200
+        );
+    }
+
+    #[test]
     fn serializes_the_swift_contract_with_camel_case_keys() {
         let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
         let snapshot = build_snapshot(vec![], today, 123, "UTC".to_string(), 1).unwrap();
         let value: Value = serde_json::to_value(snapshot).unwrap();
 
-        assert_eq!(value["schemaVersion"], 3);
+        assert_eq!(value["schemaVersion"], 7);
         assert_eq!(value["generatedAtMs"], 123);
         assert_eq!(value["today"]["requestCount"], 0);
         assert_eq!(value["today"]["tokens"]["cacheRead"], 0);
+        assert_eq!(value["rangeTotals"]["requestCount"], 0);
         assert_eq!(value["days"][0]["sessionCount"], 0);
         assert_eq!(value["days"][0]["models"], serde_json::json!([]));
         assert!(value.get("schema_version").is_none());

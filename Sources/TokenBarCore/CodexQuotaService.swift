@@ -1,7 +1,12 @@
 import Foundation
 
 public protocol QuotaProviding: Sendable {
+    var platform: TokenPlatform { get }
     func fetchQuota() async throws -> QuotaSnapshot
+}
+
+public extension QuotaProviding {
+    var platform: TokenPlatform { .codex }
 }
 
 public enum CodexQuotaServiceError: LocalizedError, Sendable {
@@ -16,6 +21,8 @@ public enum CodexQuotaServiceError: LocalizedError, Sendable {
 }
 
 public struct CodexQuotaService: QuotaProviding, Sendable {
+    public let platform = TokenPlatform.codex
+
     private let loadQuota: @Sendable () async throws -> QuotaSnapshot
     private let loadResetCredits: @Sendable () async throws -> QuotaResetCreditsSnapshot?
 

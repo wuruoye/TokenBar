@@ -8,14 +8,19 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MODE"] == "1" {
             return DashboardModel(
                 quotaService: DemoQuotaProvider(),
+                additionalQuotaServices: [DemoClaudeQuotaProvider()],
                 activityService: DemoActivityProvider(),
                 cache: nil)
         }
         #endif
-        return DashboardModel()
+        return DashboardModel(
+            quotaService: CodexQuotaService(),
+            additionalQuotaServices: [ClaudeQuotaService()],
+            quotaCache: QuotaSnapshotCache())
     }()
     private let settings = TokenBarSettings.shared
     private let confettiOverlayController = ScreenConfettiOverlayController()
+    private var requestDetailService: (any RequestDetailProviding)?
     private var statusController: TokenBarStatusItemController?
     private var settingsWindowController: SettingsWindowController?
     private var previewTask: Task<Void, Never>?
@@ -73,6 +78,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         #else
         let requestDetailService: any RequestDetailProviding = CodexRequestDetailService()
         #endif
+        self.requestDetailService = requestDetailService
         let controller = TokenBarStatusItemController(
             model: self.model,
             settings: self.settings,
@@ -97,6 +103,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         self.statusController = nil
         self.settingsWindowController?.close()
         self.settingsWindowController = nil
+        self.requestDetailService = nil
     }
 
     private func showSettings() {
@@ -111,7 +118,8 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func testResetAnimation() {
-        let origin = self.statusController?.celebrationOriginPoint(for: .codex)
+        let platform = self.statusController == nil ? TokenPlatform.codex : self.model.scope.platform
+        let origin = self.statusController?.celebrationOriginPoint(for: platform)
         self.confettiOverlayController.play(originInScreen: origin)
     }
 

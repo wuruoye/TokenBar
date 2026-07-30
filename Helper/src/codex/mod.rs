@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::pricing::CodexPricing;
-use crate::usage::{CostSource, UnifiedMessage};
+use crate::usage::{CostSource, ServiceTier, UnifiedMessage};
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalParseOptions {
@@ -34,12 +34,19 @@ pub fn parse_local_codex_messages(
         .par_iter()
         .map(|path| parser::parse_codex_file(path).ok())
         .collect::<Vec<_>>();
-    for (path, file_messages) in paths.iter().zip(parsed_files) {
+    let mut service_tier_snapshots_by_physical = HashMap::new();
+    for (path, parsed_file) in paths.iter().zip(parsed_files) {
         let path_text = path.to_string_lossy().into_owned();
-        let Some(file_messages) = file_messages else {
+        let Some(parsed_file) = parsed_file else {
             continue;
         };
-        for mut message in file_messages {
+        if let Some(physical_id) = path.file_stem().and_then(|stem| stem.to_str()) {
+            service_tier_snapshots_by_physical.insert(
+                physical_id.to_string(),
+                parsed_file.service_tier_snapshots,
+            );
+        }
+        for mut message in parsed_file.messages {
             message.session_path = Some(path_text.clone());
             message.refresh_derived_fields();
             if message
@@ -53,7 +60,11 @@ pub fn parse_local_codex_messages(
         }
     }
 
-    assign_subagent_messages_to_root_sessions(&mut messages, &paths);
+    assign_subagent_messages_to_root_sessions(
+        &mut messages,
+        &paths,
+        &service_tier_snapshots_by_physical,
+    );
     for message in &mut messages {
         apply_pricing(message, pricing);
     }
@@ -206,6 +217,7 @@ struct CodexSessionIdentity {
     physical_id: String,
     upstream_id: String,
     subagent_parent_id: Option<String>,
+    started_at_ms: Option<i64>,
 }
 
 fn read_codex_session_identity(path: &Path) -> Option<CodexSessionIdentity> {
@@ -218,6 +230,10 @@ fn read_codex_session_identity(path: &Path) -> Option<CodexSessionIdentity> {
             continue;
         }
         let payload = entry.get("payload")?;
+        let started_at_ms = entry
+            .get("timestamp")
+            .or_else(|| payload.get("timestamp"))
+            .and_then(codex_timestamp_ms);
         let upstream_id = payload
             .get("id")?
             .as_str()
@@ -243,14 +259,31 @@ fn read_codex_session_identity(path: &Path) -> Option<CodexSessionIdentity> {
                 .to_string(),
             upstream_id,
             subagent_parent_id: structured_parent.or(legacy_parent).map(str::to_string),
+            started_at_ms,
         });
     }
     None
 }
 
+fn codex_timestamp_ms(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.timestamp_millis())
+    })
+}
+
 /// Resolve explicit Codex subagent lineage after replay filtering and global
 /// deduplication. Adapted from tokscale-core's MIT-licensed implementation.
-fn assign_subagent_messages_to_root_sessions(messages: &mut [UnifiedMessage], paths: &[PathBuf]) {
+fn assign_subagent_messages_to_root_sessions(
+    messages: &mut [UnifiedMessage],
+    paths: &[PathBuf],
+    service_tier_snapshots_by_physical: &HashMap<
+        String,
+        Vec<parser::ServiceTierSnapshot>,
+    >,
+) {
     let mut identities = paths
         .iter()
         .filter_map(|path| read_codex_session_identity(path))
@@ -282,6 +315,14 @@ fn assign_subagent_messages_to_root_sessions(messages: &mut [UnifiedMessage], pa
         }
     }
 
+    inherit_standalone_subagent_service_tiers(
+        messages,
+        &identities,
+        &physical_by_upstream,
+        &parent_by_upstream,
+        service_tier_snapshots_by_physical,
+    );
+
     let mut root_by_physical = HashMap::new();
     for identity in &identities {
         let mut current = identity.upstream_id.as_str();
@@ -311,6 +352,162 @@ fn assign_subagent_messages_to_root_sessions(messages: &mut [UnifiedMessage], pa
             message.session_id.clone_from(root_session_id);
         }
     }
+}
+
+/// Newer standalone subagent logs carry parent lineage but may omit their own
+/// thread-settings event. Fill only all-unknown children from the parent's
+/// exact tier at spawn time; an explicit child tier always remains authoritative.
+fn inherit_standalone_subagent_service_tiers(
+    messages: &mut [UnifiedMessage],
+    identities: &[CodexSessionIdentity],
+    physical_by_upstream: &HashMap<String, String>,
+    parent_by_upstream: &HashMap<String, String>,
+    service_tier_snapshots_by_physical: &HashMap<
+        String,
+        Vec<parser::ServiceTierSnapshot>,
+    >,
+) {
+    let mut ordered_subagents = identities
+        .iter()
+        .filter(|identity| identity.subagent_parent_id.is_some())
+        .map(|identity| {
+            (
+                lineage_depth(&identity.upstream_id, parent_by_upstream),
+                identity,
+            )
+        })
+        .collect::<Vec<_>>();
+    ordered_subagents.sort_by(|(left_depth, left), (right_depth, right)| {
+        left_depth
+            .cmp(right_depth)
+            .then_with(|| {
+                left.started_at_ms
+                    .unwrap_or(i64::MAX)
+                    .cmp(&right.started_at_ms.unwrap_or(i64::MAX))
+            })
+            .then_with(|| left.physical_id.cmp(&right.physical_id))
+    });
+
+    for (_, identity) in ordered_subagents {
+        let child_has_messages = messages
+            .iter()
+            .any(|message| message.session_id == identity.physical_id);
+        let child_has_explicit_tier = messages.iter().any(|message| {
+            message.session_id == identity.physical_id
+                && message.service_tier != ServiceTier::Unknown
+        });
+        if !child_has_messages || child_has_explicit_tier {
+            continue;
+        }
+
+        let Some(parent_upstream_id) = identity.subagent_parent_id.as_ref() else {
+            continue;
+        };
+        let Some(parent_physical_id) = physical_by_upstream.get(parent_upstream_id) else {
+            continue;
+        };
+        let child_started_at_ms = identity.started_at_ms.or_else(|| {
+            earliest_session_message_start(messages, &identity.physical_id)
+        });
+        let Some(child_started_at_ms) = child_started_at_ms else {
+            continue;
+        };
+        let Some(inherited_tier) = service_tier_at(
+            messages,
+            parent_physical_id,
+            child_started_at_ms,
+            service_tier_snapshots_by_physical
+                .get(parent_physical_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        ) else {
+            continue;
+        };
+
+        for message in messages.iter_mut().filter(|message| {
+            message.session_id == identity.physical_id
+                && message.service_tier == ServiceTier::Unknown
+        }) {
+            message.service_tier = inherited_tier;
+        }
+    }
+}
+
+fn lineage_depth(
+    upstream_id: &str,
+    parent_by_upstream: &HashMap<String, String>,
+) -> usize {
+    let mut current = upstream_id;
+    let mut visited = HashSet::new();
+    let mut depth = 0_usize;
+    while visited.insert(current.to_string()) {
+        let Some(parent) = parent_by_upstream.get(current) else {
+            break;
+        };
+        depth = depth.saturating_add(1);
+        current = parent;
+    }
+    depth
+}
+
+fn earliest_session_message_start(
+    messages: &[UnifiedMessage],
+    physical_id: &str,
+) -> Option<i64> {
+    messages
+        .iter()
+        .filter(|message| message.session_id == physical_id)
+        .map(|message| {
+            message
+                .duration_ms
+                .filter(|duration| *duration > 0)
+                .map_or(message.timestamp, |duration| {
+                    message.timestamp.saturating_sub(duration)
+                })
+        })
+        .min()
+}
+
+fn service_tier_at(
+    messages: &[UnifiedMessage],
+    physical_id: &str,
+    timestamp_ms: i64,
+    snapshots: &[parser::ServiceTierSnapshot],
+) -> Option<ServiceTier> {
+    if !snapshots.is_empty() {
+        if let Some(snapshot) = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.timestamp_ms <= timestamp_ms)
+            .max_by_key(|snapshot| snapshot.timestamp_ms)
+        {
+            return (snapshot.tier != ServiceTier::Unknown).then_some(snapshot.tier);
+        }
+        let first_tier = snapshots[0].tier;
+        return (first_tier != ServiceTier::Unknown
+            && snapshots
+                .iter()
+                .all(|snapshot| snapshot.tier == first_tier))
+        .then_some(first_tier);
+    }
+
+    if let Some(message) = messages
+        .iter()
+        .filter(|message| {
+            message.session_id == physical_id && message.timestamp <= timestamp_ms
+        })
+        .max_by_key(|message| message.timestamp)
+    {
+        return (message.service_tier != ServiceTier::Unknown)
+            .then_some(message.service_tier);
+    }
+
+    let mut tiers = messages
+        .iter()
+        .filter(|message| message.session_id == physical_id)
+        .map(|message| message.service_tier);
+    let first_tier = tiers.next()?;
+    (first_tier != ServiceTier::Unknown && tiers.all(|tier| tier == first_tier))
+        .then_some(first_tier)
 }
 
 #[cfg(test)]
@@ -348,6 +545,85 @@ mod tests {
             serde_json::json!({"timestamp":"2026-07-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":input,"output_tokens":2}}}})
         );
         fs::write(path, content).unwrap();
+    }
+
+    fn write_json_lines(path: &Path, lines: Vec<Value>) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut content = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push('\n');
+        fs::write(path, content).unwrap();
+    }
+
+    fn session_meta(timestamp: &str, id: &str, parent: Option<&str>) -> Value {
+        let source = parent.map_or_else(
+            || Value::String("vscode".to_string()),
+            |parent| {
+                serde_json::json!({
+                    "subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}
+                })
+            },
+        );
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {"id": id, "source": source}
+        })
+    }
+
+    fn turn_context(timestamp: &str) -> Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"}
+        })
+    }
+
+    fn service_tier_snapshot(timestamp: &str, tier: &str) -> Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": tier}
+            }
+        })
+    }
+
+    fn token_count(timestamp: &str, input: i64, output: i64) -> Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input,
+                        "output_tokens": output
+                    }
+                }
+            }
+        })
+    }
+
+    fn message_from_physical<'a>(
+        messages: &'a [UnifiedMessage],
+        filename: &str,
+    ) -> &'a UnifiedMessage {
+        messages
+            .iter()
+            .find(|message| {
+                message
+                    .session_path
+                    .as_deref()
+                    .and_then(|path| Path::new(path).file_name())
+                    .and_then(|name| name.to_str())
+                    == Some(filename)
+            })
+            .unwrap()
     }
 
     #[test]
@@ -445,6 +721,139 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert!(messages.iter().all(|message| message.session_id == "root"));
         assert!(messages.iter().all(|message| message.token_costs.is_some()));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn standalone_subagents_inherit_parent_tier_at_spawn_time() {
+        let home = temporary_home("standalone-subagent-tier");
+        let directory = home.join(".codex/sessions");
+        write_json_lines(
+            &directory.join("root.jsonl"),
+            vec![
+                session_meta("2026-07-01T00:00:00Z", "root-id", None),
+                turn_context("2026-07-01T00:00:00Z"),
+                service_tier_snapshot("2026-07-01T00:00:01Z", "default"),
+                token_count("2026-07-01T00:00:02Z", 100, 10),
+                service_tier_snapshot("2026-07-01T00:00:04Z", "priority"),
+                token_count("2026-07-01T00:00:05Z", 100, 10),
+            ],
+        );
+        write_json_lines(
+            &directory.join("early-child.jsonl"),
+            vec![
+                session_meta(
+                    "2026-07-01T00:00:03Z",
+                    "early-child-id",
+                    Some("root-id"),
+                ),
+                turn_context("2026-07-01T00:00:03Z"),
+                token_count("2026-07-01T00:00:06Z", 50, 5),
+            ],
+        );
+        write_json_lines(
+            &directory.join("late-child.jsonl"),
+            vec![
+                session_meta(
+                    "2026-07-01T00:00:06Z",
+                    "late-child-id",
+                    Some("root-id"),
+                ),
+                turn_context("2026-07-01T00:00:06Z"),
+                token_count("2026-07-01T00:00:07Z", 50, 5),
+            ],
+        );
+        write_json_lines(
+            &directory.join("grandchild.jsonl"),
+            vec![
+                session_meta(
+                    "2026-07-01T00:00:08Z",
+                    "grandchild-id",
+                    Some("late-child-id"),
+                ),
+                turn_context("2026-07-01T00:00:08Z"),
+                token_count("2026-07-01T00:00:09Z", 50, 5),
+            ],
+        );
+        let pricing = CodexPricing::with_fast_pricing(
+            crate::pricing::FastPricingBasis::ChatGptSubscription,
+        );
+
+        let messages = parse_local_codex_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                ..Default::default()
+            },
+            &pricing,
+        )
+        .unwrap();
+
+        let early_child = message_from_physical(&messages, "early-child.jsonl");
+        let late_child = message_from_physical(&messages, "late-child.jsonl");
+        let grandchild = message_from_physical(&messages, "grandchild.jsonl");
+        assert_eq!(early_child.service_tier, ServiceTier::Standard);
+        assert_eq!(late_child.service_tier, ServiceTier::Fast);
+        assert_eq!(grandchild.service_tier, ServiceTier::Fast);
+        let standard_cost = pricing
+            .calculate_cost_with_provider(
+                &late_child.model_id,
+                Some(&late_child.provider_id),
+                &late_child.tokens,
+            )
+            .unwrap();
+        assert!((early_child.cost - standard_cost).abs() < 1e-12);
+        assert!((late_child.cost - standard_cost * 2.5).abs() < 1e-12);
+        assert!((grandchild.cost - standard_cost * 2.5).abs() < 1e-12);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn standalone_subagent_keeps_its_explicit_tier() {
+        let home = temporary_home("standalone-subagent-explicit-tier");
+        let directory = home.join(".codex/sessions");
+        write_json_lines(
+            &directory.join("root.jsonl"),
+            vec![
+                session_meta("2026-07-01T00:00:00Z", "root-id", None),
+                turn_context("2026-07-01T00:00:00Z"),
+                service_tier_snapshot("2026-07-01T00:00:01Z", "priority"),
+                token_count("2026-07-01T00:00:02Z", 100, 10),
+            ],
+        );
+        write_json_lines(
+            &directory.join("child.jsonl"),
+            vec![
+                session_meta("2026-07-01T00:00:03Z", "child-id", Some("root-id")),
+                turn_context("2026-07-01T00:00:03Z"),
+                service_tier_snapshot("2026-07-01T00:00:04Z", "default"),
+                token_count("2026-07-01T00:00:05Z", 50, 5),
+            ],
+        );
+        let pricing = CodexPricing::with_fast_pricing(
+            crate::pricing::FastPricingBasis::ChatGptSubscription,
+        );
+
+        let messages = parse_local_codex_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                ..Default::default()
+            },
+            &pricing,
+        )
+        .unwrap();
+
+        let child = message_from_physical(&messages, "child.jsonl");
+        assert_eq!(child.service_tier, ServiceTier::Standard);
+        let standard_cost = pricing
+            .calculate_cost_with_provider(
+                &child.model_id,
+                Some(&child.provider_id),
+                &child.tokens,
+            )
+            .unwrap();
+        assert!((child.cost - standard_cost).abs() < 1e-12);
         fs::remove_dir_all(home).unwrap();
     }
 

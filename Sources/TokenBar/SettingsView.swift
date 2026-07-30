@@ -30,6 +30,14 @@ struct TokenBarSettingsView: View {
                 }
             }
 
+            Section("Platforms") {
+                Toggle("Show Claude Code", isOn: self.$settings.showsClaude)
+
+                Text("Adds the Claude T/W section and Claude tab. Changes take effect immediately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Activity") {
                 Picker("Statistics timezone", selection: self.$settings.statisticsTimeZone) {
                     ForEach(TokenBarStatisticsTimeZone.allCases) { timeZone in
@@ -76,7 +84,7 @@ struct TokenBarSettingsView: View {
                     }
                 }
 
-                Text("Plays a click-through animation from the menu bar.")
+                Text("Plays a click-through animation from the provider's menu bar section.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -89,7 +97,7 @@ struct TokenBarSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 570)
+        .frame(width: 440, height: 620)
     }
 }
 

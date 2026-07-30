@@ -18,6 +18,12 @@ struct SnapshotCacheTests {
                 costUsd: 1.25,
                 requestCount: 4,
                 sessionCount: 2))
+        let rangeTotals = ActivityTotals(
+            tokens: TokenBreakdown(input: 100, output: 20, cacheRead: 300, cacheWrite: 5, reasoning: 10),
+            costUsd: 2.5,
+            requestCount: 8,
+            sessionCount: 3,
+            averageGenerationTokensPerSecond: 25)
         let nestedRequest = RequestSummary(
             id: "child-request",
             sessionId: "session-1",
@@ -29,6 +35,7 @@ struct SnapshotCacheTests {
             startedAtMs: 1_720_000_000_100,
             endedAtMs: 1_720_000_000_900,
             durationMs: 800,
+            modelDurationMs: 600,
             tokens: .zero,
             costUsd: 0.05,
             costSource: .estimated,
@@ -42,6 +49,7 @@ struct SnapshotCacheTests {
             sessionPath: "/Users/private/.codex/sessions/private-session.jsonl",
             sessionTitle: "generated title secret",
             weeklySinceReset: weeklySinceReset,
+            rangeTotals: rangeTotals,
             requestContributions: [nestedRequest])
 
         try await cache.saveActivity(original)
@@ -58,6 +66,7 @@ struct SnapshotCacheTests {
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.sessionPath == nil)
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.physicalSessionId == "child-session")
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.serviceTier == .fast)
+        #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.modelDurationMs == 600)
         #expect(loaded?.sessions.first?.title == nil)
         #expect(!raw.contains("prompt secret"))
         #expect(!raw.contains("output secret"))
@@ -67,7 +76,28 @@ struct SnapshotCacheTests {
         #expect(!raw.contains("nested output secret"))
         #expect(!raw.contains("child-session.jsonl"))
         #expect(loaded?.today == original.today)
+        #expect(loaded?.rangeTotals == rangeTotals)
         #expect(loaded?.weeklySinceReset == weeklySinceReset)
+        #expect(permissions == 0o600)
+    }
+
+    @Test("persists independent platform quota snapshots")
+    func persistsQuotaSnapshots() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBarQuotaTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("quotas.json")
+        let cache = QuotaSnapshotCache(fileURL: fileURL)
+        let codex = TestFixtures.quota(usedPercent: 20)
+        let claude = TestFixtures.quota(usedPercent: 35)
+
+        try await cache.saveQuotas([.codex: codex, .claude: claude])
+        let loaded = try await cache.loadQuotas()
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+
+        #expect(loaded[.codex] == codex)
+        #expect(loaded[.claude] == claude)
         #expect(permissions == 0o600)
     }
 }

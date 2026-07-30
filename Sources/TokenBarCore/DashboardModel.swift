@@ -13,23 +13,46 @@ public struct DashboardSourceState<Value: Equatable & Sendable>: Equatable, Send
     }
 }
 
+private enum QuotaRefreshResult: Sendable {
+    case success(TokenPlatform, QuotaSnapshot)
+    case cancelled(TokenPlatform)
+    case failure(TokenPlatform, String)
+}
+
 @MainActor
 @Observable
 public final class DashboardModel {
     public static let defaultBackgroundRefreshInterval: Duration = .seconds(5 * 60)
     public static let defaultQuotaRefreshInterval = DashboardModel.defaultBackgroundRefreshInterval
     public static let defaultActivityRefreshInterval = DashboardModel.defaultBackgroundRefreshInterval
+    public static let automaticQuotaRefreshMinimumAge: TimeInterval = 60
 
-    public private(set) var quota = DashboardSourceState<QuotaSnapshot>()
+    public private(set) var quotas: [TokenPlatform: DashboardSourceState<QuotaSnapshot>]
     public private(set) var activity = DashboardSourceState<ActivitySnapshot>()
+    public var scope: DashboardScope = .codex
+
+    public var quota: DashboardSourceState<QuotaSnapshot> {
+        self.quotaState(for: .codex)
+    }
 
     public var quotaSnapshot: QuotaSnapshot? { self.quota.value }
     public var activitySnapshot: ActivitySnapshot? { self.activity.value }
+    public var visibleActivitySnapshot: ActivitySnapshot? {
+        self.activity.value?.scoped(to: self.scope.platform)
+    }
+
+    public var visibleActivity: DashboardSourceState<ActivitySnapshot> {
+        DashboardSourceState(
+            value: self.visibleActivitySnapshot,
+            isRefreshing: self.activity.isRefreshing,
+            errorMessage: self.activity.errorMessage)
+    }
 
     @ObservationIgnored public var quotaResetHandler: ((QuotaResetEvent) -> Void)?
-    @ObservationIgnored private let quotaService: any QuotaProviding
+    @ObservationIgnored private let quotaServices: [TokenPlatform: any QuotaProviding]
     @ObservationIgnored private let activityService: any ActivityProviding
     @ObservationIgnored private let cache: (any ActivitySnapshotCaching)?
+    @ObservationIgnored private let quotaCache: (any QuotaSnapshotCaching)?
     @ObservationIgnored private var quotaRefreshInterval: Duration
     @ObservationIgnored private var activityRefreshInterval: Duration
     @ObservationIgnored private var statisticsTimeZone: TokenBarStatisticsTimeZone
@@ -37,20 +60,33 @@ public final class DashboardModel {
     @ObservationIgnored private let now: @Sendable () -> Date
     @ObservationIgnored private var quotaTimerTask: Task<Void, Never>?
     @ObservationIgnored private var refreshAllTask: Task<Void, Never>?
+    @ObservationIgnored private var lastQuotaRefreshAttemptAt: [TokenPlatform: Date] = [:]
+    @ObservationIgnored private var quotaRefreshEnabledPlatforms: Set<TokenPlatform>
     @ObservationIgnored private var quotaResetDetector = QuotaResetDetector()
     @ObservationIgnored private var isStarted = false
 
     public init(
         quotaService: any QuotaProviding = CodexQuotaService(),
+        additionalQuotaServices: [any QuotaProviding] = [],
         activityService: any ActivityProviding = ActivityService(),
         cache: (any ActivitySnapshotCaching)? = SnapshotCache(),
+        quotaCache: (any QuotaSnapshotCaching)? = nil,
         quotaRefreshInterval: Duration = DashboardModel.defaultQuotaRefreshInterval,
         activityRefreshInterval: Duration = DashboardModel.defaultActivityRefreshInterval,
         statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone)
     {
-        self.quotaService = quotaService
+        var quotaServices: [TokenPlatform: any QuotaProviding] = [:]
+        for service in [quotaService] + additionalQuotaServices {
+            quotaServices[service.platform] = service
+        }
+        self.quotaServices = quotaServices
+        self.quotaRefreshEnabledPlatforms = Set(quotaServices.keys)
+        self.quotas = quotaServices.reduce(into: [:]) { states, entry in
+            states[entry.key] = DashboardSourceState()
+        }
         self.activityService = activityService
         self.cache = cache
+        self.quotaCache = quotaCache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
         self.statisticsTimeZone = statisticsTimeZone
@@ -62,17 +98,28 @@ public final class DashboardModel {
 
     init(
         quotaService: any QuotaProviding,
+        additionalQuotaServices: [any QuotaProviding] = [],
         activityService: any ActivityProviding,
         cache: (any ActivitySnapshotCaching)?,
+        quotaCache: (any QuotaSnapshotCaching)? = nil,
         quotaRefreshInterval: Duration,
         activityRefreshInterval: Duration,
         statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone,
         sleep: @escaping @Sendable (Duration) async throws -> Void,
         now: @escaping @Sendable () -> Date = Date.init)
     {
-        self.quotaService = quotaService
+        var quotaServices: [TokenPlatform: any QuotaProviding] = [:]
+        for service in [quotaService] + additionalQuotaServices {
+            quotaServices[service.platform] = service
+        }
+        self.quotaServices = quotaServices
+        self.quotaRefreshEnabledPlatforms = Set(quotaServices.keys)
+        self.quotas = quotaServices.reduce(into: [:]) { states, entry in
+            states[entry.key] = DashboardSourceState()
+        }
         self.activityService = activityService
         self.cache = cache
+        self.quotaCache = quotaCache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
         self.statisticsTimeZone = statisticsTimeZone
@@ -89,9 +136,20 @@ public final class DashboardModel {
         {
             self.activity = DashboardSourceState(value: cached)
         }
+        if let cachedQuotas = try? await self.quotaCache?.loadQuotas() {
+            for (platform, snapshot) in cachedQuotas
+                where self.quotaServices[platform] != nil
+                    && self.quotaState(for: platform).value == nil
+            {
+                self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
+                if self.quotaRefreshEnabledPlatforms.contains(platform) {
+                    _ = self.quotaResetDetector.observe(snapshot, for: platform)
+                }
+            }
+        }
 
         self.startRefreshTimers()
-        await self.refreshAll()
+        await self.refreshAll(forceQuota: false)
     }
 
     public func stop() {
@@ -122,7 +180,30 @@ public final class DashboardModel {
         return true
     }
 
-    public func refreshAll() async {
+    @discardableResult
+    public func updateQuotaRefreshEnabled(
+        _ isEnabled: Bool,
+        for platform: TokenPlatform) -> Bool
+    {
+        guard self.quotaServices[platform] != nil else { return false }
+        if isEnabled {
+            return self.quotaRefreshEnabledPlatforms.insert(platform).inserted
+        }
+        guard self.quotaRefreshEnabledPlatforms.remove(platform) != nil else { return false }
+        self.lastQuotaRefreshAttemptAt.removeValue(forKey: platform)
+        self.quotaResetDetector.reset(for: platform)
+        let state = self.quotaState(for: platform)
+        if state.isRefreshing {
+            self.setQuotaState(
+                DashboardSourceState(
+                    value: state.value,
+                    errorMessage: state.errorMessage),
+                for: platform)
+        }
+        return true
+    }
+
+    public func refreshAll(forceQuota: Bool = true) async {
         if let refreshAllTask = self.refreshAllTask {
             await refreshAllTask.value
             return
@@ -130,7 +211,7 @@ public final class DashboardModel {
 
         let refreshAllTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.refreshQuota()
+            await self.refreshQuotas(force: forceQuota)
             await self.refreshActivity()
         }
         self.refreshAllTask = refreshAllTask
@@ -139,27 +220,185 @@ public final class DashboardModel {
     }
 
     public func refreshQuota() async {
-        guard !self.quota.isRefreshing else { return }
-        self.quota = DashboardSourceState(
-            value: self.quota.value,
-            isRefreshing: true,
-            errorMessage: nil)
-        do {
-            let snapshot = try await self.quotaService.fetchQuota()
-            try Task.checkCancellation()
-            self.quota = DashboardSourceState(value: snapshot)
-            let resetEvents = self.quotaResetDetector.observe(snapshot, for: .codex)
-            for event in resetEvents {
-                self.quotaResetHandler?(event)
+        await self.refreshQuota(for: .codex)
+    }
+
+    public func refreshQuotas(force: Bool = true) async {
+        let pending = self.quotaServices.filter { platform, _ in
+            self.quotaRefreshEnabledPlatforms.contains(platform)
+                && !self.quotaState(for: platform).isRefreshing
+                && (force || self.shouldAutomaticallyRefreshQuota(for: platform))
+        }
+        let attemptedAt = self.now()
+        let previous = self.quotas
+        for platform in pending.keys {
+            self.lastQuotaRefreshAttemptAt[platform] = attemptedAt
+            let state = self.quotaState(for: platform)
+            self.setQuotaState(
+                DashboardSourceState(
+                    value: state.value,
+                    isRefreshing: true,
+                    errorMessage: nil),
+                for: platform)
+        }
+
+        var savedSnapshot = false
+        await withTaskGroup(of: QuotaRefreshResult.self) { group in
+            for (platform, service) in pending {
+                group.addTask {
+                    do {
+                        let snapshot = try await service.fetchQuota()
+                        try Task.checkCancellation()
+                        return .success(platform, snapshot)
+                    } catch is CancellationError {
+                        return .cancelled(platform)
+                    } catch {
+                        return .failure(platform, error.localizedDescription)
+                    }
+                }
             }
+            for await result in group {
+                switch result {
+                case let .success(platform, snapshot):
+                    self.acceptQuotaSnapshot(
+                        snapshot,
+                        mergingFrom: previous[platform]?.value,
+                        for: platform)
+                    savedSnapshot = true
+                case let .cancelled(platform):
+                    let state = previous[platform] ?? DashboardSourceState()
+                    self.setQuotaState(state, for: platform)
+                case let .failure(platform, message):
+                    self.setQuotaState(
+                        DashboardSourceState(
+                            value: previous[platform]?.value,
+                            errorMessage: message),
+                        for: platform)
+                }
+            }
+        }
+        if savedSnapshot {
+            try? await self.quotaCache?.saveQuotas(self.quotaSnapshots())
+        }
+    }
+
+    public func refreshQuota(for platform: TokenPlatform) async {
+        guard self.quotaRefreshEnabledPlatforms.contains(platform),
+              let quotaService = self.quotaServices[platform]
+        else {
+            return
+        }
+        let current = self.quotaState(for: platform)
+        guard !current.isRefreshing else { return }
+        self.lastQuotaRefreshAttemptAt[platform] = self.now()
+        self.setQuotaState(
+            DashboardSourceState(
+                value: current.value,
+                isRefreshing: true,
+                errorMessage: nil),
+            for: platform)
+        do {
+            let snapshot = try await quotaService.fetchQuota()
+            try Task.checkCancellation()
+            self.acceptQuotaSnapshot(
+                snapshot,
+                mergingFrom: current.value,
+                for: platform)
+            try? await self.quotaCache?.saveQuotas(self.quotaSnapshots())
         } catch is CancellationError {
-            self.quota = DashboardSourceState(
-                value: self.quota.value,
-                errorMessage: self.quota.errorMessage)
+            self.setQuotaState(
+                DashboardSourceState(
+                    value: current.value,
+                    errorMessage: current.errorMessage),
+                for: platform)
         } catch {
-            self.quota = DashboardSourceState(
-                value: self.quota.value,
-                errorMessage: error.localizedDescription)
+            self.setQuotaState(
+                DashboardSourceState(
+                    value: current.value,
+                    errorMessage: error.localizedDescription),
+                for: platform)
+        }
+    }
+
+    public func quotaState(for platform: TokenPlatform) -> DashboardSourceState<QuotaSnapshot> {
+        self.quotas[platform] ?? DashboardSourceState()
+    }
+
+    private func setQuotaState(
+        _ state: DashboardSourceState<QuotaSnapshot>,
+        for platform: TokenPlatform)
+    {
+        var quotas = self.quotas
+        quotas[platform] = state
+        self.quotas = quotas
+    }
+
+    private func quotaSnapshots() -> [TokenPlatform: QuotaSnapshot] {
+        self.quotas.reduce(into: [:]) { snapshots, entry in
+            snapshots[entry.key] = entry.value.value
+        }
+    }
+
+    private func acceptQuotaSnapshot(
+        _ snapshot: QuotaSnapshot,
+        mergingFrom previous: QuotaSnapshot?,
+        for platform: TokenPlatform)
+    {
+        let snapshot = Self.mergingMissingResetDates(in: snapshot, from: previous)
+        self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
+        let events = self.quotaResetDetector.observe(snapshot, for: platform)
+        for event in events {
+            self.quotaResetHandler?(event)
+        }
+    }
+
+    private func shouldAutomaticallyRefreshQuota(for platform: TokenPlatform) -> Bool {
+        let now = self.now()
+        if let lastAttempt = self.lastQuotaRefreshAttemptAt[platform],
+           now.timeIntervalSince(lastAttempt) < Self.automaticQuotaRefreshMinimumAge
+        {
+            return false
+        }
+        guard let updatedAt = self.quotaState(for: platform).value?.updatedAt else {
+            return true
+        }
+        return now.timeIntervalSince(updatedAt) >= Self.automaticQuotaRefreshMinimumAge
+    }
+
+    private static func mergingMissingResetDates(
+        in snapshot: QuotaSnapshot,
+        from previous: QuotaSnapshot?) -> QuotaSnapshot
+    {
+        func merge(
+            _ window: QuotaWindowSnapshot?,
+            previous: QuotaWindowSnapshot?) -> QuotaWindowSnapshot?
+        {
+            guard let window else { return nil }
+            return QuotaWindowSnapshot(
+                usedPercent: window.usedPercent,
+                windowMinutes: window.windowMinutes ?? previous?.windowMinutes,
+                resetsAt: window.resetsAt ?? previous?.resetsAt)
+        }
+        return QuotaSnapshot(
+            session: merge(snapshot.session, previous: previous?.session),
+            weekly: merge(snapshot.weekly, previous: previous?.weekly),
+            resetCredits: snapshot.resetCredits,
+            updatedAt: snapshot.updatedAt)
+    }
+
+    public var isRefreshing: Bool {
+        self.activity.isRefreshing || self.quotas.values.contains(where: \.isRefreshing)
+    }
+
+    private func weeklyResetDates() -> [TokenPlatform: Date] {
+        self.quotas.reduce(into: [:]) { result, entry in
+            guard self.quotaRefreshEnabledPlatforms.contains(entry.key),
+                  let windowStart = entry.value.value?.weekly?
+                .weeklyPacing(at: self.now())?.windowStart
+            else {
+                return
+            }
+            result[entry.key] = windowStart
         }
     }
 
@@ -172,11 +411,8 @@ public final class DashboardModel {
         while true {
             let statisticsTimeZone = self.statisticsTimeZone
             do {
-                let weeklyResetAt = self.quota.value.flatMap { snapshot in
-                    snapshot.weekly?.weeklyPacing(at: self.now())?.windowStart
-                }
                 let snapshot = try await self.activityService.fetchActivity(
-                    sinceWeeklyResetAt: weeklyResetAt,
+                    sinceWeeklyResetAtByPlatform: self.weeklyResetDates(),
                     statisticsTimeZone: statisticsTimeZone)
                 try Task.checkCancellation()
                 guard statisticsTimeZone == self.statisticsTimeZone else { continue }
@@ -212,7 +448,7 @@ public final class DashboardModel {
                     return
                 }
                 guard !Task.isCancelled, self.isStarted else { return }
-                await self.refreshAll()
+                await self.refreshAll(forceQuota: false)
             }
         }
     }

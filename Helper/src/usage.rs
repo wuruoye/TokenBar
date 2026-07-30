@@ -102,6 +102,10 @@ pub struct UnifiedMessage {
     pub model_id: String,
     pub provider_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub physical_session_id: Option<String>,
+    #[serde(default)]
+    pub is_subagent: bool,
     pub workspace_key: Option<String>,
     pub workspace_label: Option<String>,
     #[serde(default)]
@@ -118,6 +122,8 @@ pub struct UnifiedMessage {
     pub service_tier: ServiceTier,
     #[serde(default)]
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub model_duration_ms: Option<i64>,
     #[serde(default = "default_message_count")]
     pub message_count: i32,
     pub agent: Option<String>,
@@ -151,6 +157,8 @@ impl UnifiedMessage {
             model_id: model_id.into(),
             provider_id: provider_id.into(),
             session_id: session_id.into(),
+            physical_session_id: None,
+            is_subagent: false,
             workspace_key: None,
             workspace_label: None,
             session_path: None,
@@ -162,6 +170,7 @@ impl UnifiedMessage {
             cost_source: CostSource::Unknown,
             service_tier: ServiceTier::Unknown,
             duration_ms: None,
+            model_duration_ms: None,
             message_count: 1,
             agent,
             dedup_key: None,

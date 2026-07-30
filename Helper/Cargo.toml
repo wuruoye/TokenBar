@@ -2,7 +2,7 @@
 name = "tokenbar-helper"
 version = "0.1.0"
 edition = "2021"
-description = "Local Codex activity parser for TokenBar"
+description = "Local Codex and Claude Code activity parser for TokenBar"
 license = "MIT"
 repository = "https://github.com/wuruoye/TokenBar"
 publish = false

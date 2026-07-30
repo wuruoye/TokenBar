@@ -4,14 +4,16 @@ import TokenBarCore
 
 struct DashboardSummaryView: View {
     @Bindable var model: DashboardModel
-    let showsFiveHour: Bool
-    let showsResetCredits: Bool
+    let showsClaude: Bool
     let accentColor: Color
 
-    static func preferredHeight(showsFiveHour: Bool, showsResetCredits: Bool) -> CGFloat {
+    static func preferredHeight(
+        quota: QuotaSnapshot?,
+        showsClaude: Bool) -> CGFloat
+    {
         DashboardOverviewView.preferredHeight(
-            showsFiveHour: showsFiveHour,
-            showsResetCredits: showsResetCredits)
+            quota: quota,
+            showsClaude: showsClaude)
             + ActivitySummarySection.preferredHeight
             + 1
     }
@@ -20,12 +22,11 @@ struct DashboardSummaryView: View {
         VStack(spacing: 0) {
             DashboardOverviewView(
                 model: self.model,
-                showsFiveHour: self.showsFiveHour,
-                showsResetCredits: self.showsResetCredits,
+                showsClaude: self.showsClaude,
                 accentColor: self.accentColor)
             Divider().padding(.horizontal, 12)
             ActivitySummarySection(
-                state: self.model.activity,
+                state: self.model.visibleActivity,
                 accentColor: self.accentColor,
                 showsChevron: false)
                 .frame(height: ActivitySummarySection.preferredHeight)
@@ -35,67 +36,109 @@ struct DashboardSummaryView: View {
 }
 
 struct DashboardOverviewView: View {
-    private static let headerHeight: CGFloat = 34
-    private static let quotaHeight: CGFloat = 78
-    private static let quotaWithFiveHourHeight: CGFloat = 122
-    private static let resetCreditsHeight: CGFloat = 30
-    private static let todayHeight: CGFloat = 122
-    private static let weeklyResetActivityHeight: CGFloat = 64
+    static let headerHeight: CGFloat = 64
+    static let compactHeaderHeight: CGFloat = 34
+    private static let unavailableQuotaHeight: CGFloat = 56
+    private static let weeklyQuotaHeight: CGFloat = 79
+    private static let fiveHourQuotaIncrement: CGFloat = 46
+    private static let resetCreditsIncrement: CGFloat = 27
+    static let todayHeight: CGFloat = 122
+    static let weeklyResetActivityHeight: CGFloat = 64
 
     @Bindable var model: DashboardModel
-    let showsFiveHour: Bool
-    let showsResetCredits: Bool
+    let showsClaude: Bool
     let accentColor: Color
 
-    static func preferredHeight(showsFiveHour: Bool, showsResetCredits: Bool) -> CGFloat {
-        self.headerHeight
-            + (showsFiveHour ? self.quotaWithFiveHourHeight : self.quotaHeight)
-            + (showsResetCredits ? self.resetCreditsHeight : 0)
+    static func preferredHeight(
+        quota: QuotaSnapshot?,
+        showsClaude: Bool) -> CGFloat
+    {
+        self.headerHeight(showsClaude: showsClaude) + self.contentHeight(quota: quota)
+    }
+
+    static func headerHeight(showsClaude: Bool) -> CGFloat {
+        showsClaude ? self.headerHeight : self.compactHeaderHeight
+    }
+
+    static func contentHeight(quota: QuotaSnapshot?) -> CGFloat {
+        self.quotaHeight(quota: quota)
             + self.todayHeight
             + self.weeklyResetActivityHeight
             + 2
     }
 
+    static func quotaHeight(
+        hasWeekly: Bool,
+        hasFiveHour: Bool,
+        hasResetCredits: Bool) -> CGFloat
+    {
+        (hasWeekly ? self.weeklyQuotaHeight : self.unavailableQuotaHeight)
+            + (hasFiveHour ? self.fiveHourQuotaIncrement : 0)
+            + (hasResetCredits ? self.resetCreditsIncrement : 0)
+    }
+
+    static func quotaHeight(quota: QuotaSnapshot?) -> CGFloat {
+        self.quotaHeight(
+            hasWeekly: quota?.weekly != nil,
+            hasFiveHour: quota?.session != nil,
+            hasResetCredits: quota?.resetCredits != nil)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            self.header
-                .frame(height: Self.headerHeight)
-            Divider().padding(.horizontal, 12)
-            QuotaSummarySection(
-                state: self.model.quota,
-                showsFiveHour: self.showsFiveHour,
+            DashboardHeaderView(
+                model: self.model,
+                showsClaude: self.showsClaude,
+                accentColor: self.accentColor,
+                onSelectScope: nil)
+                .frame(height: Self.headerHeight(showsClaude: self.showsClaude))
+            DashboardOverviewContentView(
+                model: self.model,
                 accentColor: self.accentColor)
-                .frame(height: self.quotaSectionHeight)
-            Divider().padding(.horizontal, 12)
-            TodaySummarySection(
-                state: self.model.activity,
-                accentColor: self.accentColor)
-                .frame(height: Self.todayHeight)
-            Divider().padding(.horizontal, 12)
-            WeeklyResetActivitySection(
-                quota: self.model.quotaSnapshot,
-                state: self.model.activity,
-                accentColor: self.accentColor)
-                .frame(height: Self.weeklyResetActivityHeight)
         }
         .background(Color.clear)
     }
+}
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            Text("TokenBar")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            if self.model.quota.isRefreshing || self.model.activity.isRefreshing {
-                ProgressView()
-                    .controlSize(.mini)
+struct DashboardHeaderView: View {
+    @Bindable var model: DashboardModel
+    let showsClaude: Bool
+    let accentColor: Color
+    let onSelectScope: ((DashboardScope) -> Void)?
+
+    var body: some View {
+        let scopes = DashboardScope.visibleScopes(showsClaude: self.showsClaude)
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text("TokenBar")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if self.model.isRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Text(self.updatedText)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Text(self.updatedText)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+
+            if scopes.count > 1 {
+                DashboardScopeSelector(
+                    selection: self.model.scope,
+                    scopes: scopes,
+                    accentColor: self.accentColor)
+                { scope in
+                    if let onSelectScope = self.onSelectScope {
+                        onSelectScope(scope)
+                    } else {
+                        self.model.scope = scope
+                    }
+                }
+            }
         }
         .padding(.horizontal, 16)
+        .padding(.vertical, 7)
     }
 
     private var updatedText: String {
@@ -104,16 +147,82 @@ struct DashboardOverviewView: View {
         }
         return "Updated \(date.compactPastText)"
     }
+}
 
-    private var quotaSectionHeight: CGFloat {
-        (self.showsFiveHour ? Self.quotaWithFiveHourHeight : Self.quotaHeight)
-            + (self.showsResetCredits ? Self.resetCreditsHeight : 0)
+struct DashboardOverviewContentView: View {
+    @Bindable var model: DashboardModel
+    let accentColor: Color
+
+    var body: some View {
+        let quotaState = self.model.quotaState(for: self.model.scope.platform)
+        VStack(spacing: 0) {
+            Divider().padding(.horizontal, 12)
+            QuotaSummarySection(
+                state: quotaState,
+                accentColor: self.accentColor)
+                .frame(
+                    height: DashboardOverviewView.quotaHeight(quota: quotaState.value),
+                    alignment: .top)
+            Divider().padding(.horizontal, 12)
+            TodaySummarySection(
+                state: self.model.visibleActivity,
+                accentColor: self.accentColor)
+                .frame(height: DashboardOverviewView.todayHeight)
+            Divider().padding(.horizontal, 12)
+            WeeklyResetActivitySection(
+                quota: quotaState.value,
+                state: self.model.visibleActivity,
+                accentColor: self.accentColor)
+                .frame(height: DashboardOverviewView.weeklyResetActivityHeight)
+        }
+        .background(Color.clear)
+    }
+}
+
+private struct DashboardScopeSelector: View {
+    let selection: DashboardScope
+    let scopes: [DashboardScope]
+    let accentColor: Color
+    let onSelect: (DashboardScope) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(self.scopes) { scope in
+                Text(scope.displayName)
+                    .font(.system(
+                        size: 10.5,
+                        weight: self.selection == scope ? .semibold : .medium))
+                    .foregroundStyle(self.selection == scope ? .primary : .secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 3)
+                    .background {
+                        if self.selection == scope {
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(self.accentColor.opacity(0.18))
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard self.selection != scope else { return }
+                        var transaction = Transaction(animation: nil)
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            self.onSelect(scope)
+                        }
+                    }
+                    .accessibilityAddTraits(self.selection == scope ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(Color.secondary.opacity(0.11))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Platform")
     }
 }
 
 private struct QuotaSummarySection: View {
     let state: DashboardSourceState<QuotaSnapshot>
-    let showsFiveHour: Bool
     let accentColor: Color
 
     var body: some View {
@@ -136,11 +245,17 @@ private struct QuotaSummarySection: View {
                     measuredAt: snapshot.updatedAt,
                     accentColor: self.accentColor)
             } else {
-                InlinePlaceholder(text: self.state.isRefreshing ? "Loading weekly quota…" : "Weekly quota unavailable")
+                InlinePlaceholder(
+                    text: self.state.isRefreshing
+                        ? "Loading weekly quota…"
+                        : "Weekly quota unavailable")
             }
 
-            if self.showsFiveHour, let fiveHour = self.state.value?.session {
-                QuotaProgressRow(title: "5-hour", window: fiveHour, accentColor: self.accentColor)
+            if let fiveHour = self.state.value?.session {
+                QuotaProgressRow(
+                    title: "5-hour",
+                    window: fiveHour,
+                    accentColor: self.accentColor)
             }
 
             if let resetCredits = self.state.value?.resetCredits {
@@ -194,7 +309,10 @@ private struct WeeklyQuotaProgressRow: View {
             }
             .help(self.helpText(pacing))
         } else {
-            QuotaProgressRow(title: "Weekly", window: self.window, accentColor: self.accentColor)
+            QuotaProgressRow(
+                title: "Weekly",
+                window: self.window,
+                accentColor: self.accentColor)
         }
     }
 
@@ -315,7 +433,9 @@ private struct QuotaProgressRow: View {
                     Capsule().fill(Color.secondary.opacity(0.17))
                     Capsule()
                         .fill(self.tint)
-                        .frame(width: proxy.size.width * self.window.remainingPercent.clamped(to: 0 ... 100) / 100)
+                        .frame(
+                            width: proxy.size.width
+                                * self.window.remainingPercent.clamped(to: 0 ... 100) / 100)
                 }
             }
             .frame(height: 6)
@@ -424,6 +544,7 @@ private struct WeeklyResetActivitySection: View {
                 HStack {
                     Text(
                         "Cache× \(totals.tokens.cacheReuseText) · "
+                            + self.averageTPSText(totals)
                             + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
                     Spacer(minLength: 6)
                     Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
@@ -433,6 +554,7 @@ private struct WeeklyResetActivitySection: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .minimumScaleFactor(0.82)
             } else {
                 InlinePlaceholder(text: self.placeholderText)
             }
@@ -449,6 +571,10 @@ private struct WeeklyResetActivitySection: View {
             return "Calculating activity since reset…"
         }
         return self.state.errorMessage ?? "Weekly reset activity unavailable"
+    }
+
+    private func averageTPSText(_ totals: ActivityTotals) -> String {
+        totals.menuAverageTPSText.map { "\($0) · " } ?? ""
     }
 }
 
@@ -473,43 +599,11 @@ private struct TodaySummarySection: View {
 
                 TokenStackedBar(tokens: totals.tokens, accentColor: self.accentColor)
 
-                HStack(spacing: 16) {
-                    TokenLegend(
-                        label: "Input",
-                        value: totals.tokens.input,
-                        costUsd: totals.tokenCosts?.input,
-                        color: self.accentColor)
-                    TokenLegend(
-                        label: "Output",
-                        value: totals.tokens.output,
-                        costUsd: totals.tokenCosts?.output,
-                        color: TokenBarPalette.blue)
-                }
-                HStack(spacing: 16) {
-                    TokenLegend(
-                        label: "Cache",
-                        value: totals.tokens.cacheRead + totals.tokens.cacheWrite,
-                        costUsd: totals.tokenCosts?.cache,
-                        color: TokenBarPalette.mint)
-                    TokenLegend(
-                        label: "Reasoning",
-                        value: totals.tokens.reasoning,
-                        costUsd: totals.tokenCosts?.reasoning,
-                        color: TokenBarPalette.orange)
-                }
-
-                HStack {
-                    Text(
-                        "Cache× \(totals.tokens.cacheReuseText) · "
-                            + self.averageTPSText
-                            + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
-                    Spacer()
-                    Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
-                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(TokenBarVisualStyle.costAccentColor)
-                }
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
+                ActivityTotalsBreakdown(
+                    totals: totals,
+                    averageTPSText: totals.menuAverageTPSText ?? self.state.value?.menuAverageTPSText,
+                    accentColor: self.accentColor,
+                    showsBar: false)
             } else {
                 HStack {
                     Text("Today")
@@ -523,9 +617,64 @@ private struct TodaySummarySection: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
     }
+}
 
-    private var averageTPSText: String {
-        self.state.value?.menuAverageTPSText.map { "\($0) · " } ?? ""
+struct ActivityTotalsBreakdown: View {
+    let totals: ActivityTotals
+    let averageTPSText: String?
+    let accentColor: Color
+    var showsBar = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if self.showsBar {
+                TokenStackedBar(tokens: self.totals.tokens, accentColor: self.accentColor)
+            }
+
+            HStack(spacing: 16) {
+                TokenLegend(
+                    label: "Input",
+                    value: self.totals.tokens.input,
+                    costUsd: self.totals.tokenCosts?.input,
+                    color: self.accentColor)
+                TokenLegend(
+                    label: "Output",
+                    value: self.totals.tokens.output,
+                    costUsd: self.totals.tokenCosts?.output,
+                    color: TokenBarPalette.blue)
+            }
+            HStack(spacing: 16) {
+                TokenLegend(
+                    label: "Cache",
+                    value: self.totals.tokens.cacheRead + self.totals.tokens.cacheWrite,
+                    costUsd: self.totals.tokenCosts?.cache,
+                    color: TokenBarPalette.mint)
+                TokenLegend(
+                    label: "Reasoning",
+                    value: self.totals.tokens.reasoning,
+                    costUsd: self.totals.tokenCosts?.reasoning,
+                    color: TokenBarPalette.orange)
+            }
+
+            HStack {
+                Text(
+                    "Cache× \(self.totals.tokens.cacheReuseText) · "
+                        + self.averageTPSSuffix
+                        + "\(self.totals.sessionCount) sessions · \(self.totals.requestCount) turns")
+                Spacer()
+                Text(self.totals.costUsd.costText(tokenTotal: self.totals.tokens.total))
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+            }
+            .font(.system(size: 10.5))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+        }
+    }
+
+    private var averageTPSSuffix: String {
+        self.averageTPSText.map { "\($0) · " } ?? ""
     }
 }
 

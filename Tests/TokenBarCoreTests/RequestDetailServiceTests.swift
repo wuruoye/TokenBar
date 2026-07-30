@@ -67,6 +67,7 @@ struct RequestDetailServiceTests {
         #expect(invocation.executableURL == helperURL)
         #expect(invocation.arguments == [
             "request-detail",
+            "--platform", "codex",
             "--session-path", sessionPath,
             "--start-ms", String(request.startedAtMs),
             "--end-ms", String(request.endedAtMs),

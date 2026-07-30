@@ -140,6 +140,111 @@ impl CodexPricing {
     }
 }
 
+/// Offline Anthropic pricing used for Claude Code compatibility estimates.
+///
+/// The model-family mapping and cache multipliers follow the Tokscale catalog
+/// pinned in THIRD_PARTY_NOTICES.md. Unknown or future model versions remain
+/// unpriced instead of silently inheriting a nearby model's rate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnthropicPricing;
+
+impl AnthropicPricing {
+    pub fn calculate_token_costs(
+        &self,
+        model_id: &str,
+        usage: &TokenBreakdown,
+    ) -> Option<TokenCostBreakdown> {
+        let rate = anthropic_rate_for_model(model_id)?;
+        let costs = TokenCostBreakdown {
+            input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
+            output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
+                / TOKENS_PER_MILLION,
+            cache_write: usage.cache_write.max(0) as f64
+                * rate.cache_write_per_million?
+                / TOKENS_PER_MILLION,
+            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                / TOKENS_PER_MILLION,
+        };
+        costs.total().is_finite().then_some(costs)
+    }
+}
+
+fn anthropic_rate_for_model(model_id: &str) -> Option<ModelRate> {
+    let normalized = normalize_anthropic_model_id(model_id);
+    let (input, output) = match normalized.as_str() {
+        "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7"
+        | "claude-opus-4-8" => (5.0, 25.0),
+        "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => (15.0, 75.0),
+        "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6"
+        | "claude-3-7-sonnet" | "claude-3-5-sonnet" => (3.0, 15.0),
+        "claude-haiku-4-5" | "claude-haiku-4-6" => (1.0, 5.0),
+        "claude-3-5-haiku" => (0.8, 4.0),
+        "claude-3-haiku" => (0.25, 1.25),
+        _ => return None,
+    };
+    Some(ModelRate {
+        input_per_million: input,
+        cached_input_per_million: input * 0.1,
+        output_per_million: output,
+        cache_write_per_million: Some(input * 1.25),
+    })
+}
+
+fn normalize_anthropic_model_id(model_id: &str) -> String {
+    let mut normalized = model_id.trim().to_ascii_lowercase().replace('.', "-");
+    for prefix in [
+        "anthropic/",
+        "vertex_ai/",
+        "vertex/",
+        "bedrock/",
+        "us-anthropic-",
+        "eu-anthropic-",
+        "global-anthropic-",
+        "anthropic-",
+    ] {
+        if let Some(model) = normalized.strip_prefix(prefix) {
+            normalized = model.to_string();
+            break;
+        }
+    }
+    if let Some(index) = normalized.find("-20") {
+        normalized.truncate(index);
+    }
+    if let Some(index) = normalized.find("-v1") {
+        normalized.truncate(index);
+    }
+    for suffix in ["-thinking", "-fast"] {
+        if let Some(model) = normalized.strip_suffix(suffix) {
+            normalized = model.to_string();
+        }
+    }
+
+    for (alias, canonical) in [
+        ("claude-4-8-opus", "claude-opus-4-8"),
+        ("claude-4-7-opus", "claude-opus-4-7"),
+        ("claude-4-6-opus", "claude-opus-4-6"),
+        ("claude-4-5-opus", "claude-opus-4-5"),
+        ("claude-4-6-sonnet", "claude-sonnet-4-6"),
+        ("claude-4-5-sonnet", "claude-sonnet-4-5"),
+        ("claude-4-6-haiku", "claude-haiku-4-6"),
+        ("claude-4-5-haiku", "claude-haiku-4-5"),
+        ("opus-4-8", "claude-opus-4-8"),
+        ("opus-4-7", "claude-opus-4-7"),
+        ("opus-4-6", "claude-opus-4-6"),
+        ("opus-4-5", "claude-opus-4-5"),
+        ("sonnet-4-6", "claude-sonnet-4-6"),
+        ("sonnet-4-5", "claude-sonnet-4-5"),
+        ("haiku-4-6", "claude-haiku-4-6"),
+        ("haiku-4-5", "claude-haiku-4-5"),
+    ] {
+        if normalized == alias {
+            return canonical.to_string();
+        }
+    }
+    normalized
+}
+
 /// Official Fast multipliers reviewed 2026-07-16:
 /// - ChatGPT subscription credits: GPT-5.4 is 2x; GPT-5.5/5.6 are 2.5x.
 /// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6 is 2x.
@@ -528,5 +633,27 @@ mod tests {
             .calculate_cost_with_provider("gpt-5.5", Some("tencent"), &usage)
             .unwrap();
         assert!((custom_provider - 35.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimates_anthropic_models_with_cache_components() {
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+            ..Default::default()
+        };
+        let costs = AnthropicPricing
+            .calculate_token_costs("anthropic/claude-sonnet-4-5-20250929", &usage)
+            .unwrap();
+
+        assert!((costs.input - 3.0).abs() < 1e-9);
+        assert!((costs.output - 15.0).abs() < 1e-9);
+        assert!((costs.cache_read - 0.3).abs() < 1e-9);
+        assert!((costs.cache_write - 3.75).abs() < 1e-9);
+        assert!(AnthropicPricing
+            .calculate_token_costs("claude-future-99", &usage)
+            .is_none());
     }
 }

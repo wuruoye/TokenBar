@@ -4,6 +4,10 @@ public protocol ActivityProviding: Sendable {
     func fetchActivity(
         sinceWeeklyResetAt: Date?,
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+
+    func fetchActivity(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
 }
 
 public extension ActivityProviding {
@@ -17,6 +21,15 @@ public extension ActivityProviding {
         try await self.fetchActivity(
             sinceWeeklyResetAt: sinceWeeklyResetAt,
             statisticsTimeZone: .utc)
+    }
+
+    func fetchActivity(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        try await self.fetchActivity(
+            sinceWeeklyResetAt: sinceWeeklyResetAtByPlatform[.codex],
+            statisticsTimeZone: statisticsTimeZone)
     }
 }
 
@@ -113,10 +126,22 @@ public struct ActivityService: ActivityProviding, Sendable {
         sinceWeeklyResetAt: Date?,
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
+        var resets: [TokenPlatform: Date] = [:]
+        resets[.codex] = sinceWeeklyResetAt
+        return try await self.fetchActivity(
+            sinceWeeklyResetAtByPlatform: resets,
+            statisticsTimeZone: statisticsTimeZone)
+    }
+
+    public func fetchActivity(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
         let helperURL = try self.resolveHelper()
         let data = try await self.runner.run(
             executableURL: helperURL,
-            arguments: self.helperArguments(sinceWeeklyResetAt: sinceWeeklyResetAt),
+            arguments: self.helperArguments(
+                sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
         guard !data.isEmpty else {
@@ -129,16 +154,29 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
     }
 
-    private func helperArguments(sinceWeeklyResetAt: Date?) -> [String] {
-        guard let sinceWeeklyResetAt else { return self.arguments }
-        let milliseconds = sinceWeeklyResetAt.timeIntervalSince1970 * 1000
+    private func helperArguments(
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date]) -> [String]
+    {
+        var arguments = self.arguments
+        if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.codex]) {
+            arguments += ["--weekly-reset-ms", String(value)]
+        }
+        if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.claude]) {
+            arguments += ["--claude-weekly-reset-ms", String(value)]
+        }
+        return arguments
+    }
+
+    private static func milliseconds(_ date: Date?) -> Int64? {
+        guard let date else { return nil }
+        let milliseconds = date.timeIntervalSince1970 * 1000
         guard milliseconds.isFinite,
               milliseconds >= Double(Int64.min),
               milliseconds <= Double(Int64.max)
         else {
-            return self.arguments
+            return nil
         }
-        return self.arguments + ["--weekly-reset-ms", String(Int64(milliseconds.rounded()))]
+        return Int64(milliseconds.rounded())
     }
 
     private func helperEnvironment(

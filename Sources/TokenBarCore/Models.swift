@@ -21,11 +21,46 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
     public var displayName: String {
         switch self {
         case .codex: "Codex"
+        case .claude: "Claude"
         default: self.rawValue.capitalized
         }
     }
 
+    public var shortLabel: String {
+        switch self {
+        case .codex: "C"
+        case .claude: "A"
+        default: String(self.displayName.prefix(1))
+        }
+    }
+
     public static let codex = TokenPlatform(rawValue: "codex")
+    public static let claude = TokenPlatform(rawValue: "claude")
+}
+
+public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
+    case codex
+    case claude
+
+    public var id: String { self.rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .codex: TokenPlatform.codex.displayName
+        case .claude: TokenPlatform.claude.displayName
+        }
+    }
+
+    public var platform: TokenPlatform {
+        switch self {
+        case .codex: .codex
+        case .claude: .claude
+        }
+    }
+
+    public static func visibleScopes(showsClaude: Bool) -> [Self] {
+        showsClaude ? Self.allCases : [.codex]
+    }
 }
 
 public struct TokenBreakdown: Codable, Equatable, Sendable {
@@ -145,6 +180,7 @@ public enum ActivityServiceTier: String, Codable, Equatable, Sendable {
 
 public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let id: String
+    public let platform: TokenPlatform?
     public let sessionId: String
     public let physicalSessionId: String
     public let isSubagent: Bool
@@ -154,6 +190,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let startedAtMs: Int64
     public let endedAtMs: Int64
     public let durationMs: Int64?
+    public let modelDurationMs: Int64?
     public let tokens: TokenBreakdown
     public let costUsd: Double
     public let costSource: ActivityCostSource
@@ -174,6 +211,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         startedAtMs: Int64,
         endedAtMs: Int64,
         durationMs: Int64?,
+        modelDurationMs: Int64? = nil,
         tokens: TokenBreakdown,
         costUsd: Double,
         costSource: ActivityCostSource,
@@ -181,9 +219,11 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         outputPreview: String?,
         sessionPath: String?,
         contributions: [RequestSummary]? = nil,
-        serviceTier: ActivityServiceTier? = nil)
+        serviceTier: ActivityServiceTier? = nil,
+        platform: TokenPlatform? = nil)
     {
         self.id = id
+        self.platform = platform
         self.sessionId = sessionId
         self.physicalSessionId = physicalSessionId
         self.isSubagent = isSubagent
@@ -193,6 +233,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         self.startedAtMs = startedAtMs
         self.endedAtMs = endedAtMs
         self.durationMs = durationMs
+        self.modelDurationMs = modelDurationMs
         self.tokens = tokens
         self.costUsd = costUsd
         self.costSource = costSource
@@ -205,6 +246,14 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
 
     public var startedAt: Date {
         Date(timeIntervalSince1970: Double(self.startedAtMs) / 1000)
+    }
+
+    public var platformID: TokenPlatform {
+        self.platform ?? .codex
+    }
+
+    public var platformScopedID: String {
+        "\(self.platformID.rawValue):\(self.id)"
     }
 
     public var menuTitle: String {
@@ -236,6 +285,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
             startedAtMs: self.startedAtMs,
             endedAtMs: self.endedAtMs,
             durationMs: self.durationMs,
+            modelDurationMs: self.modelDurationMs,
             tokens: self.tokens,
             costUsd: self.costUsd,
             costSource: self.costSource,
@@ -243,13 +293,16 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
             outputPreview: nil,
             sessionPath: nil,
             contributions: self.contributions?.map { $0.redactedForCache() },
-            serviceTier: self.serviceTier)
+            serviceTier: self.serviceTier,
+            platform: self.platform)
     }
 }
 
 public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
     public let id: String
+    public let platform: TokenPlatform?
     public let title: String?
+    public let workspacePath: String?
     public let workspaceLabel: String?
     public let startedAtMs: Int64
     public let endedAtMs: Int64
@@ -267,10 +320,14 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
         costUsd: Double,
         models: [String],
         requests: [RequestSummary],
-        title: String? = nil)
+        title: String? = nil,
+        workspacePath: String? = nil,
+        platform: TokenPlatform? = nil)
     {
         self.id = id
+        self.platform = platform
         self.title = title
+        self.workspacePath = workspacePath
         self.workspaceLabel = workspaceLabel
         self.startedAtMs = startedAtMs
         self.endedAtMs = endedAtMs
@@ -282,6 +339,14 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
 
     public var requestCount: Int {
         self.requests.count
+    }
+
+    public var platformID: TokenPlatform {
+        self.platform ?? .codex
+    }
+
+    public var platformScopedID: String {
+        "\(self.platformID.rawValue):\(self.id)"
     }
 
     public var menuTitle: String {
@@ -315,7 +380,9 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
             costUsd: self.costUsd,
             models: self.models,
             requests: self.requests.map { $0.redactedForCache() },
-            title: nil)
+            title: nil,
+            workspacePath: nil,
+            platform: self.platform)
     }
 }
 
@@ -328,6 +395,7 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
     public let tokens: TokenBreakdown
     public let costUsd: Double
     public let tokenCosts: TokenCostBreakdown?
+    public let averageGenerationTokensPerSecond: Double?
     public let requestCount: Int
     public let sessionCount: Int
 
@@ -336,11 +404,13 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
         costUsd: Double,
         requestCount: Int,
         sessionCount: Int,
-        tokenCosts: TokenCostBreakdown? = nil)
+        tokenCosts: TokenCostBreakdown? = nil,
+        averageGenerationTokensPerSecond: Double? = nil)
     {
         self.tokens = tokens
         self.costUsd = costUsd
         self.tokenCosts = tokenCosts
+        self.averageGenerationTokensPerSecond = averageGenerationTokensPerSecond
         self.requestCount = requestCount
         self.sessionCount = sessionCount
     }
@@ -367,6 +437,7 @@ public struct ActivityRangeSummary: Codable, Equatable, Sendable {
 }
 
 public struct DailyModelSummary: Codable, Equatable, Sendable {
+    public let platform: TokenPlatform?
     public let model: String
     public let provider: String
     public let tokens: TokenBreakdown
@@ -380,8 +451,10 @@ public struct DailyModelSummary: Codable, Equatable, Sendable {
         tokens: TokenBreakdown,
         costUsd: Double,
         requestCount: Int,
-        sessionCount: Int)
+        sessionCount: Int,
+        platform: TokenPlatform? = nil)
     {
+        self.platform = platform
         self.model = model
         self.provider = provider
         self.tokens = tokens
@@ -437,14 +510,40 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct ActivitySourceSnapshot: Codable, Equatable, Identifiable, Sendable {
+    public let platform: TokenPlatform
+    public let today: ActivityTotals
+    public let rangeTotals: ActivityTotals?
+    public let weeklySinceReset: ActivityRangeSummary?
+    public let days: [DailySummary]
+
+    public init(
+        platform: TokenPlatform,
+        today: ActivityTotals,
+        weeklySinceReset: ActivityRangeSummary?,
+        days: [DailySummary],
+        rangeTotals: ActivityTotals? = nil)
+    {
+        self.platform = platform
+        self.today = today
+        self.rangeTotals = rangeTotals
+        self.weeklySinceReset = weeklySinceReset
+        self.days = days
+    }
+
+    public var id: TokenPlatform { self.platform }
+}
+
 public struct ActivitySnapshot: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let generatedAtMs: Int64
     public let timezone: String
     public let today: ActivityTotals
+    public let rangeTotals: ActivityTotals?
     public let weeklySinceReset: ActivityRangeSummary?
     public let sessions: [SessionSummary]
     public let days: [DailySummary]
+    public let sources: [ActivitySourceSnapshot]?
 
     public init(
         schemaVersion: Int,
@@ -453,19 +552,62 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
         today: ActivityTotals,
         sessions: [SessionSummary],
         days: [DailySummary],
-        weeklySinceReset: ActivityRangeSummary? = nil)
+        weeklySinceReset: ActivityRangeSummary? = nil,
+        sources: [ActivitySourceSnapshot]? = nil,
+        rangeTotals: ActivityTotals? = nil)
     {
         self.schemaVersion = schemaVersion
         self.generatedAtMs = generatedAtMs
         self.timezone = timezone
         self.today = today
+        self.rangeTotals = rangeTotals
         self.weeklySinceReset = weeklySinceReset
         self.sessions = sessions
         self.days = days
+        self.sources = sources
     }
 
     public var generatedAt: Date {
         Date(timeIntervalSince1970: Double(self.generatedAtMs) / 1000)
+    }
+
+    public var sourceSnapshots: [ActivitySourceSnapshot] {
+        self.sources ?? []
+    }
+
+    public func scoped(to platform: TokenPlatform?) -> ActivitySnapshot {
+        guard let platform else { return self }
+        guard let source = self.sourceSnapshots.first(where: { $0.platform == platform }) else {
+            if platform == .codex, self.sourceSnapshots.isEmpty {
+                return self
+            }
+            return ActivitySnapshot(
+                schemaVersion: self.schemaVersion,
+                generatedAtMs: self.generatedAtMs,
+                timezone: self.timezone,
+                today: .zero,
+                sessions: [],
+                days: self.days.map {
+                    DailySummary(
+                        date: $0.date,
+                        tokens: .zero,
+                        costUsd: 0,
+                        requestCount: 0,
+                        sessionCount: 0)
+                },
+                sources: [],
+                rangeTotals: .zero)
+        }
+        return ActivitySnapshot(
+            schemaVersion: self.schemaVersion,
+            generatedAtMs: self.generatedAtMs,
+            timezone: self.timezone,
+            today: source.today,
+            sessions: self.sessions.filter { $0.platformID == platform },
+            days: source.days,
+            weeklySinceReset: source.weeklySinceReset,
+            sources: [source],
+            rangeTotals: source.rangeTotals)
     }
 
     public func redactedForCache() -> ActivitySnapshot {
@@ -476,7 +618,9 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
             today: self.today,
             sessions: self.sessions.map { $0.redactedForCache() },
             days: self.days,
-            weeklySinceReset: self.weeklySinceReset)
+            weeklySinceReset: self.weeklySinceReset,
+            sources: self.sources,
+            rangeTotals: self.rangeTotals)
     }
 
     public func sessionMenu(limit: Int?) -> SessionMenuProjection {
@@ -484,7 +628,7 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
             if $0.endedAtMs != $1.endedAtMs {
                 return $0.endedAtMs > $1.endedAtMs
             }
-            return $0.id < $1.id
+            return $0.platformScopedID < $1.platformScopedID
         }
         guard let limit else {
             return SessionMenuProjection(visibleSessions: sorted, remainingCount: 0)

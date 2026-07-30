@@ -13,8 +13,9 @@ same catalog is stored as `ThirdPartyLicenses.html` inside the app bundle.
 Project: [steipete/CodexBar](https://github.com/steipete/CodexBar)
 
 TokenBar's Codex app-server quota integration, reset-credit compatibility,
-quota-reset detection, and celebration behavior were informed by or adapted
-from CodexBar's implementation.
+quota-reset detection and celebration behavior, provider icon resources, and
+provider icon loading were informed by or adapted from CodexBar's
+implementation.
 
 MIT License
 
@@ -70,8 +71,8 @@ SOFTWARE.
 
 Project: [junhoyeo/tokscale](https://github.com/junhoyeo/tokscale)
 
-TokenBar's Codex session parsing and accounting implementation is adapted from
-`tokscale-core` at commit
+TokenBar's Codex and Claude Code session parsing, accounting, and Claude quota
+compatibility are adapted from `tokscale-core` and `tokscale-cli` at commit
 `37c1b2ca0cc2e6afc56d28b1648d63e5991c9474`.
 
 MIT License
