@@ -32,8 +32,9 @@ struct TokenBarSettingsView: View {
 
             Section("Platforms") {
                 Toggle("Show Claude Code", isOn: self.$settings.showsClaude)
+                Toggle("Show Grok Build", isOn: self.$settings.showsGrok)
 
-                Text("Adds the Claude T/W section and Claude tab. Changes take effect immediately.")
+                Text("Adds each provider's T/W section and dashboard tab. Changes take effect immediately.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -164,6 +164,9 @@ public struct ActivityService: ActivityProviding, Sendable {
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.claude]) {
             arguments += ["--claude-weekly-reset-ms", String(value)]
         }
+        if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.grok]) {
+            arguments += ["--grok-weekly-reset-ms", String(value)]
+        }
         return arguments
     }
 

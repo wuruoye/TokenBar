@@ -11,6 +11,10 @@ use tokenbar_helper::claude::{
     LocalParseOptions as ClaudeParseOptions,
 };
 use tokenbar_helper::codex::{parse_local_codex_messages, LocalParseOptions};
+use tokenbar_helper::grok::{
+    extract_request_detail as extract_grok_request_detail, load_grok_session_titles,
+    parse_local_grok_messages, LocalParseOptions as GrokParseOptions,
+};
 use serde::Deserialize;
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
@@ -19,7 +23,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude] --session-path PATH --start-ms MS --end-ms MS";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -27,6 +31,7 @@ struct SnapshotConfig {
     home_dir: Option<PathBuf>,
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
+    grok_weekly_reset_ms: Option<i64>,
 }
 
 impl Default for SnapshotConfig {
@@ -36,6 +41,7 @@ impl Default for SnapshotConfig {
             home_dir: None,
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
+            grok_weekly_reset_ms: None,
         }
     }
 }
@@ -78,6 +84,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         config.end_ms,
                     )
                 }
+                "grok" => extract_grok_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
                 platform => Err(format!("unsupported request-detail platform: {platform}")),
             }
             .map_err(io::Error::other)?;
@@ -92,7 +103,11 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let first_day = today
         .checked_sub_days(Days::new((config.days - 1) as u64))
         .ok_or("day range is too large")?;
-    let scan_first_day = [config.weekly_reset_ms, config.claude_weekly_reset_ms]
+    let scan_first_day = [
+        config.weekly_reset_ms,
+        config.claude_weekly_reset_ms,
+        config.grok_weekly_reset_ms,
+    ]
         .into_iter()
         .flatten()
         .filter_map(chrono::DateTime::from_timestamp_millis)
@@ -135,7 +150,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .unwrap_or_default();
     let claude_messages = parse_local_claude_messages(
         ClaudeParseOptions {
-            home_dir,
+            home_dir: home_dir.clone(),
             use_env_roots,
             since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
             until: Some(today.format("%Y-%m-%d").to_string()),
@@ -144,8 +159,17 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_claude_session_titles(&claude_messages));
+    let grok_messages = parse_local_grok_messages(GrokParseOptions {
+        home_dir,
+        use_env_roots,
+        since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
+        until: Some(today.format("%Y-%m-%d").to_string()),
+    })
+    .map_err(io::Error::other)?;
+    session_titles.extend(load_grok_session_titles(&grok_messages));
     let mut messages = codex_messages;
     messages.extend(claude_messages);
+    messages.extend(grok_messages);
 
     let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| now.offset().to_string());
     let mut weekly_resets = std::collections::HashMap::new();
@@ -154,6 +178,9 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     }
     if let Some(timestamp) = config.claude_weekly_reset_ms {
         weekly_resets.insert("claude".to_string(), timestamp);
+    }
+    if let Some(timestamp) = config.grok_weekly_reset_ms {
+        weekly_resets.insert("grok".to_string(), timestamp);
     }
     let snapshot = build_snapshot_with_platform_resets(
         messages,
@@ -267,6 +294,19 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .map_err(|_| "--claude-weekly-reset-ms must be an integer")?,
                 );
             }
+            Some("--grok-weekly-reset-ms") => {
+                let value = args
+                    .next()
+                    .ok_or("--grok-weekly-reset-ms requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--grok-weekly-reset-ms must be valid UTF-8")?;
+                config.grok_weekly_reset_ms = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| "--grok-weekly-reset-ms must be an integer")?,
+                );
+            }
             Some("--help" | "-h") => {
                 return Err(USAGE.to_string());
             }
@@ -292,8 +332,8 @@ fn parse_request_detail_args(
             Some("--platform") => {
                 let value = args.next().ok_or("--platform requires a value")?;
                 let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
-                if !matches!(value, "codex" | "claude") {
-                    return Err("--platform must be codex or claude".to_string());
+                if !matches!(value, "codex" | "claude" | "grok") {
+                    return Err("--platform must be codex, claude, or grok".to_string());
                 }
                 platform = value.to_string();
             }
@@ -360,6 +400,8 @@ mod tests {
             OsString::from("1800000000000"),
             OsString::from("--claude-weekly-reset-ms"),
             OsString::from("1799000000000"),
+            OsString::from("--grok-weekly-reset-ms"),
+            OsString::from("1798000000000"),
         ])
         .unwrap();
 
@@ -370,6 +412,7 @@ mod tests {
                 home_dir: Some(PathBuf::from("/tmp/home")),
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
+                grok_weekly_reset_ms: Some(1_798_000_000_000),
             })
         );
     }

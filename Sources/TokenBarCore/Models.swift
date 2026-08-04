@@ -22,6 +22,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         switch self {
         case .codex: "Codex"
         case .claude: "Claude"
+        case .grok: "Grok"
         default: self.rawValue.capitalized
         }
     }
@@ -30,17 +31,20 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         switch self {
         case .codex: "C"
         case .claude: "A"
+        case .grok: "G"
         default: String(self.displayName.prefix(1))
         }
     }
 
     public static let codex = TokenPlatform(rawValue: "codex")
     public static let claude = TokenPlatform(rawValue: "claude")
+    public static let grok = TokenPlatform(rawValue: "grok")
 }
 
 public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
     case codex
     case claude
+    case grok
 
     public var id: String { self.rawValue }
 
@@ -48,6 +52,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         switch self {
         case .codex: TokenPlatform.codex.displayName
         case .claude: TokenPlatform.claude.displayName
+        case .grok: TokenPlatform.grok.displayName
         }
     }
 
@@ -55,11 +60,18 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         switch self {
         case .codex: .codex
         case .claude: .claude
+        case .grok: .grok
         }
     }
 
-    public static func visibleScopes(showsClaude: Bool) -> [Self] {
-        showsClaude ? Self.allCases : [.codex]
+    public static func visibleScopes(showsClaude: Bool, showsGrok: Bool) -> [Self] {
+        Self.allCases.filter { scope in
+            switch scope {
+            case .codex: true
+            case .claude: showsClaude
+            case .grok: showsGrok
+            }
+        }
     }
 }
 

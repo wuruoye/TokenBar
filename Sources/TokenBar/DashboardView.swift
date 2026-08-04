@@ -5,15 +5,18 @@ import TokenBarCore
 struct DashboardSummaryView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
+    let showsGrok: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
-        showsClaude: Bool) -> CGFloat
+        showsClaude: Bool,
+        showsGrok: Bool) -> CGFloat
     {
         DashboardOverviewView.preferredHeight(
             quota: quota,
-            showsClaude: showsClaude)
+            showsClaude: showsClaude,
+            showsGrok: showsGrok)
             + ActivitySummarySection.preferredHeight
             + 1
     }
@@ -23,6 +26,7 @@ struct DashboardSummaryView: View {
             DashboardOverviewView(
                 model: self.model,
                 showsClaude: self.showsClaude,
+                showsGrok: self.showsGrok,
                 accentColor: self.accentColor)
             Divider().padding(.horizontal, 12)
             ActivitySummarySection(
@@ -47,17 +51,24 @@ struct DashboardOverviewView: View {
 
     @Bindable var model: DashboardModel
     let showsClaude: Bool
+    let showsGrok: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
-        showsClaude: Bool) -> CGFloat
+        showsClaude: Bool,
+        showsGrok: Bool) -> CGFloat
     {
-        self.headerHeight(showsClaude: showsClaude) + self.contentHeight(quota: quota)
+        self.headerHeight(showsClaude: showsClaude, showsGrok: showsGrok)
+            + self.contentHeight(quota: quota)
     }
 
-    static func headerHeight(showsClaude: Bool) -> CGFloat {
-        showsClaude ? self.headerHeight : self.compactHeaderHeight
+    static func headerHeight(showsClaude: Bool, showsGrok: Bool) -> CGFloat {
+        DashboardScope.visibleScopes(
+            showsClaude: showsClaude,
+            showsGrok: showsGrok).count > 1
+            ? self.headerHeight
+            : self.compactHeaderHeight
     }
 
     static func contentHeight(quota: QuotaSnapshot?) -> CGFloat {
@@ -89,9 +100,12 @@ struct DashboardOverviewView: View {
             DashboardHeaderView(
                 model: self.model,
                 showsClaude: self.showsClaude,
+                showsGrok: self.showsGrok,
                 accentColor: self.accentColor,
                 onSelectScope: nil)
-                .frame(height: Self.headerHeight(showsClaude: self.showsClaude))
+                .frame(height: Self.headerHeight(
+                    showsClaude: self.showsClaude,
+                    showsGrok: self.showsGrok))
             DashboardOverviewContentView(
                 model: self.model,
                 accentColor: self.accentColor)
@@ -103,11 +117,14 @@ struct DashboardOverviewView: View {
 struct DashboardHeaderView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
+    let showsGrok: Bool
     let accentColor: Color
     let onSelectScope: ((DashboardScope) -> Void)?
 
     var body: some View {
-        let scopes = DashboardScope.visibleScopes(showsClaude: self.showsClaude)
+        let scopes = DashboardScope.visibleScopes(
+            showsClaude: self.showsClaude,
+            showsGrok: self.showsGrok)
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Text("TokenBar")

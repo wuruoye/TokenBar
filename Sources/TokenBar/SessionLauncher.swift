@@ -23,18 +23,29 @@ enum SessionLauncherError: LocalizedError {
 struct SessionLauncher {
     private let openURL: (URL) -> Bool
     private let resolveClaudeDesktopSessionID: (String) -> String?
+    private let launchGrokSession: (SessionSummary) -> Bool
 
     init(
         openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
         resolveClaudeDesktopSessionID: @escaping (String) -> String? = {
             ClaudeDesktopSessionResolver().desktopSessionID(for: $0)
+        },
+        launchGrokSession: @escaping (SessionSummary) -> Bool = {
+            GrokTerminalSessionLauncher().open($0)
         })
     {
         self.openURL = openURL
         self.resolveClaudeDesktopSessionID = resolveClaudeDesktopSessionID
+        self.launchGrokSession = launchGrokSession
     }
 
     func open(_ session: SessionSummary) throws {
+        if session.platformID == .grok {
+            guard self.launchGrokSession(session) else {
+                throw SessionLauncherError.applicationUnavailable(.grok)
+            }
+            return
+        }
         let claudeDesktopSessionID = session.platformID == .claude
             ? self.resolveClaudeDesktopSessionID(session.id)
             : nil
@@ -103,6 +114,87 @@ struct SessionLauncher {
             && value.unicodeScalars.allSatisfy {
                 CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-"
             }
+    }
+}
+
+@MainActor
+private struct GrokTerminalSessionLauncher {
+    private let environment: [String: String]
+
+    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.environment = environment
+    }
+
+    func open(_ session: SessionSummary) -> Bool {
+        let sessionID = session.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isSafeIdentifier(sessionID),
+              let executable = self.executableURL()
+        else {
+            return false
+        }
+        let workspace = session.workspacePath.flatMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let command = "exec \(Self.shellQuote(executable.path))"
+            + " --cwd \(Self.shellQuote(workspace))"
+            + " --resume \(Self.shellQuote(sessionID))"
+        let script = """
+        #!/bin/zsh
+        command rm -f -- "$0"
+        \(command)
+        """
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBar-Grok-\(UUID().uuidString).command")
+        do {
+            try Data(script.utf8).write(to: scriptURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: scriptURL.path)
+            guard NSWorkspace.shared.open(scriptURL) else {
+                try? FileManager.default.removeItem(at: scriptURL)
+                return false
+            }
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: scriptURL)
+            return false
+        }
+    }
+
+    private func executableURL() -> URL? {
+        var candidates: [URL] = []
+        if let configured = self.environment["GROK_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !configured.isEmpty
+        {
+            candidates.append(URL(fileURLWithPath: configured))
+        }
+        let home = self.environment["HOME"].flatMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let grokHome = self.environment["GROK_HOME"].flatMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } ?? URL(fileURLWithPath: home).appendingPathComponent(".grok").path
+        candidates.append(
+            URL(fileURLWithPath: grokHome).appendingPathComponent("bin/grok"))
+        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/grok"))
+        candidates.append(URL(fileURLWithPath: "/usr/local/bin/grok"))
+        return candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        })
+    }
+
+    private static func isSafeIdentifier(_ value: String) -> Bool {
+        !value.isEmpty && value.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-"
+        }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
     }
 }
 

@@ -8,14 +8,14 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MODE"] == "1" {
             return DashboardModel(
                 quotaService: DemoQuotaProvider(),
-                additionalQuotaServices: [DemoClaudeQuotaProvider()],
+                additionalQuotaServices: [DemoClaudeQuotaProvider(), DemoGrokQuotaProvider()],
                 activityService: DemoActivityProvider(),
                 cache: nil)
         }
         #endif
         return DashboardModel(
             quotaService: CodexQuotaService(),
-            additionalQuotaServices: [ClaudeQuotaService()],
+            additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
             quotaCache: QuotaSnapshotCache())
     }()
     private let settings = TokenBarSettings.shared

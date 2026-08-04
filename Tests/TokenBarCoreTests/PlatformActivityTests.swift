@@ -3,13 +3,21 @@ import Testing
 
 @Suite("Platform activity")
 struct PlatformActivityTests {
-    @Test("dashboard exposes exactly the two platform tabs")
+    @Test("dashboard exposes the three provider tabs and visibility filters")
     func platformTabs() {
-        #expect(DashboardScope.allCases == [.codex, .claude])
-        #expect(DashboardScope.visibleScopes(showsClaude: true) == [.codex, .claude])
-        #expect(DashboardScope.visibleScopes(showsClaude: false) == [.codex])
+        #expect(DashboardScope.allCases == [.codex, .claude, .grok])
+        #expect(DashboardScope.visibleScopes(
+            showsClaude: true,
+            showsGrok: true) == [.codex, .claude, .grok])
+        #expect(DashboardScope.visibleScopes(
+            showsClaude: false,
+            showsGrok: true) == [.codex, .grok])
+        #expect(DashboardScope.visibleScopes(
+            showsClaude: false,
+            showsGrok: false) == [.codex])
         #expect(DashboardScope.codex.platform == .codex)
         #expect(DashboardScope.claude.platform == .claude)
+        #expect(DashboardScope.grok.platform == .grok)
     }
 
     @Test("scopes totals, days, and colliding session ids by platform")

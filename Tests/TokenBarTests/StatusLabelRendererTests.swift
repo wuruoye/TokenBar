@@ -15,30 +15,42 @@ struct StatusLabelRendererTests {
             platform: .claude,
             today: "12K",
             weekly: "80%")
+        let grok = StatusLabelRenderer.image(
+            platform: .grok,
+            today: "12K",
+            weekly: "80%")
 
         #expect(codex.isTemplate)
         #expect(claude.isTemplate)
+        #expect(grok.isTemplate)
         #expect(codex.size.width > plain.size.width)
         #expect(claude.size.width > plain.size.width)
+        #expect(grok.size.width > plain.size.width)
         #expect(codex.size.height == plain.size.height)
         #expect(claude.size.height == plain.size.height)
+        #expect(grok.size.height == plain.size.height)
     }
 
-    @Test("Combined status label routes its two visual regions to matching tabs")
+    @Test("Combined status label routes all visual regions to matching tabs")
     func combinedHitRegions() {
         let layout = StatusLabelRenderer.layout(
             codexToday: "12K",
             codexWeekly: "80%",
             claudeToday: "8K",
-            claudeWeekly: "60%")
-        let boundary = layout.claudeBoundaryX
+            claudeWeekly: "60%",
+            grokToday: "4K",
+            grokWeekly: "40%")
+        let claudeStart = layout.regions[1].startX
+        let grokStart = layout.regions[2].startX
 
         #expect(layout.image.isTemplate)
-        #expect(boundary != nil)
+        #expect(layout.regions.map(\.scope) == [.codex, .claude, .grok])
         #expect(layout.scope(at: 0) == .codex)
-        #expect(layout.scope(at: (boundary ?? 1) - 0.1) == .codex)
-        #expect(layout.scope(at: boundary ?? 0) == .claude)
-        #expect(layout.scope(at: layout.image.size.width) == .claude)
+        #expect(layout.scope(at: claudeStart - 0.1) == .codex)
+        #expect(layout.scope(at: claudeStart) == .claude)
+        #expect(layout.scope(at: grokStart - 0.1) == .claude)
+        #expect(layout.scope(at: grokStart) == .grok)
+        #expect(layout.scope(at: layout.image.size.width) == .grok)
     }
 
     @Test("Codex-only status label has one hit region")
@@ -47,7 +59,19 @@ struct StatusLabelRendererTests {
             codexToday: "12K",
             codexWeekly: "80%")
 
-        #expect(layout.claudeBoundaryX == nil)
+        #expect(layout.regions.map(\.scope) == [.codex])
         #expect(layout.scope(at: layout.image.size.width) == .codex)
+    }
+
+    @Test("Grok remains clickable when Claude is hidden")
+    func codexAndGrokHitRegions() {
+        let layout = StatusLabelRenderer.layout(
+            codexToday: "12K",
+            codexWeekly: "80%",
+            grokToday: "4K",
+            grokWeekly: "40%")
+
+        #expect(layout.regions.map(\.scope) == [.codex, .grok])
+        #expect(layout.scope(at: layout.regions[1].startX) == .grok)
     }
 }

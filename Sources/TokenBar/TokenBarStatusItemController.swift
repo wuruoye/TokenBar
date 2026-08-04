@@ -65,6 +65,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.model.updateBackgroundRefreshInterval(settings.backgroundRefreshDuration)
         self.model.updateStatisticsTimeZone(settings.statisticsTimeZone)
         self.model.updateQuotaRefreshEnabled(settings.showsClaude, for: .claude)
+        self.model.updateQuotaRefreshEnabled(settings.showsGrok, for: .grok)
         self.rebuildRootMenu()
         self.observeModel()
         self.observeScope()
@@ -106,7 +107,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             if let requestedScope {
                 self.model.scope = requestedScope
             }
-            if !self.settings.showsClaude {
+            if !self.visibleScopes.contains(self.model.scope) {
                 self.model.scope = .codex
             }
             self.rebuildRootMenu()
@@ -190,15 +191,24 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.updateStatusButton()
     }
 
+    private var visibleScopes: [DashboardScope] {
+        DashboardScope.visibleScopes(
+            showsClaude: self.settings.showsClaude,
+            showsGrok: self.settings.showsGrok)
+    }
+
     private func updateStatusButton() {
         guard let button = self.statusItem.button else { return }
         let codex = self.statusValues(for: .codex)
         let claude = self.settings.showsClaude ? self.statusValues(for: .claude) : nil
+        let grok = self.settings.showsGrok ? self.statusValues(for: .grok) : nil
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
             claudeToday: claude?.today,
-            claudeWeekly: claude?.weekly)
+            claudeWeekly: claude?.weekly,
+            grokToday: grok?.today,
+            grokWeekly: grok?.weekly)
         self.statusLabelLayout = layout
         button.image = layout.image
 
@@ -213,6 +223,12 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 "Claude Code · Today: \(claude.today) tokens · Weekly: \(claude.weekly) left")
             accessibilityLabels.append(
                 "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.")
+        }
+        if let grok {
+            toolTips.append(
+                "Grok Build · Today: \(grok.today) tokens · Weekly: \(grok.weekly) left")
+            accessibilityLabels.append(
+                "Grok Build. Today, \(grok.today) tokens. Weekly quota, \(grok.weekly) remaining.")
         }
         button.toolTip = toolTips.joined(separator: "\n")
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
@@ -236,14 +252,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             return nil
         }
 
-        let imageX: CGFloat = switch (platform, layout.claudeBoundaryX) {
-        case (.codex, let boundary?):
-            boundary / 2
-        case (.claude, let boundary?):
-            (boundary + image.size.width) / 2
-        default:
-            image.size.width / 2
-        }
+        let imageX = layout.centerX(for: platform) ?? image.size.width / 2
         let imageMinX = button.bounds.midX - image.size.width / 2
         let buttonPoint = CGPoint(x: imageMinX + imageX, y: button.bounds.midY)
         let windowPoint = button.convert(buttonPoint, to: nil)
@@ -251,7 +260,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func scopeForCurrentStatusClick() -> DashboardScope? {
-        guard self.settings.showsClaude,
+        guard self.visibleScopes.count > 1,
               let event = NSApp.currentEvent,
               event.type == .leftMouseDown || event.type == .leftMouseUp,
               let button = self.statusItem.button,
@@ -307,6 +316,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.refreshInterval
             _ = self.settings.statisticsTimeZone
             _ = self.settings.showsClaude
+            _ = self.settings.showsGrok
             _ = self.settings.showsFullRequestContentOnHover
         } onChange: { [weak self] in
             Task { @MainActor in
@@ -326,7 +336,15 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                         await self?.model.refreshQuota(for: .claude)
                     }
                 }
-                if !self.settings.showsClaude, self.model.scope == .claude {
+                let grokQuotaSettingChanged = self.model.updateQuotaRefreshEnabled(
+                    self.settings.showsGrok,
+                    for: .grok)
+                if grokQuotaSettingChanged, self.settings.showsGrok {
+                    Task { @MainActor [weak self] in
+                        await self?.model.refreshQuota(for: .grok)
+                    }
+                }
+                if !self.visibleScopes.contains(self.model.scope) {
                     self.model.scope = .codex
                 }
                 self.updateStatusButton()
@@ -383,10 +401,12 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
         let accentColor = self.settings.theme.color
         let headerHeight = DashboardOverviewView.headerHeight(
-            showsClaude: self.settings.showsClaude)
+            showsClaude: self.settings.showsClaude,
+            showsGrok: self.settings.showsGrok)
         let header = DashboardHeaderView(
             model: self.model,
             showsClaude: self.settings.showsClaude,
+            showsGrok: self.settings.showsGrok,
             accentColor: accentColor,
             onSelectScope: { [weak self] scope in
                 self?.selectScope(scope)
@@ -1019,12 +1039,21 @@ private struct MenuActivitySummaryView: View {
 
 @MainActor
 struct StatusLabelLayout {
+    struct Region {
+        let scope: DashboardScope
+        let startX: CGFloat
+        let centerX: CGFloat
+    }
+
     let image: NSImage
-    let claudeBoundaryX: CGFloat?
+    let regions: [Region]
 
     func scope(at imageX: CGFloat) -> DashboardScope {
-        guard let claudeBoundaryX else { return .codex }
-        return imageX < claudeBoundaryX ? .codex : .claude
+        self.regions.last(where: { imageX >= $0.startX })?.scope ?? .codex
+    }
+
+    func centerX(for platform: TokenPlatform) -> CGFloat? {
+        self.regions.first(where: { $0.scope.platform == platform })?.centerX
     }
 }
 
@@ -1034,49 +1063,58 @@ enum StatusLabelRenderer {
         codexToday: String,
         codexWeekly: String,
         claudeToday: String? = nil,
-        claudeWeekly: String? = nil) -> StatusLabelLayout
+        claudeWeekly: String? = nil,
+        grokToday: String? = nil,
+        grokWeekly: String? = nil) -> StatusLabelLayout
     {
-        let codexImage = self.image(
-            platform: .codex,
-            today: codexToday,
-            weekly: codexWeekly)
-        guard let claudeToday, let claudeWeekly else {
-            return StatusLabelLayout(image: codexImage, claudeBoundaryX: nil)
+        var values: [(scope: DashboardScope, today: String, weekly: String)] = [
+            (.codex, codexToday, codexWeekly),
+        ]
+        if let claudeToday, let claudeWeekly {
+            values.append((.claude, claudeToday, claudeWeekly))
         }
-
-        let claudeImage = self.image(
-            platform: .claude,
-            today: claudeToday,
-            weekly: claudeWeekly)
+        if let grokToday, let grokWeekly {
+            values.append((.grok, grokToday, grokWeekly))
+        }
+        let images = values.map { value in
+            self.image(
+                platform: value.scope.platform,
+                today: value.today,
+                weekly: value.weekly)
+        }
         let gap: CGFloat = 7
         let size = NSSize(
-            width: codexImage.size.width + gap + claudeImage.size.width,
-            height: max(codexImage.size.height, claudeImage.size.height))
+            width: images.map(\.size.width).reduce(0, +)
+                + gap * CGFloat(max(0, images.count - 1)),
+            height: images.map(\.size.height).max() ?? 20)
         let image = NSImage(size: size, flipped: false) { _ in
-            codexImage.draw(
-                in: NSRect(
-                    x: 0,
-                    y: floor((size.height - codexImage.size.height) / 2),
-                    width: codexImage.size.width,
-                    height: codexImage.size.height),
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1)
-            claudeImage.draw(
-                in: NSRect(
-                    x: codexImage.size.width + gap,
-                    y: floor((size.height - claudeImage.size.height) / 2),
-                    width: claudeImage.size.width,
-                    height: claudeImage.size.height),
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1)
+            var imageX: CGFloat = 0
+            for providerImage in images {
+                providerImage.draw(
+                    in: NSRect(
+                        x: imageX,
+                        y: floor((size.height - providerImage.size.height) / 2),
+                        width: providerImage.size.width,
+                        height: providerImage.size.height),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1)
+                imageX += providerImage.size.width + gap
+            }
             return true
         }
         image.isTemplate = true
-        return StatusLabelLayout(
-            image: image,
-            claudeBoundaryX: codexImage.size.width + gap / 2)
+        var regions: [StatusLabelLayout.Region] = []
+        var imageX: CGFloat = 0
+        for (index, value) in values.enumerated() {
+            let providerImage = images[index]
+            regions.append(StatusLabelLayout.Region(
+                scope: value.scope,
+                startX: index == 0 ? 0 : imageX - gap / 2,
+                centerX: imageX + providerImage.size.width / 2))
+            imageX += providerImage.size.width + gap
+        }
+        return StatusLabelLayout(image: image, regions: regions)
     }
 
     static func image(
@@ -1152,6 +1190,17 @@ enum PlatformStatusIcon {
     static func image(for platform: TokenPlatform) -> NSImage? {
         if let cached = self.cache[platform] {
             return cached
+        }
+        if platform == .grok,
+           let symbol = NSImage(
+               systemSymbolName: "xmark",
+               accessibilityDescription: "Grok")?
+               .withSymbolConfiguration(.init(pointSize: 14, weight: .bold))
+        {
+            symbol.size = self.size
+            symbol.isTemplate = true
+            self.cache[platform] = symbol
+            return symbol
         }
         guard let resourceName = self.resourceName(for: platform),
               let url = self.resourceBundle.url(

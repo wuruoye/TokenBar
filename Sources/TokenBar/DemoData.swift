@@ -54,6 +54,25 @@ struct DemoClaudeQuotaProvider: QuotaProviding {
     }
 }
 
+struct DemoGrokQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.grok
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        let now = Date()
+        let object: [String: Any] = [
+            "weekly": [
+                "usedPercent": 28,
+                "windowMinutes": 10_080,
+                "resetsAt": now.addingTimeInterval(4.4 * 86_400).timeIntervalSinceReferenceDate,
+            ],
+            "updatedAt": now.timeIntervalSinceReferenceDate,
+        ]
+        return try JSONDecoder().decode(
+            QuotaSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object))
+    }
+}
+
 struct DemoActivityProvider: ActivityProviding {
     func fetchActivity(
         sinceWeeklyResetAt: Date?,
@@ -96,9 +115,10 @@ struct DemoActivityProvider: ActivityProviding {
         var todayByPlatform: [TokenPlatform: DemoTokenCounter] = [
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
+            .grok: DemoTokenCounter(),
         ]
-        var requestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
-        var sessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var requestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var sessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
         var requestCount = 0
         for (sessionIndex, prompt) in prompts.enumerated() {
             let platform = sessionIndex.isMultiple(of: 2)
@@ -220,22 +240,24 @@ struct DemoActivityProvider: ActivityProviding {
         formatter.dateFormat = "yyyy-MM-dd"
         let calendar = Calendar(identifier: .gregorian)
         var days: [[String: Any]] = []
-        var sourceDays: [TokenPlatform: [[String: Any]]] = [.codex: [], .claude: []]
+        var sourceDays: [TokenPlatform: [[String: Any]]] = [.codex: [], .claude: [], .grok: []]
         var range = DemoTokenCounter()
         var rangeByPlatform: [TokenPlatform: DemoTokenCounter] = [
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
+            .grok: DemoTokenCounter(),
         ]
         var rangeRequestCount = 0
         var rangeSessionCount = 0
-        var rangeRequestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
-        var rangeSessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var rangeRequestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var rangeSessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
         var weeklyByPlatform: [TokenPlatform: DemoTokenCounter] = [
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
+            .grok: DemoTokenCounter(),
         ]
-        var weeklyRequestCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
-        var weeklySessionCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0]
+        var weeklyRequestCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var weeklySessionCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
         for offset in (0 ..< 30).reversed() {
             let date = calendar.date(byAdding: .day, value: -offset, to: now) ?? now
             let wave = Int64((29 - offset) % 7)
@@ -342,10 +364,15 @@ struct DemoActivityProvider: ActivityProviding {
         }
 
         var sources: [[String: Any]] = []
-        for platform in [TokenPlatform.codex, .claude] {
+        for platform in [TokenPlatform.codex, .claude, .grok] {
             let platformToday = todayByPlatform[platform] ?? DemoTokenCounter()
             let platformRange = rangeByPlatform[platform] ?? DemoTokenCounter()
-            let averageTPS = platform == .codex ? 31.2 : 23.4
+            let averageTPS = switch platform {
+            case .codex: 31.2
+            case .claude: 23.4
+            case .grok: 28.7
+            default: 0.0
+            }
             var source: [String: Any] = [
                 "platform": platform.rawValue,
                 "today": [
@@ -383,7 +410,7 @@ struct DemoActivityProvider: ActivityProviding {
         }
 
         let object: [String: Any] = [
-            "schemaVersion": 7,
+            "schemaVersion": 8,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [
@@ -497,15 +524,21 @@ enum DemoPreviewRenderer {
             model.scope = scope
         }
         let showsClaude = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_CLAUDE"] != "0"
-        if !showsClaude {
+        let showsGrok = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_GROK"] != "0"
+        let visibleScopes = DashboardScope.visibleScopes(
+            showsClaude: showsClaude,
+            showsGrok: showsGrok)
+        if !visibleScopes.contains(model.scope) {
             model.scope = .codex
         }
         let height = DashboardSummaryView.preferredHeight(
             quota: model.quotaState(for: model.scope.platform).value,
-            showsClaude: showsClaude)
+            showsClaude: showsClaude,
+            showsGrok: showsGrok)
         let content = DashboardSummaryView(
             model: model,
             showsClaude: showsClaude,
+            showsGrok: showsGrok,
             accentColor: .purple)
             .frame(width: 384, height: height, alignment: .top)
             .background(Color.white)

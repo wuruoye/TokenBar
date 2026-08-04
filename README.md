@@ -5,7 +5,7 @@
 <h1 align="center">TokenBar</h1>
 
 <p align="center">
-  Codex and Claude Code quota and token activity, at a glance in your macOS menu bar.
+  Codex, Claude Code, and Grok Build quota and token activity, at a glance in your macOS menu bar.
 </p>
 
 <p align="center">
@@ -19,23 +19,23 @@
   <img src="docs/images/dashboard.png" width="460" alt="TokenBar dashboard showing Codex quota, today's token usage, weekly-reset totals, and recent activity">
 </p>
 
-TokenBar is a native, standalone macOS menu bar app for Codex and Claude Code. It combines each platform's live quota windows with local token accounting, cost estimates, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
+TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and Grok Build. It combines each platform's quota windows with local token accounting, costs, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
 
-> TokenBar is an independent project and is not affiliated with or endorsed by OpenAI.
+> TokenBar is an independent project and is not affiliated with or endorsed by OpenAI, Anthropic, or xAI.
 
 ## Highlights
 
-- See one compact menu bar item with separate Codex-icon `T/W` and Claude-icon `T/W` sections.
-- Click either section to open TokenBar directly on that platform's tab.
-- Switch between the **Codex** and **Claude** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
-- Hide or restore the Claude section and tab immediately from Settings, without restarting TokenBar.
-- Track Codex and Claude quota windows independently without mixing percentages or reset cycles.
+- See one compact menu bar item with separate Codex, Claude, and Grok `T/W` sections.
+- Click a provider section to open TokenBar directly on that platform's tab.
+- Switch between the **Codex**, **Claude**, and **Grok** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
+- Hide or restore the Claude and Grok sections and tabs immediately from Settings, without restarting TokenBar.
+- Track every provider's quota window independently without mixing percentages or reset cycles.
 - Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
 - Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
 - Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
-- Browse the selected platform's recent sessions, using Codex-generated titles when available, or click one to open the existing matching thread directly in the desktop app. Claude links reuse Claude Desktop's indexed local-session mapping and never import or duplicate the CLI transcript; an unindexed CLI session falls back to Claude's Local Sessions page.
+- Browse the selected platform's recent sessions, using provider-generated titles when available. Codex and Claude sessions open in their desktop apps; Grok sessions resume in Terminal from their original workspace.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
@@ -57,6 +57,7 @@ _The screenshots use generated demo data and contain no real account or session 
 - At least one supported client:
   - [Codex CLI](https://developers.openai.com/codex/cli/) installed and authenticated. Running `codex` in Terminal should work before starting TokenBar; `CODEX_CLI_PATH` can point to a nonstandard installation.
   - Claude Code installed, used at least once, and authenticated. TokenBar reads its local projects from `~/.claude/projects` (or `CLAUDE_CONFIG_DIR`) and its existing OAuth credential for quota.
+  - [Grok Build](https://x.ai/cli) installed, used at least once, and authenticated. TokenBar reads durable local sessions and the latest CLI-written quota snapshot from `~/.grok` (or `GROK_HOME`).
 - To build from source: Apple Swift 6.2 command-line tools and a recent stable Rust toolchain with Cargo.
 
 TokenBar is currently distributed from source. There is no prebuilt, notarized GitHub release yet.
@@ -86,10 +87,10 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 ## Usage
 
 1. Launch `TokenBar.app`. TokenBar appears only in the menu bar; it has no Dock icon.
-2. Click the Codex-icon `T/W` section to open the **Codex** tab, or the Claude-icon `T/W` section to open the **Claude** tab. Opening the menu refreshes local activity and any quota data older than one minute.
-3. Use the two tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
+2. Click a provider's `T/W` section to open its matching tab. Opening the menu refreshes local activity and any quota data older than one minute.
+3. Use the three tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
 4. Hover **Activity** for the daily chart and per-model breakdowns.
-5. Click a recent session to open it in the matching Codex or Claude desktop app. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
+5. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
 6. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
 7. Use **Copy Session** or click a request row to copy its stable locator.
 
@@ -103,15 +104,15 @@ The default background refresh interval is five minutes. Opening the menu always
 
 ## How counting works
 
-TokenBar normalizes Codex and Claude Code into the same three activity levels:
+TokenBar normalizes Codex, Claude Code, and Grok Build into the same three activity levels:
 
 1. **Session** — a root conversation within one platform. TokenBar prefers the Codex-generated title when available and otherwise falls back to the first useful prompt.
 2. **Turn** — the interval beginning with a root user prompt and ending before the next root user prompt. Main-thread and subagent requests launched for that prompt are aggregated into the turn, including subagent work that finishes later.
 3. **Physical request** — the original main or subagent activity recorded in a specific client session log. These rows retain their own platform, model, token, cache, cost, duration, prompt/output detail, and copy locator.
 
-Platform is part of every aggregation and identity key, so a Codex session and a Claude session with the same raw ID remain separate. Claude Code's repeated streaming snapshots are deduplicated by message/request identity before totals are calculated.
+Platform is part of every aggregation and identity key, so sessions from different clients with the same raw ID remain separate. Claude Code's repeated streaming snapshots are deduplicated by message/request identity before totals are calculated.
 
-Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex reports reasoning tokens as part of output tokens; TokenBar normalizes that breakdown before aggregation so reasoning is counted and priced once.
+Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex and Grok report overlapping total fields; TokenBar converts them into disjoint buckets before aggregation so cache and reasoning are counted once. Complete Grok turn costs are provider-reported; partial or incomplete Grok costs stay unknown rather than appearing as zero-cost usage.
 
 `Avg tok/s` divides generated output plus reasoning tokens by the summed active duration of the underlying model requests. Tool execution, polling, and other time between model requests stay in the displayed turn duration but are excluded from TPS. TokenBar omits TPS when a local transcript does not expose enough request-boundary timing to calculate it reliably.
 
@@ -129,12 +130,14 @@ Recognized OpenAI model IDs retain the estimate behind custom Codex gateways, an
 
 Fast pricing never changes raw token/cache counts. Quota percentages come from Codex and are not multiplied again; quota and local token totals measure different things and should not be expected to map one-to-one.
 
+
 ## Privacy
 
 TokenBar is designed to keep session content local:
 
 - The Rust helper reads Codex JSONL logs under `~/.codex/sessions` and `~/.codex/archived_sessions`, or the equivalent directory selected by `CODEX_HOME`.
 - It reads Claude Code JSONL logs under `~/.claude/projects`, or the equivalent directory selected by `CLAUDE_CONFIG_DIR`.
+- It reads Grok Build's `summary.json` and durable `updates.jsonl` files under `~/.grok/sessions`, or the equivalent directory selected by `GROK_HOME`.
 - Codex-generated titles are read from `session_index.jsonl` in the same Codex home directory.
 - Local activity parsing, turn attribution, and pricing do not upload session content, fetch remote pricing, or read a Tokscale runtime cache.
 - Full prompt and output text is read lazily when a request detail menu opens and is retained in memory only for the current process.
@@ -142,7 +145,7 @@ TokenBar is designed to keep session content local:
 - The last successful provider quota snapshots are stored at `~/Library/Application Support/TokenBar/quota-snapshots.json`, also with owner-only permissions, so a temporary provider rate limit does not blank the menu.
 - TokenBar contains no telemetry or analytics integration.
 
-Quota is the intentional network-facing part of the app. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when that endpoint rate-limits a refresh, TokenBar can use Claude Desktop's recent local usage sample. TokenBar does not refresh, rewrite, or copy either provider's credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
+Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when that endpoint rate-limits a refresh, TokenBar can use Claude Desktop's recent local usage sample. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
 
 ## Settings
 
@@ -150,6 +153,7 @@ Open **Settings** with `Command-,` to configure:
 
 - **Theme color:** System, Blue, Purple, Green, Orange, or Pink.
 - **Show Claude Code:** add or remove the Claude `T/W` section and Claude tab immediately. When hidden, TokenBar skips Claude quota refreshes and does not read the Claude credential from disk or the macOS Keychain.
+- **Show Grok Build:** add or remove the Grok `T/W` section and Grok tab immediately. When hidden, TokenBar skips Grok quota-log refreshes.
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
@@ -158,7 +162,7 @@ Open **Settings** with `Command-,` to configure:
 
 ## Development
 
-No sibling repository checkout is required. The Swift package contains the menu bar UI and independent Codex/Claude quota clients; `Helper` contains the platform adapters and shared Rust activity aggregator.
+No sibling repository checkout is required. The Swift package contains the menu bar UI and independent provider quota clients; `Helper` contains the Codex, Claude, and Grok adapters plus the shared Rust activity aggregator.
 
 ### Build and run
 
@@ -258,7 +262,7 @@ TokenBar does not embed Sparkle yet, so GitHub Releases are the update channel f
 ```text
 Sources/TokenBar/             AppKit/SwiftUI menu bar UI
 Sources/TokenBarCore/         Models, quota client, caching, and presentation logic
-Helper/                       Codex/Claude parsers and shared activity aggregator
+Helper/                       Codex/Claude/Grok parsers and shared activity aggregator
 Tests/TokenBarCoreTests/      Swift behavior and fixture tests
 Resources/                    Bundle metadata and app icon assets
 Scripts/package_app.sh        Build, embed, sign, and verify TokenBar.app
@@ -281,7 +285,7 @@ This is intentional when Codex returns no 5-hour window. Weekly quota can still 
 
 ### No local activity appears
 
-Confirm that the client has created JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, or `~/.claude/projects`. If you use a custom home, launch TokenBar with the same `CODEX_HOME` or `CLAUDE_CONFIG_DIR` environment.
+Confirm that the client has created JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.claude/projects`, or `~/.grok/sessions`. If you use a custom home, launch TokenBar with the matching `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or `GROK_HOME` environment.
 
 ### An extra reset count is missing
 
@@ -303,8 +307,9 @@ Run `cargo build --manifest-path Helper/Cargo.toml` before `swift run TokenBar`,
 
 - [CodexBar](https://github.com/steipete/CodexBar) inspired TokenBar's focused native menu bar experience; its quota protocol and reset-celebration behavior informed TokenBar's standalone integration.
 - [Tokscale](https://github.com/junhoyeo/tokscale) established many of the local Codex and Claude Code accounting, parsing, quota, and compatibility semantics used by TokenBar. Adapted portions are used under the MIT License; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- [Grok Build](https://github.com/xai-org/grok-build) publishes the durable session-update and usage contracts used by TokenBar's independent Grok adapter. The reference implementation is available under Apache-2.0.
 
-TokenBar is a standalone implementation: neither project is a build-time or runtime dependency. Adapted portions are retained under their MIT licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+TokenBar is a standalone implementation: none of these projects is a build-time or runtime dependency. Adapted MIT-licensed portions are retained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 

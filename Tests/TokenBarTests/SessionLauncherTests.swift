@@ -107,6 +107,31 @@ struct SessionLauncherTests {
                 == "claude://claude.ai/claude-code-desktop/local_existing")
     }
 
+    @Test("opening Grok resumes the local session in its workspace")
+    func opensGrokSession() throws {
+        var launchedSession: SessionSummary?
+        let launcher = SessionLauncher(
+            launchGrokSession: {
+                launchedSession = $0
+                return true
+            })
+        let session = SessionSummary(
+            id: "019f9344-f590-78d0-868f-903feede981f",
+            workspaceLabel: "TokenBar",
+            startedAtMs: 0,
+            endedAtMs: 1,
+            tokens: .zero,
+            costUsd: 0,
+            models: [],
+            requests: [],
+            workspacePath: "/tmp/TokenBar",
+            platform: .grok)
+
+        try launcher.open(session)
+
+        #expect(launchedSession == session)
+    }
+
     private func session(
         id: String,
         platform: TokenPlatform) -> SessionSummary

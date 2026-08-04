@@ -12,10 +12,11 @@ use crate::usage::{
 
 pub mod codex;
 pub mod claude;
+pub mod grok;
 pub mod pricing;
 pub mod usage;
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -675,11 +676,17 @@ pub fn build_snapshot_with_platform_resets(
         .iter()
         .map(|message| message.client.clone())
         .collect::<BTreeSet<_>>();
-    let mut platforms = vec!["codex".to_string(), "claude".to_string()];
+    let mut platforms = vec![
+        "codex".to_string(),
+        "claude".to_string(),
+        "grok".to_string(),
+    ];
     platforms.extend(
         discovered_platforms
             .into_iter()
-            .filter(|platform| platform != "codex" && platform != "claude"),
+            .filter(|platform| {
+                platform != "codex" && platform != "claude" && platform != "grok"
+            }),
     );
 
     let mut snapshot = build_snapshot_core(
@@ -2596,7 +2603,7 @@ mod tests {
             Some("Claude title")
         );
         assert_eq!(snapshot.today.session_count, 2);
-        assert_eq!(snapshot.sources.len(), 2);
+        assert_eq!(snapshot.sources.len(), 3);
         assert_eq!(
             snapshot
                 .sources
@@ -2619,6 +2626,17 @@ mod tests {
                 .input,
             200
         );
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .find(|source| source.platform == "grok")
+                .unwrap()
+                .today
+                .tokens
+                .total(),
+            0
+        );
     }
 
     #[test]
@@ -2627,7 +2645,7 @@ mod tests {
         let snapshot = build_snapshot(vec![], today, 123, "UTC".to_string(), 1).unwrap();
         let value: Value = serde_json::to_value(snapshot).unwrap();
 
-        assert_eq!(value["schemaVersion"], 7);
+        assert_eq!(value["schemaVersion"], SCHEMA_VERSION);
         assert_eq!(value["generatedAtMs"], 123);
         assert_eq!(value["today"]["requestCount"], 0);
         assert_eq!(value["today"]["tokens"]["cacheRead"], 0);

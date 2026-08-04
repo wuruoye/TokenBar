@@ -80,7 +80,7 @@ struct ActivityServiceTests {
         #expect(await runner.environments.last?["TZ"] == "UTC")
     }
 
-    @Test("passes independent Codex and Claude reset timestamps")
+    @Test("passes independent reset timestamps for all providers")
     func passesPlatformResetTimestamps() async throws {
         let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
         let service = ActivityService(
@@ -92,6 +92,7 @@ struct ActivityServiceTests {
             sinceWeeklyResetAtByPlatform: [
                 .codex: Date(timeIntervalSince1970: 1_720_000_000.125),
                 .claude: Date(timeIntervalSince1970: 1_730_000_000.5),
+                .grok: Date(timeIntervalSince1970: 1_740_000_000.75),
             ],
             statisticsTimeZone: .utc)
 
@@ -99,6 +100,7 @@ struct ActivityServiceTests {
             "--days", "30",
             "--weekly-reset-ms", "1720000000125",
             "--claude-weekly-reset-ms", "1730000000500",
+            "--grok-weekly-reset-ms", "1740000000750",
         ])
     }
 
