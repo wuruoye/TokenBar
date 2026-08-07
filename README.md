@@ -118,10 +118,10 @@ Token totals contain input, output, cache-read, cache-write, and reasoning bucke
 
 Codex records Fast mode as the `priority` service tier (`fast` is also accepted for older logs); `default` and `standard` are treated as Standard. When every service-tier snapshot in one physical session agrees, TokenBar applies that tier to the whole session, including usage written before the first snapshot. If a session switches tier, TokenBar follows the timeline from each snapshot and leaves any prefix before the first snapshot unknown. Subagents inherit the last tier from their replayed parent context without counting the parent's earlier tier history as their own. A turn containing both Fast and Standard physical requests is marked `MIXED`.
 
-`Cache×` is the cache reuse ratio:
+`Cache` is the percentage of prompt tokens served from the cache:
 
 ```text
-cache-read tokens / (input tokens + cache-write tokens)
+cache-read tokens / (input tokens + cache-read tokens + cache-write tokens) × 100%
 ```
 
 Costs prefixed with `~` are compatibility estimates based on pricing data maintained inside TokenBar, not provider invoices. Provider-reported costs, when present in the source data, remain authoritative. TokenBar reads only the non-sensitive `auth_mode` field from the active Codex home's `auth.json` to choose the Fast basis. ChatGPT subscription sessions follow Codex credit consumption—GPT-5.4 uses 2× and GPT-5.5/5.6 use 2.5×—while API Key sessions follow API Priority pricing, where GPT-5.6 uses 2×. The underlying dollar estimates still use standard API token rates, so subscription totals are best understood as credit-weighted compatibility estimates. See OpenAI's [Codex Fast mode documentation](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode), [pricing table](https://developers.openai.com/api/docs/pricing), and [Priority Processing guide](https://developers.openai.com/api/docs/guides/priority-processing). A model without an explicitly verified Fast multiplier keeps its standard estimate instead of receiving a guessed multiplier.

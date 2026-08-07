@@ -11,7 +11,7 @@ struct MenuRowPresentationTests {
         #expect(Int64(1_250_000_000).statusBarCompactCount == "1B")
     }
 
-    @Test("Session and request details keep only total tokens and Tokscale cache reuse")
+    @Test("Session and request details show cache as a percentage")
     func tokenDetails() {
         let tokens = TokenBreakdown(
             input: 12_900,
@@ -20,9 +20,26 @@ struct MenuRowPresentationTests {
             cacheWrite: 1_500,
             reasoning: 2_100)
 
-        #expect(tokens.sessionMenuDetail == "47K total · Cache× 1.9x")
-        #expect(tokens.requestMenuDetail == "47K total · Cache× 1.9x")
-        #expect(tokens.cacheReuseText == "1.9x")
+        #expect(tokens.sessionMenuDetail == "47K total · Cache 65.0%")
+        #expect(tokens.requestMenuDetail == "47K total · Cache 65.0%")
+        #expect(tokens.cachePercentageText == "65.0%")
+    }
+
+    @Test("Cache percentage handles empty and fully cached input")
+    func cachePercentageBoundaries() {
+        #expect(TokenBreakdown.zero.cachePercentageText == "—")
+        #expect(TokenBreakdown(
+            input: 10,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0).cachePercentageText == "0.0%")
+        #expect(TokenBreakdown(
+            input: 0,
+            output: 0,
+            cacheRead: 10,
+            cacheWrite: 0,
+            reasoning: 0).cachePercentageText == "100.0%")
     }
 
     @Test("Subagent request title falls back to output")

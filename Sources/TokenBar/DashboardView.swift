@@ -560,7 +560,7 @@ private struct WeeklyResetActivitySection: View {
             if let totals = self.summary?.totals {
                 HStack {
                     Text(
-                        "Cache× \(totals.tokens.cacheReuseText) · "
+                        "Cache \(totals.tokens.cachePercentageText) · "
                             + self.averageTPSText(totals)
                             + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
                     Spacer(minLength: 6)
@@ -675,7 +675,7 @@ struct ActivityTotalsBreakdown: View {
 
             HStack {
                 Text(
-                    "Cache× \(self.totals.tokens.cacheReuseText) · "
+                    "Cache \(self.totals.tokens.cachePercentageText) · "
                         + self.averageTPSSuffix
                         + "\(self.totals.sessionCount) sessions · \(self.totals.requestCount) turns")
                 Spacer()
@@ -798,7 +798,7 @@ struct ActivitySummarySection: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Activity")
                     .font(.system(size: 12, weight: .semibold))
-                Text("30 days · Cache× \(self.totalCacheReuseText)")
+                Text("30 days · Cache \(self.totalCachePercentageText)")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -876,7 +876,7 @@ struct ActivitySummarySection: View {
         self.days.reduce(0) { $0 + $1.requestCount }
     }
 
-    private var totalCacheReuseText: String {
+    private var totalCachePercentageText: String {
         self.days.reduce(TokenBreakdown.zero) { total, day in
             TokenBreakdown(
                 input: total.input.saturatingAdd(day.tokens.input),
@@ -884,7 +884,7 @@ struct ActivitySummarySection: View {
                 cacheRead: total.cacheRead.saturatingAdd(day.tokens.cacheRead),
                 cacheWrite: total.cacheWrite.saturatingAdd(day.tokens.cacheWrite),
                 reasoning: total.reasoning.saturatingAdd(day.tokens.reasoning))
-        }.cacheReuseText
+        }.cachePercentageText
     }
 
     private var averageTokens: Int64 {

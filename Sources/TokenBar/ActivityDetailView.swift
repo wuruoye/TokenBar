@@ -177,7 +177,7 @@ struct ActivityDetailView: View {
                         .font(.system(size: 13, weight: .semibold))
                     Text(
                         "\(day.sessionCount) sessions · \(day.requestCount) turns · "
-                            + "Cache× \(day.tokens.cacheReuseText)")
+                            + "Cache \(day.tokens.cachePercentageText)")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
@@ -260,7 +260,7 @@ private struct ActivityModelRow: View {
                 Text(self.usage.tokens.total.compactCount)
                     .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                Text("Cache× \(self.usage.tokens.cacheReuseText)")
+                Text("Cache \(self.usage.tokens.cachePercentageText)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                 Text(self.usage.costUsd.costText(tokenTotal: self.usage.tokens.total))

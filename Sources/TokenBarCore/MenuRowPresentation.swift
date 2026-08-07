@@ -35,19 +35,20 @@ public extension TokenBreakdown {
         self.compactMenuDetail
     }
 
-    var cacheReuseText: String {
-        let paid = self.input.saturatingAddForPresentation(self.cacheWrite)
-        if paid == 0 {
-            return self.cacheRead > 0 ? "∞" : "—"
-        }
+    var cachePercentageText: String {
+        let cacheRead = Double(max(0, self.cacheRead))
+        let promptTokens = Double(max(0, self.input))
+            + cacheRead
+            + Double(max(0, self.cacheWrite))
+        guard promptTokens > 0 else { return "—" }
         return String(
-            format: "%.1fx",
+            format: "%.1f%%",
             locale: Locale(identifier: "en_US_POSIX"),
-            Double(self.cacheRead) / Double(paid))
+            cacheRead / promptTokens * 100)
     }
 
     private var compactMenuDetail: String {
-        "\(self.total.tokscaleCount) total · Cache× \(self.cacheReuseText)"
+        "\(self.total.tokscaleCount) total · Cache \(self.cachePercentageText)"
     }
 }
 
@@ -262,12 +263,6 @@ private extension Int64 {
             return "\(self / 1_000)K"
         }
         return "\(self)"
-    }
-
-    func saturatingAddForPresentation(_ other: Int64) -> Int64 {
-        let (value, overflow) = self.addingReportingOverflow(other)
-        guard overflow else { return value }
-        return other >= 0 ? .max : .min
     }
 }
 
