@@ -1,7 +1,69 @@
-use chrono::TimeZone;
+use std::str::FromStr;
+
+use chrono::{Local, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 const CONTENT_PREVIEW_MAX_CHARS: usize = 160;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatisticsTimeZone {
+    Utc,
+    #[default]
+    Local,
+}
+
+impl StatisticsTimeZone {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Utc => "utc",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn date_at_ms(self, timestamp_ms: i64) -> Option<NaiveDate> {
+        let timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_ms)?;
+        Some(match self {
+            Self::Utc => timestamp.date_naive(),
+            Self::Local => timestamp.with_timezone(&Local).date_naive(),
+        })
+    }
+
+    pub fn timezone_identifier(self, timestamp_ms: i64) -> String {
+        match self {
+            Self::Utc => "UTC".to_string(),
+            Self::Local => iana_time_zone::get_timezone().unwrap_or_else(|_| {
+                Local
+                    .timestamp_millis_opt(timestamp_ms)
+                    .single()
+                    .map(|timestamp| timestamp.offset().to_string())
+                    .unwrap_or_else(|| "local".to_string())
+            }),
+        }
+    }
+
+    pub fn normalize_message_dates(self, messages: &mut [UnifiedMessage]) -> Result<(), String> {
+        for message in messages {
+            let date = self
+                .date_at_ms(message.timestamp)
+                .ok_or_else(|| "activity timestamp is outside the supported range".to_string())?;
+            message.date = date.format("%Y-%m-%d").to_string();
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for StatisticsTimeZone {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "utc" => Ok(Self::Utc),
+            "local" => Ok(Self::Local),
+            _ => Err("statistics timezone must be utc or local".to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBreakdown {
@@ -359,10 +421,10 @@ fn strip_date_snapshot(model_id: &str) -> Option<&str> {
 }
 
 fn timestamp_to_date(timestamp_ms: i64) -> String {
-    match chrono::Local.timestamp_millis_opt(timestamp_ms) {
-        chrono::LocalResult::Single(date_time) => date_time.format("%Y-%m-%d").to_string(),
-        _ => String::new(),
-    }
+    StatisticsTimeZone::Local
+        .date_at_ms(timestamp_ms)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -377,6 +439,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(tokens.total(), i64::MAX);
+    }
+
+    #[test]
+    fn utc_statistics_timezone_controls_dates_and_identifier() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            StatisticsTimeZone::Utc.date_at_ms(timestamp),
+            NaiveDate::from_ymd_opt(2026, 7, 1)
+        );
+        assert_eq!(
+            StatisticsTimeZone::Utc.timezone_identifier(timestamp),
+            "UTC"
+        );
+        assert_eq!(
+            "utc".parse::<StatisticsTimeZone>().unwrap(),
+            StatisticsTimeZone::Utc
+        );
+        assert!("pacific".parse::<StatisticsTimeZone>().is_err());
     }
 
     #[test]

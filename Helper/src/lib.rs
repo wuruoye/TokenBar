@@ -16,6 +16,8 @@ pub mod grok;
 pub mod pricing;
 pub mod usage;
 
+pub use usage::StatisticsTimeZone;
+
 pub const SCHEMA_VERSION: u32 = 8;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;

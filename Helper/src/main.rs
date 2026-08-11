@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use chrono::{Days, Local};
+use chrono::{Days, Utc};
 use tokenbar_helper::claude::{
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
@@ -20,15 +20,17 @@ use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis}
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
+    StatisticsTimeZone,
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
     days: usize,
     home_dir: Option<PathBuf>,
+    statistics_timezone: StatisticsTimeZone,
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
     grok_weekly_reset_ms: Option<i64>,
@@ -39,6 +41,7 @@ impl Default for SnapshotConfig {
         Self {
             days: DEFAULT_DAYS,
             home_dir: None,
+            statistics_timezone: StatisticsTimeZone::Local,
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
             grok_weekly_reset_ms: None,
@@ -98,8 +101,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
-    let now = Local::now();
-    let today = now.date_naive();
+    let generated_at_ms = Utc::now().timestamp_millis();
+    let today = config
+        .statistics_timezone
+        .date_at_ms(generated_at_ms)
+        .ok_or("system clock is outside the supported range")?;
     let first_day = today
         .checked_sub_days(Days::new((config.days - 1) as u64))
         .ok_or("day range is too large")?;
@@ -108,11 +114,14 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         config.claude_weekly_reset_ms,
         config.grok_weekly_reset_ms,
     ]
-        .into_iter()
-        .flatten()
-        .filter_map(chrono::DateTime::from_timestamp_millis)
-        .map(|timestamp| timestamp.with_timezone(&Local).date_naive())
-        .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
+    .into_iter()
+    .flatten()
+    .filter_map(|timestamp| config.statistics_timezone.date_at_ms(timestamp))
+    .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
+    let parser_first_day = scan_first_day
+        .checked_sub_days(Days::new(1))
+        .unwrap_or(scan_first_day);
+    let parser_last_day = today.checked_add_days(Days::new(1)).unwrap_or(today);
     let session_index_path = codex_session_index_path(&config);
     let home_dir = config
         .home_dir
@@ -130,8 +139,8 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         LocalParseOptions {
             home_dir: home_dir.clone(),
             use_env_roots,
-            since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
-            until: Some(today.format("%Y-%m-%d").to_string()),
+            since: Some(parser_first_day.format("%Y-%m-%d").to_string()),
+            until: Some(parser_last_day.format("%Y-%m-%d").to_string()),
         },
         &pricing,
     )
@@ -152,8 +161,8 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         ClaudeParseOptions {
             home_dir: home_dir.clone(),
             use_env_roots,
-            since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
-            until: Some(today.format("%Y-%m-%d").to_string()),
+            since: Some(parser_first_day.format("%Y-%m-%d").to_string()),
+            until: Some(parser_last_day.format("%Y-%m-%d").to_string()),
         },
         &AnthropicPricing,
     )
@@ -162,16 +171,22 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let grok_messages = parse_local_grok_messages(GrokParseOptions {
         home_dir,
         use_env_roots,
-        since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
-        until: Some(today.format("%Y-%m-%d").to_string()),
+        since: Some(parser_first_day.format("%Y-%m-%d").to_string()),
+        until: Some(parser_last_day.format("%Y-%m-%d").to_string()),
     })
     .map_err(io::Error::other)?;
     session_titles.extend(load_grok_session_titles(&grok_messages));
     let mut messages = codex_messages;
     messages.extend(claude_messages);
     messages.extend(grok_messages);
+    config
+        .statistics_timezone
+        .normalize_message_dates(&mut messages)
+        .map_err(io::Error::other)?;
 
-    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| now.offset().to_string());
+    let timezone = config
+        .statistics_timezone
+        .timezone_identifier(generated_at_ms);
     let mut weekly_resets = std::collections::HashMap::new();
     if let Some(timestamp) = config.weekly_reset_ms {
         weekly_resets.insert("codex".to_string(), timestamp);
@@ -185,7 +200,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let snapshot = build_snapshot_with_platform_resets(
         messages,
         today,
-        now.timestamp_millis(),
+        generated_at_ms,
         timezone,
         config.days,
         &session_titles,
@@ -269,6 +284,15 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
             Some("--home-dir") => {
                 let value = args.next().ok_or("--home-dir requires a path")?;
                 config.home_dir = Some(PathBuf::from(value));
+            }
+            Some("--statistics-timezone") => {
+                let value = args
+                    .next()
+                    .ok_or("--statistics-timezone requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--statistics-timezone must be valid UTF-8")?;
+                config.statistics_timezone = value.parse()?;
             }
             Some("--weekly-reset-ms") => {
                 let value = args.next().ok_or("--weekly-reset-ms requires a value")?;
@@ -410,9 +434,27 @@ mod tests {
             Command::Snapshot(SnapshotConfig {
                 days: 7,
                 home_dir: Some(PathBuf::from("/tmp/home")),
+                statistics_timezone: StatisticsTimeZone::Local,
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_statistics_timezone() {
+        let config = parse_args([
+            OsString::from("--statistics-timezone"),
+            OsString::from("utc"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config,
+            Command::Snapshot(SnapshotConfig {
+                statistics_timezone: StatisticsTimeZone::Utc,
+                ..SnapshotConfig::default()
             })
         );
     }
