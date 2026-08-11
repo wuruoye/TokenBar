@@ -12,12 +12,10 @@ ExecStart=%h/.local/lib/tokenbar-sync/bin/tokenbar-sync-client upload
 UMask=0077
 
 NoNewPrivileges=true
-PrivateDevices=true
+# Capability-changing sandbox directives are intentionally omitted for
+# portability across unprivileged user managers.
 PrivateTmp=true
-ProtectClock=true
 ProtectControlGroups=true
-ProtectKernelLogs=true
-ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
 ProtectHome=read-only
