@@ -128,6 +128,12 @@ struct CodexResetCreditsClientTests {
             to: URL(string: "https://chatgpt.com:444/backend-api/login")!))
     }
 
+    @Test("sync transport can bypass ambient forward proxies")
+    func proxyBypass() {
+        let configuration = EphemeralHTTPTransport.configuration(bypassesProxy: true)
+        #expect(configuration.connectionProxyDictionary?.isEmpty == true)
+    }
+
     private static func makeCodexHome(lastRefresh: String) throws -> URL {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("tokenbar-auth-\(UUID().uuidString)", isDirectory: true)

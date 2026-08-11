@@ -406,6 +406,8 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             envelope = json_loads_strict(raw)
+            if isinstance(envelope, dict):
+                _redact_legacy_workspace_labels(envelope.get("snapshot"))
             validate_envelope(envelope, path_device_id=path_device_id)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
             message = str(error) if isinstance(error, ValidationError) else "request body is invalid JSON"
@@ -432,6 +434,21 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
                 "receivedAtMs": result.received_at_ms,
             },
         )
+
+
+def _redact_legacy_workspace_labels(value: Any, *, _depth: int = 0) -> None:
+    """Allow rolling protocol-v1 upgrades without retaining old project labels."""
+    if _depth > 100:
+        raise ValidationError("snapshot nesting exceeds 100 levels")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "workspaceLabel":
+                value[key] = None
+            else:
+                _redact_legacy_workspace_labels(child, _depth=_depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            _redact_legacy_workspace_labels(child, _depth=_depth + 1)
 
 
 def parse_bind(value: str) -> tuple[str, int]:

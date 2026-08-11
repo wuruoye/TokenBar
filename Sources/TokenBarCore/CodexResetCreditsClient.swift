@@ -326,16 +326,27 @@ private struct ResetCredit: Decodable {
 final class EphemeralHTTPTransport: TokenBarHTTPTransport, @unchecked Sendable {
     private let session: URLSession
 
-    init(allowsSameOriginRedirects: Bool = true) {
+    init(
+        allowsSameOriginRedirects: Bool = true,
+        bypassesProxy: Bool = false)
+    {
+        let configuration = Self.configuration(bypassesProxy: bypassesProxy)
+        let delegate = SameOriginRedirectDelegate(
+            allowsSameOriginRedirects: allowsSameOriginRedirects)
+        self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+    }
+
+    static func configuration(bypassesProxy: Bool) -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieStorage = nil
         configuration.httpShouldSetCookies = false
         configuration.urlCredentialStorage = nil
-        let delegate = SameOriginRedirectDelegate(
-            allowsSameOriginRedirects: allowsSameOriginRedirects)
-        self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        if bypassesProxy {
+            configuration.connectionProxyDictionary = [:]
+        }
+        return configuration
     }
 
     func response(for request: URLRequest) async throws -> TokenBarHTTPResponse {

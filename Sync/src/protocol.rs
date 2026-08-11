@@ -10,12 +10,13 @@ use crate::config::tokenbar_sync_device_name;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_DEPTH: usize = 100;
-const PRIVACY_NULL_FIELDS: [&str; 16] = [
+const PRIVACY_NULL_FIELDS: [&str; 17] = [
     "promptPreview",
     "outputPreview",
     "sessionPath",
     "title",
     "workspacePath",
+    "workspaceLabel",
     "promptText",
     "outputText",
     "rawPrompt",
@@ -359,7 +360,7 @@ mod tests {
         let session = &output["sessions"][0];
         assert!(session["title"].is_null());
         assert!(session["workspacePath"].is_null());
-        assert_eq!(session["workspaceLabel"], "repo");
+        assert!(session["workspaceLabel"].is_null());
         assert!(session.get("accessToken").is_none());
         assert!(session["futureAbsolutePath"].is_null());
         let request = &session["requests"][0];

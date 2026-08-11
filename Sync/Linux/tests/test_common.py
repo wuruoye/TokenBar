@@ -68,7 +68,7 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(clean["request"]["sessionPath"], None)
         self.assertEqual(clean["request"]["nested"][0]["workspacePath"], None)
         self.assertEqual(clean["request"]["nested"][0]["title"], None)
-        self.assertEqual(clean["workspaceLabel"], "safe-label")
+        self.assertIsNone(clean["workspaceLabel"])
         self.assertNotIn("api_key", clean)
         self.assertNotIn("authToken", clean)
         self.assertEqual(clean["tokens"]["output"], 42)
@@ -136,6 +136,77 @@ class CommonTests(unittest.TestCase):
         value["snapshot"]["today"]["requestCount"] = -1
         with self.assertRaisesRegex(ValidationError, "must be nonnegative"):
             validate_envelope(value, path_device_id=DEVICE_ID)
+
+        invalid_cases = []
+
+        empty_session_id = envelope()
+        empty_session_id["snapshot"]["sessions"] = [{
+            "id": "",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "models": [],
+            "requests": [],
+        }]
+        invalid_cases.append(empty_session_id)
+
+        invalid_agent_type = envelope()
+        invalid_agent_type["snapshot"]["sessions"] = [{
+            "id": "session",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "models": [],
+            "requests": [{
+                "id": "request",
+                "sessionId": "session",
+                "physicalSessionId": "physical",
+                "isSubagent": False,
+                "agent": 1,
+                "model": "",
+                "provider": "",
+                "startedAtMs": 1,
+                "endedAtMs": 2,
+                "tokens": zero_tokens(),
+                "costUsd": 0,
+                "costSource": "unknown",
+            }],
+        }]
+        invalid_cases.append(invalid_agent_type)
+
+        duplicate_dates = envelope()
+        day = {
+            "date": "2026-08-11",
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "requestCount": 0,
+            "sessionCount": 0,
+            "models": [],
+        }
+        duplicate_dates["snapshot"]["days"] = [day, dict(day)]
+        invalid_cases.append(duplicate_dates)
+
+        future_range = envelope()
+        future_range["snapshot"]["weeklySinceReset"] = {
+            "startedAtMs": future_range["generatedAtMs"] + 1,
+            "totals": zero_totals(),
+        }
+        invalid_cases.append(future_range)
+
+        wide_schema = envelope()
+        wide_schema["snapshot"]["schemaVersion"] = 2**63
+        invalid_cases.append(wide_schema)
+
+        control_timezone = envelope()
+        control_timezone["snapshot"]["timezone"] = "UTC\n"
+        invalid_cases.append(control_timezone)
+
+        for invalid in invalid_cases:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValidationError):
+                    validate_envelope(invalid, path_device_id=DEVICE_ID)
 
 
 if __name__ == "__main__":

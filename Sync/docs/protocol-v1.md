@@ -33,8 +33,9 @@ Before network serialization, recursively set these fields to JSON `null` wherev
 - `sessionPath`
 - session `title`
 - `workspacePath`
+- `workspaceLabel`
 
-`workspaceLabel` may remain. Never transmit credentials or raw session files. The request body limit is 16 MiB.
+Never transmit credentials or raw session files. During a rolling protocol-v1 upgrade, the server accepts a legacy non-null `workspaceLabel` only to replace it with `null` before validation and storage; other unredacted content remains invalid. The request body limit is 16 MiB.
 
 Credential-bearing properties are omitted, known content/path properties are `null`, and unknown absolute POSIX, Windows, UNC, or `file://` paths are also `null`. The server validates protocol version, the device/path ID match, canonical lowercase UUID, OS enum, device/client-version display bounds, positive timestamps, signed 64-bit and nonnegative aggregate ranges, and the complete ActivitySnapshot structure required by the Mac decoder. It rejects a `generatedAtMs` more than five minutes ahead of server time. `PUT` is an idempotent latest-snapshot upsert. An older `generatedAtMs` for the same device returns HTTP 409; an exact retry with identical device/snapshot content succeeds without changing `receivedAtMs`; conflicting content at the same timestamp returns 409.
 

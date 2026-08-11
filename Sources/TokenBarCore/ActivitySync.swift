@@ -231,7 +231,9 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
 
     public init(timeout: TimeInterval = 15) {
         self.init(
-            transport: EphemeralHTTPTransport(allowsSameOriginRedirects: false),
+            transport: EphemeralHTTPTransport(
+                allowsSameOriginRedirects: false,
+                bypassesProxy: true),
             timeout: timeout)
     }
 
@@ -328,20 +330,27 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
                 throw ActivitySyncError.invalidProtocolVersion(value.protocolVersion)
             }
             var deviceIDs = Set<String>()
+            var snapshots: [ActivitySyncStoredSnapshot] = []
             for record in value.snapshots {
+                let sanitizedSnapshot = record.snapshot.redactedForSync()
                 try Self.validate(
                     device: record.device,
                     generatedAtMs: record.generatedAtMs,
                     receivedAtMs: record.receivedAtMs,
-                    snapshot: record.snapshot)
+                    snapshot: sanitizedSnapshot)
                 guard deviceIDs.insert(record.device.id).inserted else {
                     throw ActivitySyncError.invalidResponse(
                         "the download contains duplicate device IDs")
                 }
+                snapshots.append(ActivitySyncStoredSnapshot(
+                    device: record.device,
+                    generatedAtMs: record.generatedAtMs,
+                    receivedAtMs: record.receivedAtMs,
+                    snapshot: sanitizedSnapshot))
             }
             return ActivitySyncDownloadResponse(
                 protocolVersion: value.protocolVersion,
-                snapshots: value.snapshots.sorted { $0.device.id < $1.device.id })
+                snapshots: snapshots.sorted { $0.device.id < $1.device.id })
         } catch let error as ActivitySyncError {
             throw error
         } catch {
@@ -538,7 +547,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               Self.isNonnegativeFinite(session.costUsd),
               session.title == nil,
               session.workspacePath == nil,
-              session.workspaceLabel.map({ !isAbsoluteLocalPathForActivitySync($0) }) ?? true
+              session.workspaceLabel == nil
         else {
             throw ActivitySyncError.invalidResponse("snapshot session is invalid or not redacted")
         }
@@ -993,9 +1002,7 @@ public enum ActivitySnapshotMerger {
     {
         SessionSummary(
             id: "sync:\(device.id):\(session.id)",
-            workspaceLabel: [device.name, session.workspaceLabel]
-                .compactMap { $0 }
-                .joined(separator: " · "),
+            workspaceLabel: device.name,
             startedAtMs: session.startedAtMs,
             endedAtMs: session.endedAtMs,
             tokens: session.tokens,
@@ -1056,9 +1063,7 @@ public extension SessionSummary {
         let redacted = self.redactedForCache()
         return SessionSummary(
             id: redacted.id,
-            workspaceLabel: redacted.workspaceLabel.flatMap {
-                isAbsoluteLocalPathForActivitySync($0) ? nil : $0
-            },
+            workspaceLabel: nil,
             startedAtMs: redacted.startedAtMs,
             endedAtMs: redacted.endedAtMs,
             tokens: redacted.tokens,
@@ -1269,18 +1274,4 @@ private func synchronizedDeviceIDForActivitySync(from value: String) -> String? 
     guard let separator = remainder.firstIndex(of: ":") else { return nil }
     let candidate = String(remainder[..<separator])
     return UUID(uuidString: candidate)?.uuidString.lowercased()
-}
-
-private func isAbsoluteLocalPathForActivitySync(_ value: String) -> Bool {
-    if value.hasPrefix("/") || value.hasPrefix("\\\\") {
-        return true
-    }
-    if value.lowercased().hasPrefix("file://") {
-        return true
-    }
-    let bytes = Array(value.utf8.prefix(3))
-    return bytes.count == 3
-        && ((65 ... 90).contains(bytes[0]) || (97 ... 122).contains(bytes[0]))
-        && bytes[1] == 58
-        && (bytes[2] == 47 || bytes[2] == 92)
 }

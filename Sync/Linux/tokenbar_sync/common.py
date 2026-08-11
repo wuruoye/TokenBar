@@ -27,6 +27,7 @@ PRIVACY_NULL_FIELDS = {
     "sessionPath",
     "title",
     "workspacePath",
+    "workspaceLabel",
     "promptText",
     "outputText",
     "rawPrompt",
@@ -221,9 +222,13 @@ def _validate_totals(value: Any, label: str) -> None:
         _require_nonnegative_number(speed, f"{label}.averageGenerationTokensPerSecond")
 
 
-def _validate_range(value: Any, label: str) -> None:
+def _validate_range(value: Any, label: str, *, generated_at_ms: int) -> None:
     summary = _require_object(value, label)
-    _require_int64(summary.get("startedAtMs"), f"{label}.startedAtMs", positive=True)
+    started_at_ms = _require_int64(
+        summary.get("startedAtMs"), f"{label}.startedAtMs", positive=True
+    )
+    if started_at_ms > generated_at_ms:
+        raise ValidationError(f"{label}.startedAtMs must not follow snapshot.generatedAtMs")
     _validate_totals(summary.get("totals"), f"{label}.totals")
 
 
@@ -240,9 +245,9 @@ def _validate_daily_model(value: Any, label: str) -> None:
     _require_nonnegative_int(model.get("sessionCount"), f"{label}.sessionCount")
 
 
-def _validate_day(value: Any, label: str) -> None:
+def _validate_day(value: Any, label: str) -> str:
     day = _require_object(value, label)
-    _require_string(day.get("date"), f"{label}.date")
+    date = _require_string(day.get("date"), f"{label}.date")
     _validate_tokens(day.get("tokens"), f"{label}.tokens")
     _require_nonnegative_number(day.get("costUsd"), f"{label}.costUsd")
     _require_nonnegative_int(day.get("requestCount"), f"{label}.requestCount")
@@ -250,14 +255,20 @@ def _validate_day(value: Any, label: str) -> None:
     models = _require_array(day.get("models", []), f"{label}.models")
     for index, model in enumerate(models):
         _validate_daily_model(model, f"{label}.models[{index}]")
+    return date
 
 
 def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
     if depth > 100:
         raise ValidationError("request contribution nesting exceeds 100 levels")
     request = _require_object(value, label)
-    for key in ("id", "sessionId", "physicalSessionId", "model", "provider"):
+    for key in ("id", "sessionId", "physicalSessionId"):
+        _require_string(request.get(key), f"{label}.{key}")
+    for key in ("model", "provider"):
         _require_string(request.get(key), f"{label}.{key}", allow_empty=True)
+    agent = request.get("agent")
+    if agent is not None:
+        _require_string(agent, f"{label}.agent", allow_empty=True)
     if not isinstance(request.get("isSubagent"), bool):
         raise ValidationError(f"{label}.isSubagent must be a boolean")
     started = _require_int64(request.get("startedAtMs"), f"{label}.startedAtMs", positive=True)
@@ -286,7 +297,7 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
 
 def _validate_session(value: Any, label: str) -> None:
     session = _require_object(value, label)
-    _require_string(session.get("id"), f"{label}.id", allow_empty=True)
+    _require_string(session.get("id"), f"{label}.id")
     started = _require_int64(session.get("startedAtMs"), f"{label}.startedAtMs", positive=True)
     ended = _require_int64(session.get("endedAtMs"), f"{label}.endedAtMs", positive=True)
     if ended < started:
@@ -302,16 +313,24 @@ def _validate_session(value: Any, label: str) -> None:
         _require_string(platform, f"{label}.platform")
 
 
-def _validate_source(value: Any, label: str) -> str:
+def _validate_source(value: Any, label: str, *, generated_at_ms: int) -> str:
     source = _require_object(value, label)
     platform = _require_string(source.get("platform"), f"{label}.platform")
     _validate_totals(source.get("today"), f"{label}.today")
     if source.get("weeklySinceReset") is not None:
-        _validate_range(source["weeklySinceReset"], f"{label}.weeklySinceReset")
+        _validate_range(
+            source["weeklySinceReset"],
+            f"{label}.weeklySinceReset",
+            generated_at_ms=generated_at_ms,
+        )
     if source.get("rangeTotals") is not None:
         _validate_totals(source["rangeTotals"], f"{label}.rangeTotals")
+    dates: set[str] = set()
     for index, day in enumerate(_require_array(source.get("days"), f"{label}.days")):
-        _validate_day(day, f"{label}.days[{index}]")
+        date = _validate_day(day, f"{label}.days[{index}]")
+        if date in dates:
+            raise ValidationError(f"{label}.days contains a duplicate date")
+        dates.add(date)
     return platform
 
 
@@ -342,20 +361,35 @@ def _validate_memory_usage(value: Any, label: str) -> None:
 
 def validate_activity_snapshot(snapshot: Any) -> dict[str, Any]:
     value = _require_object(snapshot, "snapshot")
+    generated_at_ms = _require_int64(
+        value.get("generatedAtMs"), "snapshot.generatedAtMs", positive=True
+    )
     _validate_totals(value.get("today"), "snapshot.today")
     if value.get("rangeTotals") is not None:
         _validate_totals(value["rangeTotals"], "snapshot.rangeTotals")
     if value.get("weeklySinceReset") is not None:
-        _validate_range(value["weeklySinceReset"], "snapshot.weeklySinceReset")
+        _validate_range(
+            value["weeklySinceReset"],
+            "snapshot.weeklySinceReset",
+            generated_at_ms=generated_at_ms,
+        )
     for index, session in enumerate(_require_array(value.get("sessions"), "snapshot.sessions")):
         _validate_session(session, f"snapshot.sessions[{index}]")
+    dates: set[str] = set()
     for index, day in enumerate(_require_array(value.get("days"), "snapshot.days")):
-        _validate_day(day, f"snapshot.days[{index}]")
+        date = _validate_day(day, f"snapshot.days[{index}]")
+        if date in dates:
+            raise ValidationError("snapshot.days contains a duplicate date")
+        dates.add(date)
     platforms: set[str] = set()
     sources = value.get("sources")
     if sources is not None:
         for index, source in enumerate(_require_array(sources, "snapshot.sources")):
-            platform = _validate_source(source, f"snapshot.sources[{index}]")
+            platform = _validate_source(
+                source,
+                f"snapshot.sources[{index}]",
+                generated_at_ms=generated_at_ms,
+            )
             if platform in platforms:
                 raise ValidationError("snapshot.sources contains a duplicate platform")
             platforms.add(platform)
@@ -437,17 +471,19 @@ def validate_envelope(
     snapshot = envelope["snapshot"]
     if not isinstance(snapshot, dict):
         raise ValidationError("snapshot must be an object")
-    schema_version = snapshot.get("schemaVersion")
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version <= 0
-    ):
+    try:
+        _require_int64(snapshot.get("schemaVersion"), "snapshot.schemaVersion", positive=True)
+    except ValidationError:
         raise ValidationError("snapshot.schemaVersion must be a positive integer")
     if snapshot.get("generatedAtMs") != generated_at_ms:
         raise ValidationError("snapshot.generatedAtMs must match generatedAtMs")
     timezone = snapshot.get("timezone")
-    if not isinstance(timezone, str) or not timezone.strip() or len(timezone) > 128:
+    if (
+        not isinstance(timezone, str)
+        or not timezone.strip()
+        or len(timezone) > 128
+        or any(unicodedata.category(ch) in {"Cc", "Cs"} for ch in timezone)
+    ):
         raise ValidationError("snapshot.timezone must be a non-empty string")
     if not isinstance(snapshot.get("today"), dict):
         raise ValidationError("snapshot.today must be an object")

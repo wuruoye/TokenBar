@@ -100,7 +100,7 @@ class ClientTests(unittest.TestCase):
             session = snapshot["sessions"][0]
             self.assertIsNone(session["title"])
             self.assertIsNone(session["workspacePath"])
-            self.assertEqual(session["workspaceLabel"], "project")
+            self.assertIsNone(session["workspaceLabel"])
             self.assertIsNone(session["requests"][0]["promptPreview"])
             self.assertIsNone(session["requests"][0]["outputPreview"])
             self.assertIsNone(session["requests"][0]["sessionPath"])

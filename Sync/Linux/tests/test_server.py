@@ -195,6 +195,27 @@ class ServerTests(unittest.TestCase):
         unsanitized["snapshot"]["sessionPath"] = "/private/session.jsonl"
         self.assertEqual(self.put(unsanitized)[0], 400)
 
+    def test_legacy_workspace_label_is_redacted_before_storage(self):
+        legacy = make_envelope()
+        legacy["snapshot"]["sessions"] = [{
+            "id": "session",
+            "workspaceLabel": "private-project",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "models": [],
+            "requests": [],
+        }]
+
+        self.assertEqual(self.put(legacy)[0], 201)
+        status, listed = self.request("GET", "/v1/snapshots")
+
+        self.assertEqual(status, 200)
+        self.assertIsNone(
+            listed["snapshots"][0]["snapshot"]["sessions"][0]["workspaceLabel"]
+        )
+
     def test_request_size_limit_is_enforced_before_body_read(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
         connection.putrequest("PUT", f"/v1/snapshots/{DEVICE_A}")

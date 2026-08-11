@@ -9,7 +9,7 @@ Protocol v1 transports privacy-redacted `ActivitySnapshot` values independently 
 
 The sync client invokes the repository's Rust `tokenbar-helper` with an explicit statistics timezone. Sync defaults to UTC so its calendar windows, `today`, weekly-reset scan boundary, per-message dates, and emitted `snapshot.timezone` match the macOS sync merger. `local` remains an explicit opt-in for deployments where every merging client uses the same local-statistics convention.
 
-Bearer-authenticated clients require HTTPS for every non-loopback server URL and do not follow redirects. Prompt/output previews, session titles, absolute paths, provider credentials, raw session files, local databases, and retry state are never part of a repository artifact.
+Bearer-authenticated clients require HTTPS for every non-loopback server URL and do not follow redirects. Current clients exclude prompt/output previews, session titles, workspace labels, absolute paths, provider credentials, raw session files, local databases, and retry state from synchronized snapshots and repository artifacts. The server removes a legacy protocol-v1 `workspaceLabel` before validation and storage during rolling upgrades.
 
 ## Windows
 

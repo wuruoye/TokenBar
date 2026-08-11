@@ -41,9 +41,9 @@ Example download response:
 
 ## Privacy boundary
 
-The client sanitizes immediately before envelope creation and again before upload. At every nesting level it sets `promptPreview`, `outputPreview`, `sessionPath`, session `title`, and `workspacePath` to `null`. It also nulls raw prompt/session-content fields and absolute POSIX, Windows, UNC, or `file://` paths, and removes credential-bearing properties. `workspaceLabel` remains when it is a label rather than an absolute path.
+The client sanitizes immediately before envelope creation and again before upload. At every nesting level it sets `promptPreview`, `outputPreview`, `sessionPath`, session `title`, `workspacePath`, and `workspaceLabel` to `null`. It also nulls raw prompt/session-content fields and absolute POSIX, Windows, UNC, or `file://` paths, and removes credential-bearing properties.
 
-The server rejects a snapshot that still contains any of those values, or whose required totals/session/day/source fields cannot be decoded by the Mac client. It never reads raw Codex session files and never logs authorization headers or request/response payloads. Headless clients keep the upload envelope only in memory and never persist a payload retry spool.
+The server rejects a snapshot that still contains any other protected value, or whose required totals/session/day/source fields cannot be decoded by the Mac client. For rolling protocol-v1 upgrades it clears a legacy `workspaceLabel` before validation and storage. It never reads raw Codex session files and never logs authorization headers or request/response payloads. Headless clients keep the upload envelope only in memory and never persist a payload retry spool.
 
 ## Local run
 

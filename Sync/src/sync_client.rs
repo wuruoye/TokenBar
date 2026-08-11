@@ -377,7 +377,7 @@ mod tests {
         let session = &response.snapshots[0].snapshot["sessions"][0];
         assert!(session["title"].is_null());
         assert!(session["workspacePath"].is_null());
-        assert_eq!(session["workspaceLabel"], "safe");
+        assert!(session["workspaceLabel"].is_null());
         assert!(session["requests"][0]["promptPreview"].is_null());
         assert!(session["requests"][0]["outputPreview"].is_null());
         assert!(session["requests"][0]["sessionPath"].is_null());

@@ -143,7 +143,7 @@ struct ActivitySyncTests {
 
         #expect(session.title == nil)
         #expect(session.workspacePath == nil)
-        #expect(session.workspaceLabel == "workspace")
+        #expect(session.workspaceLabel == nil)
         #expect(request.promptPreview == nil)
         #expect(request.outputPreview == nil)
         #expect(request.sessionPath == nil)
@@ -277,6 +277,30 @@ struct ActivitySyncTests {
         }
     }
 
+    @Test("remote client re-redacts legacy workspace labels")
+    func redactsLegacyWorkspaceLabels() async throws {
+        let legacy = TestFixtures.activity()
+        let stored = ActivitySyncStoredSnapshot(
+            device: self.remoteDevice,
+            generatedAtMs: legacy.generatedAtMs,
+            receivedAtMs: legacy.generatedAtMs + 1,
+            snapshot: legacy)
+        let responseData = try JSONEncoder().encode(
+            ActivitySyncDownloadResponse(snapshots: [stored]))
+        let client = ActivitySyncRemoteClient(
+            transport: RecordingHTTPTransport(responses: [
+                TokenBarHTTPResponse(data: responseData, statusCode: 200),
+            ]))
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com",
+            token: self.sharedToken,
+            device: self.localDevice)
+
+        let response = try await client.download(configuration: configuration)
+
+        #expect(response.snapshots.first?.snapshot.sessions.first?.workspaceLabel == nil)
+    }
+
     @Test("remote client rejects negative aggregate counts")
     func rejectsNegativeCounts() async throws {
         let base = TestFixtures.activity().redactedForSync()
@@ -361,7 +385,7 @@ struct ActivitySyncTests {
         #expect(remoteSession.synchronizedDeviceID == self.remoteDevice.id)
         #expect(remoteSession.title == nil)
         #expect(remoteSession.workspacePath == nil)
-        #expect(remoteSession.workspaceLabel == "Windows PC · workspace")
+        #expect(remoteSession.workspaceLabel == "Windows PC")
         let remoteRequest = try #require(remoteSession.requests.first)
         #expect(remoteRequest.isSynchronizedRemote)
         #expect(remoteRequest.synchronizedDeviceID == self.remoteDevice.id)
