@@ -3,6 +3,34 @@ use serde::{Deserialize, Serialize};
 
 const CONTENT_PREVIEW_MAX_CHARS: usize = 160;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatisticsTimezone {
+    Utc,
+    #[default]
+    Local,
+}
+
+impl StatisticsTimezone {
+    pub fn date_at_ms(self, timestamp_ms: i64) -> Option<chrono::NaiveDate> {
+        match self {
+            Self::Utc => chrono::Utc
+                .timestamp_millis_opt(timestamp_ms)
+                .single()
+                .map(|date_time| date_time.date_naive()),
+            Self::Local => chrono::Local
+                .timestamp_millis_opt(timestamp_ms)
+                .single()
+                .map(|date_time| date_time.date_naive()),
+        }
+    }
+
+    fn format_date_at_ms(self, timestamp_ms: i64) -> String {
+        self.date_at_ms(timestamp_ms)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBreakdown {
     pub input: i64,
@@ -193,6 +221,10 @@ impl UnifiedMessage {
         self.date = timestamp_to_date(self.timestamp);
     }
 
+    pub fn refresh_derived_fields_for_timezone(&mut self, timezone: StatisticsTimezone) {
+        self.date = timezone.format_date_at_ms(self.timestamp);
+    }
+
     pub fn set_content_preview(&mut self, preview: Option<String>) {
         self.content_preview = preview;
     }
@@ -368,6 +400,32 @@ fn timestamp_to_date(timestamp_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_utc_statistics_date_uses_utc_boundary() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut message = UnifiedMessage::new_with_agent(
+            "codex",
+            "gpt-test",
+            "openai",
+            "session",
+            timestamp,
+            TokenBreakdown::default(),
+            0.0,
+            None,
+        );
+
+        message.date = "not-the-utc-date".to_string();
+        message.refresh_derived_fields_for_timezone(StatisticsTimezone::Utc);
+
+        assert_eq!(message.date, "2026-01-01");
+        assert_eq!(
+            StatisticsTimezone::Utc.date_at_ms(timestamp),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        );
+    }
 
     #[test]
     fn token_total_saturates() {

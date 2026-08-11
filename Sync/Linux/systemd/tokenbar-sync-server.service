@@ -1,0 +1,36 @@
+[Unit]
+Description=TokenBar protocol-v1 snapshot sync service
+After=network.target
+
+[Service]
+Type=simple
+User=tokenbar-sync
+Group=tokenbar-sync
+WorkingDirectory=/var/lib/tokenbar-sync
+EnvironmentFile=/etc/tokenbar-sync/server.env
+ExecStart=/opt/tokenbar-sync/bin/tokenbar-sync-server
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tokenbar-sync
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
