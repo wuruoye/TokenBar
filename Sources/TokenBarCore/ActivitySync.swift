@@ -96,9 +96,9 @@ public enum ActivitySyncConfigurationError: LocalizedError, Equatable, Sendable 
         case .insecureServerURL:
             "The sync server must use HTTPS. HTTP is allowed only for localhost testing."
         case .missingToken:
-            "Enter the shared sync token."
+            "Enter this device's sync access token."
         case .invalidToken:
-            "The shared sync token must contain 32 to 512 non-whitespace ASCII characters."
+            "The sync access token must contain 32 to 512 non-whitespace ASCII characters."
         case .invalidDeviceID:
             "The device ID is invalid."
         case .invalidDeviceName:

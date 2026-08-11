@@ -80,7 +80,7 @@ struct TokenBarSettingsView: View {
                         prompt: Text("https://sync.example.com"))
 
                     SecureField(
-                        "Shared token",
+                        "Device access token",
                         text: Binding(
                             get: { activitySync.token },
                             set: { activitySync.token = $0 }))

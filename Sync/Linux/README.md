@@ -1,6 +1,6 @@
 # TokenBar Sync protocol v1 MVP
 
-Python 3 service and headless Linux collector/uploader for latest-per-device TokenBar activity snapshots. The service itself has no third-party Python dependency. The collector invokes this repository's Rust `tokenbar-helper`, sanitizes its JSON in memory, and only then constructs a network envelope. The service defaults to loopback, authenticates all `/v1/*` routes with a shared bearer token, stores durable SQLite state, and never logs tokens or payloads.
+Python 3 service and headless Linux collector/uploader for latest-per-device TokenBar activity snapshots. The service itself has no third-party Python dependency. The collector invokes this repository's Rust `tokenbar-helper`, sanitizes its JSON in memory, and only then constructs a network envelope. The service defaults to loopback, authenticates all `/v1/*` routes with bearer tokens, stores durable SQLite state, and never logs tokens or payloads.
 
 ## Fixed protocol
 
@@ -61,7 +61,8 @@ The default server configuration is:
 ```text
 TOKENBAR_SYNC_BIND=127.0.0.1:18765
 TOKENBAR_SYNC_DATABASE=./tokenbar-sync.sqlite3
-TOKENBAR_SYNC_TOKEN=(required; no default)
+TOKENBAR_SYNC_TOKEN=(plaintext local-testing option)
+TOKENBAR_SYNC_TOKEN_SHA256=(comma-separated production device-token hashes)
 ```
 
 Build the repository helper once on a Linux build host with Rust installed:
@@ -110,7 +111,7 @@ sudo ./scripts/install-server.sh
 ./scripts/install-user-client.sh
 ```
 
-After installation, replace the placeholder token in `/etc/tokenbar-sync/server.env` and the XDG config file `${XDG_CONFIG_HOME:-~/.config}/tokenbar-sync/client.env` with the same random 32–512 character ASCII token. The server refuses example placeholders and non-loopback binds unless `TOKENBAR_SYNC_ALLOW_PUBLIC_BIND=1` is explicitly set. Test manually, and only then enable the units using the commands printed by the installers. Avoid placing a literal token on a command line.
+After installation, generate an independent random 32–512 character ASCII token on each client and keep its plaintext only in that client's protected store. Put the comma-separated SHA-256 hashes in `TOKENBAR_SYNC_TOKEN_SHA256` inside `/etc/tokenbar-sync/server.env`; the Linux client's own plaintext goes only in the XDG config file `${XDG_CONFIG_HOME:-~/.config}/tokenbar-sync/client.env`. `TOKENBAR_SYNC_TOKEN` remains available as a single-token local-testing option. The server refuses malformed or placeholder credentials and non-loopback binds unless `TOKENBAR_SYNC_ALLOW_PUBLIC_BIND=1` is explicitly set. Test manually, and only then enable the units using the commands printed by the installers. Avoid placing a literal token on a command line or in a Codex message.
 
 ## Deployment recommendation
 

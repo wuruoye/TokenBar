@@ -1,4 +1,5 @@
 import http.client
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -13,10 +14,12 @@ from tokenbar_sync.server import (
     SnapshotRepository,
     TokenBarHTTPServer,
     build_server,
+    parse_server_token_hashes,
 )
 
 
 TOKEN = "local-test-token-32-characters-long"
+SECOND_TOKEN = "second-local-token-32-characters-long"
 DEVICE_A = "11111111-1111-4111-8111-111111111111"
 DEVICE_B = "00000000-0000-4000-8000-000000000000"
 
@@ -62,7 +65,10 @@ class ServerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.database = str(Path(self.temp.name) / "sync.sqlite3")
         self.server = TokenBarHTTPServer(
-            ("127.0.0.1", 0), SnapshotRepository(self.database), TOKEN
+            ("127.0.0.1", 0),
+            SnapshotRepository(self.database),
+            TOKEN,
+            (hashlib.sha256(SECOND_TOKEN.encode("ascii")).digest(),),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -108,6 +114,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 401)
         status, _body = self.request("GET", "/v1/snapshots", token="wrong")
         self.assertEqual(status, 401)
+        status, _body = self.request("GET", "/v1/snapshots", token=SECOND_TOKEN)
+        self.assertEqual(status, 200)
         status, _body = self.put(make_envelope(), token="wrong")
         self.assertEqual(status, 401)
 
@@ -208,6 +216,15 @@ class ServerTests(unittest.TestCase):
             build_server("127.0.0.1:18765", ":memory:", "short")
         with self.assertRaisesRegex(ValueError, "loopback"):
             build_server("0.0.0.0:18765", ":memory:", TOKEN)
+        with self.assertRaisesRegex(ValueError, "required"):
+            build_server("127.0.0.1:18765", ":memory:", "")
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            parse_server_token_hashes("not-a-hash")
+        digest = hashlib.sha256(SECOND_TOKEN.encode("ascii")).hexdigest()
+        self.assertEqual(
+            parse_server_token_hashes(digest),
+            (bytes.fromhex(digest),),
+        )
 
 
 if __name__ == "__main__":

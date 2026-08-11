@@ -19,12 +19,12 @@ Windows requires Rust's MSVC target and the Visual C++ build tools:
 .\Sync\scripts\Build-TokenBarSync.ps1
 ```
 
-The installer accepts the shared bearer token only from the current PowerShell process, protects it with DPAPI CurrentUser, and never writes it to `config.json` or the Scheduled Task command line. Each upload decrypts it only for the child process lifetime and clears that environment entry afterward. A one-shot upload collects a fresh, sanitized snapshot in memory. HTTP 409 discards that rejected snapshot so the next invocation can collect a newer timestamp.
+The installer accepts this Windows installation's bearer token only from the current PowerShell process, protects it with DPAPI CurrentUser, and never writes it to `config.json` or the Scheduled Task command line. Each upload decrypts it only for the child process lifetime and clears that environment entry afterward. A one-shot upload collects a fresh, sanitized snapshot in memory. HTTP 409 discards that rejected snapshot so the next invocation can collect a newer timestamp.
 
 Build first, set a 32–512 character random token only in the current PowerShell process, and install the fixed per-user Scheduled Task:
 
 ```powershell
-$env:TOKENBAR_SYNC_TOKEN = Read-Host 'Shared token'
+$env:TOKENBAR_SYNC_TOKEN = Read-Host 'Device access token'
 .\Sync\scripts\Install-TokenBarSync.ps1 -Endpoint 'https://sync.example.com'
 Remove-Item Env:TOKENBAR_SYNC_TOKEN
 .\Sync\scripts\Get-TokenBarSyncStatus.ps1
@@ -34,7 +34,7 @@ The installer owns only `%LOCALAPPDATA%\TokenBarSync` and the `TokenBarSync` tas
 
 ## macOS
 
-Open TokenBar Settings, enable **Multi-device sync**, then enter the HTTPS server origin, the same shared token, and a device name. The token is stored in the macOS Keychain; the URL, stable UUID, enabled state, and display name use TokenBar preferences. Changing or disabling sync cancels the in-flight activity refresh and refreshes the dashboard from local data. Remote sessions are labeled with their device and remain read-only because prompt/output text and source paths are never uploaded.
+Open TokenBar Settings, enable **Multi-device sync**, then enter the HTTPS server origin, this Mac's access token, and a device name. The token is stored in the macOS Keychain; the URL, stable UUID, enabled state, and display name use TokenBar preferences. Changing or disabling sync cancels the in-flight activity refresh and refreshes the dashboard from local data. Remote sessions are labeled with their device and remain read-only because prompt/output text and source paths are never uploaded.
 
 ## Verification
 

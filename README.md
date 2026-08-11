@@ -179,7 +179,7 @@ Open **Settings** with `Command-,` to configure:
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
 - **Codex Memory:** inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
-- **Multi-device sync:** configure the optional HTTPS endpoint, Keychain-backed shared token, and this Mac's stable device identity. Headless Windows/Linux components and the self-hosted service are documented in [`Sync/README.md`](Sync/README.md).
+- **Multi-device sync:** configure the optional HTTPS endpoint, Keychain-backed device access token, and this Mac's stable device identity. Headless Windows/Linux components and the self-hosted service are documented in [`Sync/README.md`](Sync/README.md).
 - **Background refresh:** 1, 5, 10, or 15 minutes.
 - **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.
 

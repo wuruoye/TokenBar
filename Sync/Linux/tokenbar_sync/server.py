@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import ipaddress
 import json
 import os
@@ -226,10 +227,17 @@ class TokenBarHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         repository: SnapshotRepository,
-        token: str,
+        token: str = "",
+        token_hashes: tuple[bytes, ...] = (),
     ):
         self.repository = repository
-        self.auth_token = token.encode("utf-8")
+        configured_hashes = list(token_hashes)
+        if token:
+            validate_server_token(token)
+            configured_hashes.append(hashlib.sha256(token.encode("ascii")).digest())
+        if not configured_hashes:
+            raise ValueError("at least one sync token or token hash is required")
+        self.auth_token_hashes = tuple(dict.fromkeys(configured_hashes))
         if ":" in server_address[0]:
             self.address_family = socket.AF_INET6
         super().__init__(server_address, TokenBarRequestHandler)
@@ -288,7 +296,11 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
         header = headers[0]
         supplied = header[7:] if header.startswith("Bearer ") else ""
         supplied_bytes = supplied.encode("utf-8", errors="surrogatepass")
-        return hmac.compare_digest(supplied_bytes, self.app.auth_token)
+        supplied_hash = hashlib.sha256(supplied_bytes).digest()
+        matched = False
+        for expected_hash in self.app.auth_token_hashes:
+            matched = hmac.compare_digest(supplied_hash, expected_hash) or matched
+        return matched
 
     def _require_auth(self) -> bool:
         if self._authorized():
@@ -455,6 +467,22 @@ def validate_server_token(token: str) -> None:
         )
 
 
+def parse_server_token_hashes(value: str) -> tuple[bytes, ...]:
+    hashes: list[bytes] = []
+    for item in value.split(","):
+        candidate = item.strip().casefold()
+        if not candidate:
+            continue
+        if len(candidate) != 64 or any(character not in "0123456789abcdef" for character in candidate):
+            raise ValueError(
+                "TOKENBAR_SYNC_TOKEN_SHA256 must contain comma-separated SHA-256 hex values"
+            )
+        hashes.append(bytes.fromhex(candidate))
+    if len(set(hashes)) != len(hashes):
+        raise ValueError("TOKENBAR_SYNC_TOKEN_SHA256 contains a duplicate hash")
+    return tuple(hashes)
+
+
 def is_loopback_bind(host: str) -> bool:
     if host.casefold() == "localhost":
         return True
@@ -469,16 +497,26 @@ def build_server(
     database: str,
     token: str,
     *,
+    token_hashes: str = "",
     allow_public_bind: bool = False,
 ) -> TokenBarHTTPServer:
-    validate_server_token(token)
+    parsed_hashes = parse_server_token_hashes(token_hashes)
+    if token:
+        validate_server_token(token)
+    elif not parsed_hashes:
+        raise ValueError("TOKENBAR_SYNC_TOKEN or TOKENBAR_SYNC_TOKEN_SHA256 is required")
     address = parse_bind(bind)
     if not allow_public_bind and not is_loopback_bind(address[0]):
         raise ValueError(
             "TOKENBAR_SYNC_BIND must be loopback unless "
             "TOKENBAR_SYNC_ALLOW_PUBLIC_BIND=1 is explicitly set"
         )
-    return TokenBarHTTPServer(address, SnapshotRepository(database), token)
+    return TokenBarHTTPServer(
+        address,
+        SnapshotRepository(database),
+        token,
+        parsed_hashes,
+    )
 
 
 def main() -> int:
@@ -486,12 +524,14 @@ def main() -> int:
     bind = os.environ.get("TOKENBAR_SYNC_BIND", DEFAULT_BIND)
     database = os.environ.get("TOKENBAR_SYNC_DATABASE", DEFAULT_DATABASE)
     token = os.environ.get("TOKENBAR_SYNC_TOKEN", "")
+    token_hashes = os.environ.get("TOKENBAR_SYNC_TOKEN_SHA256", "")
     allow_public_bind = os.environ.get("TOKENBAR_SYNC_ALLOW_PUBLIC_BIND") == "1"
     try:
         server = build_server(
             bind,
             database,
             token,
+            token_hashes=token_hashes,
             allow_public_bind=allow_public_bind,
         )
     except (ValueError, OSError, sqlite3.Error) as error:
