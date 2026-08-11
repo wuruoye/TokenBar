@@ -950,15 +950,57 @@ fn set_private_permissions(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("could not protect memory telemetry file: {error}"))?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut c_void;
+        fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    if pid == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
+    }
+    let mut exit_code = 0_u32;
+    let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    !queried || exit_code == STILL_ACTIVE
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 fn now_ms() -> i64 {
@@ -977,6 +1019,11 @@ mod tests {
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
     const EVENT_MS: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(process_is_alive(std::process::id()));
+    }
 
     fn temporary_database(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
