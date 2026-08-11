@@ -4,6 +4,7 @@ import TokenBarCore
 @MainActor
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let memoryTelemetryController = MemoryTelemetryController()
+    let activitySyncController = ActivitySyncController(settings: .shared)
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
         #if DEBUG
@@ -15,12 +16,21 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                 cache: nil)
         }
         #endif
+        let localActivity = ActivityService(
+            memoryDatabaseURL: self.memoryTelemetryController.paths.databaseURL,
+            anthropicPricingCatalog: self.anthropicPricingCatalog)
+        let synchronizedActivity = SynchronizedActivityService(
+            local: localActivity,
+            configuration: { [weak activitySyncController = self.activitySyncController] in
+                await activitySyncController?.configuration()
+            },
+            report: { [weak activitySyncController = self.activitySyncController] report in
+                await activitySyncController?.accept(report)
+            })
         return DashboardModel(
             quotaService: CodexQuotaService(),
             additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
-            activityService: ActivityService(
-                memoryDatabaseURL: self.memoryTelemetryController.paths.databaseURL,
-                anthropicPricingCatalog: self.anthropicPricingCatalog),
+            activityService: synchronizedActivity,
             quotaCache: QuotaSnapshotCache())
     }()
     private let settings = TokenBarSettings.shared
@@ -98,6 +108,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             model: self.model,
             settings: self.settings,
             memoryTelemetry: self.memoryTelemetryController,
+            activitySync: self.activitySyncController,
             showSettings: { [weak self] in
                 self?.showSettings()
             },
@@ -128,6 +139,12 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             self.settingsWindowController = SettingsWindowController(
                 settings: self.settings,
                 memoryTelemetry: self.memoryTelemetryController,
+                activitySync: self.activitySyncController,
+                syncNow: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        await self?.model.refreshActivity()
+                    }
+                },
                 testResetAnimation: { [weak self] in
                     self?.testResetAnimation()
                 })
@@ -139,6 +156,10 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         let platform = self.statusController == nil ? TokenPlatform.codex : self.model.scope.platform
         let origin = self.statusController?.celebrationOriginPoint(for: platform)
         self.confettiOverlayController.play(originInScreen: origin)
+    }
+
+    func refreshActivity() async {
+        await self.model.refreshActivity()
     }
 
     private func handleQuotaReset(_ event: QuotaResetEvent) {

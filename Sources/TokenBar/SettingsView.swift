@@ -4,15 +4,21 @@ import TokenBarCore
 struct TokenBarSettingsView: View {
     @Bindable var settings: TokenBarSettings
     let memoryTelemetry: MemoryTelemetryController?
+    let activitySync: ActivitySyncController?
+    let syncNow: () -> Void
     let testResetAnimation: () -> Void
 
     init(
         settings: TokenBarSettings,
         memoryTelemetry: MemoryTelemetryController? = nil,
+        activitySync: ActivitySyncController? = nil,
+        syncNow: @escaping () -> Void = {},
         testResetAnimation: @escaping () -> Void = {})
     {
         self.settings = settings
         self.memoryTelemetry = memoryTelemetry
+        self.activitySync = activitySync
+        self.syncNow = syncNow
         self.testResetAnimation = testResetAnimation
     }
 
@@ -62,6 +68,64 @@ struct TokenBarSettingsView: View {
                 Toggle(
                     "Show full request content on hover",
                     isOn: self.$settings.showsFullRequestContentOnHover)
+            }
+
+            if let activitySync = self.activitySync {
+                Section("Multi-device sync") {
+                    Toggle("Sync activity across devices", isOn: self.$settings.syncEnabled)
+
+                    TextField(
+                        "Server URL",
+                        text: self.$settings.syncServerURL,
+                        prompt: Text("https://sync.example.com"))
+
+                    SecureField(
+                        "Shared token",
+                        text: Binding(
+                            get: { activitySync.token },
+                            set: { activitySync.token = $0 }))
+
+                    TextField("Device name", text: self.$settings.syncDeviceName)
+
+                    LabeledContent("Device ID") {
+                        Text(self.settings.syncDeviceID)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(self.syncStatusColor(
+                                self.syncDisplayPhase(activitySync.report)))
+                            .frame(width: 7, height: 7)
+                        Text(self.syncStatusTitle(activitySync.report))
+                        Spacer()
+                        Button("Sync Now") {
+                            self.syncNow()
+                        }
+                        .disabled(
+                            !self.settings.syncEnabled
+                                || activitySync.report.phase == .syncing)
+                    }
+
+                    if self.settings.syncEnabled,
+                       let message = activitySync.credentialMessage
+                        ?? activitySync.configurationMessage
+                        ?? activitySync.report.message,
+                       !message.isEmpty
+                    {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(
+                                activitySync.report.phase == .success
+                                    ? Color.secondary
+                                    : Color.red)
+                    }
+
+                    Text("Uploads token counts, models, timing, and coarse workspace labels. Prompt/output text, session titles, absolute paths, and provider credentials are removed before transmission. Sync failures never replace local activity data.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if let memoryTelemetry = self.memoryTelemetry {
@@ -146,7 +210,42 @@ struct TokenBarSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: self.memoryTelemetry == nil ? 620 : 760)
+        .frame(
+            width: self.activitySync == nil ? 440 : 480,
+            height: self.activitySync == nil
+                ? (self.memoryTelemetry == nil ? 620 : 760)
+                : 820)
+    }
+
+    private func syncStatusTitle(_ report: ActivitySyncReport) -> String {
+        switch self.syncDisplayPhase(report) {
+        case .disabled:
+            "Disabled"
+        case .ready:
+            "Ready"
+        case .syncing:
+            "Syncing…"
+        case .success:
+            report.deviceCount == 1 ? "1 device synced" : "\(report.deviceCount) devices synced"
+        case .partial:
+            "Partial sync"
+        case .failure:
+            "Sync failed"
+        }
+    }
+
+    private func syncDisplayPhase(_ report: ActivitySyncReport) -> ActivitySyncPhase {
+        guard self.settings.syncEnabled else { return .disabled }
+        return report.phase == .disabled ? .ready : report.phase
+    }
+
+    private func syncStatusColor(_ phase: ActivitySyncPhase) -> Color {
+        switch phase {
+        case .success: .green
+        case .syncing: .blue
+        case .partial, .failure: .orange
+        case .disabled, .ready: .secondary
+        }
     }
 }
 

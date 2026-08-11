@@ -5,6 +5,26 @@ import FoundationNetworking
 
 protocol TokenBarHTTPTransport: Sendable {
     func response(for request: URLRequest) async throws -> TokenBarHTTPResponse
+    func response(
+        for request: URLRequest,
+        maximumBodyBytes: Int) async throws -> TokenBarHTTPResponse
+}
+
+extension TokenBarHTTPTransport {
+    func response(
+        for request: URLRequest,
+        maximumBodyBytes: Int) async throws -> TokenBarHTTPResponse
+    {
+        let response = try await self.response(for: request)
+        guard response.data.count <= maximumBodyBytes else {
+            throw TokenBarHTTPTransportError.responseTooLarge
+        }
+        return response
+    }
+}
+
+enum TokenBarHTTPTransportError: Error {
+    case responseTooLarge
 }
 
 struct TokenBarHTTPResponse: Sendable {
@@ -303,17 +323,18 @@ private struct ResetCredit: Decodable {
     }
 }
 
-private final class EphemeralHTTPTransport: TokenBarHTTPTransport, @unchecked Sendable {
+final class EphemeralHTTPTransport: TokenBarHTTPTransport, @unchecked Sendable {
     private let session: URLSession
 
-    init() {
+    init(allowsSameOriginRedirects: Bool = true) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieStorage = nil
         configuration.httpShouldSetCookies = false
         configuration.urlCredentialStorage = nil
-        let delegate = SameOriginRedirectDelegate()
+        let delegate = SameOriginRedirectDelegate(
+            allowsSameOriginRedirects: allowsSameOriginRedirects)
         self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     }
 
@@ -324,9 +345,39 @@ private final class EphemeralHTTPTransport: TokenBarHTTPTransport, @unchecked Se
         }
         return TokenBarHTTPResponse(data: data, statusCode: response.statusCode)
     }
+
+    func response(
+        for request: URLRequest,
+        maximumBodyBytes: Int) async throws -> TokenBarHTTPResponse
+    {
+        let (bytes, response) = try await self.session.bytes(for: request)
+        guard let response = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        if response.expectedContentLength > Int64(maximumBodyBytes) {
+            throw TokenBarHTTPTransportError.responseTooLarge
+        }
+        var data = Data()
+        if response.expectedContentLength > 0 {
+            data.reserveCapacity(min(Int(response.expectedContentLength), maximumBodyBytes))
+        }
+        for try await byte in bytes {
+            guard data.count < maximumBodyBytes else {
+                throw TokenBarHTTPTransportError.responseTooLarge
+            }
+            data.append(byte)
+        }
+        return TokenBarHTTPResponse(data: data, statusCode: response.statusCode)
+    }
 }
 
 final class SameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let allowsSameOriginRedirects: Bool
+
+    init(allowsSameOriginRedirects: Bool = true) {
+        self.allowsSameOriginRedirects = allowsSameOriginRedirects
+    }
+
     func urlSession(
         _: URLSession,
         task: URLSessionTask,
@@ -334,7 +385,8 @@ final class SameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate, @unche
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void)
     {
-        guard let originalURL = task.originalRequest?.url,
+        guard self.allowsSameOriginRedirects,
+              let originalURL = task.originalRequest?.url,
               let redirectedURL = request.url,
               Self.allowsRedirect(from: originalURL, to: redirectedURL)
         else {

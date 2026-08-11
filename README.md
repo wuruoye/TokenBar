@@ -41,6 +41,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
+- Optionally combine privacy-redacted activity snapshots from Windows, Linux, and other Macs through a self-hosted HTTPS sync service; remote sessions are labeled by device and stay read-only.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
 
 ## Screenshots
@@ -178,6 +179,7 @@ Open **Settings** with `Command-,` to configure:
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
 - **Codex Memory:** inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
+- **Multi-device sync:** configure the optional HTTPS endpoint, Keychain-backed shared token, and this Mac's stable device identity. Headless Windows/Linux components and the self-hosted service are documented in [`Sync/README.md`](Sync/README.md).
 - **Background refresh:** 1, 5, 10, or 15 minutes.
 - **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.
 
@@ -284,6 +286,7 @@ TokenBar does not embed Sparkle yet, so GitHub Releases are the update channel f
 Sources/TokenBar/             AppKit/SwiftUI menu bar UI
 Sources/TokenBarCore/         Models, quota client, caching, and presentation logic
 Helper/                       Codex/Claude/Grok parsers and shared activity aggregator
+Sync/                         Windows/Linux headless clients, Linux service, and protocol
 Tests/TokenBarCoreTests/      Swift behavior and fixture tests
 Resources/                    Bundle metadata and app icon assets
 Scripts/package_app.sh        Build, embed, sign, and verify TokenBar.app

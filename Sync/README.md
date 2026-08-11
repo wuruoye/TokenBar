@@ -1,0 +1,45 @@
+# Multi-device snapshot sync
+
+Protocol v1 transports privacy-redacted `ActivitySnapshot` values independently of the snapshot's own positive `schemaVersion`.
+
+- The Rust crate in this directory is the headless Windows collector and client. Build and install it with the scripts in [`scripts/`](scripts/).
+- The Python service, Linux client, packaging, systemd units, and deployment guide live in [`Linux/`](Linux/README.md).
+- The macOS app configures the shared endpoint/token, uploads its local snapshot, downloads the latest snapshot for every device, and merges compatible calendars into the existing TokenBar dashboard.
+- The exact shared wire contract is documented in [`docs/protocol-v1.md`](docs/protocol-v1.md).
+
+The sync client invokes the repository's Rust `tokenbar-helper` with an explicit statistics timezone. Sync defaults to UTC so its calendar windows, `today`, weekly-reset scan boundary, per-message dates, and emitted `snapshot.timezone` match the macOS sync merger. `local` remains an explicit opt-in for deployments where every merging client uses the same local-statistics convention.
+
+Bearer-authenticated clients require HTTPS for every non-loopback server URL and do not follow redirects. Prompt/output previews, session titles, absolute paths, provider credentials, raw session files, local databases, and retry state are never part of a repository artifact.
+
+## Windows
+
+Windows requires Rust's MSVC target and the Visual C++ build tools:
+
+```powershell
+.\Sync\scripts\Build-TokenBarSync.ps1
+```
+
+The installer accepts the shared bearer token only from the current PowerShell process, protects it with DPAPI CurrentUser, and never writes it to `config.json` or the Scheduled Task command line. Each upload decrypts it only for the child process lifetime and clears that environment entry afterward. A one-shot upload collects a fresh, sanitized snapshot in memory. HTTP 409 discards that rejected snapshot so the next invocation can collect a newer timestamp.
+
+Build first, set a 32–512 character random token only in the current PowerShell process, and install the fixed per-user Scheduled Task:
+
+```powershell
+$env:TOKENBAR_SYNC_TOKEN = Read-Host 'Shared token'
+.\Sync\scripts\Install-TokenBarSync.ps1 -Endpoint 'https://sync.example.com'
+Remove-Item Env:TOKENBAR_SYNC_TOKEN
+.\Sync\scripts\Get-TokenBarSyncStatus.ps1
+```
+
+The installer owns only `%LOCALAPPDATA%\TokenBarSync` and the `TokenBarSync` task, verifies both before upgrades/removal, and never recursively deletes an arbitrary directory. It writes the two binaries, license files, non-secret configuration, a DPAPI-protected token, stable device UUID, and non-payload last-run status there.
+
+## macOS
+
+Open TokenBar Settings, enable **Multi-device sync**, then enter the HTTPS server origin, the same shared token, and a device name. The token is stored in the macOS Keychain; the URL, stable UUID, enabled state, and display name use TokenBar preferences. Changing or disabling sync cancels the in-flight activity refresh and refreshes the dashboard from local data. Remote sessions are labeled with their device and remain read-only because prompt/output text and source paths are never uploaded.
+
+## Verification
+
+```sh
+cargo test --manifest-path Helper/Cargo.toml --locked
+cargo test --manifest-path Sync/Cargo.toml --locked
+cd Sync/Linux && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```

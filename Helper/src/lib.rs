@@ -17,6 +17,8 @@ pub mod memory;
 pub mod pricing;
 pub mod usage;
 
+pub use usage::StatisticsTimeZone;
+
 pub const SCHEMA_VERSION: u32 = 9;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;

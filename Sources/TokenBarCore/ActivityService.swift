@@ -147,7 +147,8 @@ public struct ActivityService: ActivityProviding, Sendable {
             executableURL: helperURL,
             arguments: self.helperArguments(
                 sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
-                anthropicPricingURL: anthropicPricingURL),
+                anthropicPricingURL: anthropicPricingURL,
+                statisticsTimeZone: statisticsTimeZone),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
         guard !data.isEmpty else {
@@ -162,9 +163,11 @@ public struct ActivityService: ActivityProviding, Sendable {
 
     private func helperArguments(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
-        anthropicPricingURL: URL?) -> [String]
+        anthropicPricingURL: URL?,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
         var arguments = self.arguments
+        arguments += ["--statistics-timezone", statisticsTimeZone.rawValue]
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.codex]) {
             arguments += ["--weekly-reset-ms", String(value)]
         }
@@ -200,6 +203,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     {
         var environment = self.environment
         environment["TZ"] = statisticsTimeZone.processEnvironmentValue
+        environment.removeValue(forKey: "TOKENBAR_SYNC_TOKEN")
         return environment
     }
 

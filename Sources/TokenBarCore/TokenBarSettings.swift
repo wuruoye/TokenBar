@@ -104,6 +104,12 @@ public final class TokenBarSettings {
     public static let defaultShowsGrok = true
     public static let defaultShowsFullRequestContentOnHover = true
     public static let defaultResetCelebration = TokenBarResetCelebration.off
+    public static let defaultSyncEnabled = false
+    public static let defaultSyncServerURL = ""
+    public static var defaultSyncDeviceName: String {
+        let name = ProcessInfo.processInfo.hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Mac" : name
+    }
 
     public var theme: TokenBarTheme {
         didSet { self.defaults.set(self.theme.rawValue, forKey: self.keys.theme) }
@@ -157,6 +163,20 @@ public final class TokenBarSettings {
         }
     }
 
+    public var syncEnabled: Bool {
+        didSet { self.defaults.set(self.syncEnabled, forKey: self.keys.syncEnabled) }
+    }
+
+    public var syncServerURL: String {
+        didSet { self.defaults.set(self.syncServerURL, forKey: self.keys.syncServerURL) }
+    }
+
+    public var syncDeviceName: String {
+        didSet { self.defaults.set(self.syncDeviceName, forKey: self.keys.syncDeviceName) }
+    }
+
+    public private(set) var syncDeviceID: String
+
     public var recentSessionLimit: Int { self.recentSessionCount.rawValue }
     public var backgroundRefreshDuration: Duration { self.refreshInterval.duration }
 
@@ -188,6 +208,16 @@ public final class TokenBarSettings {
             ?? Self.defaultShowsFullRequestContentOnHover
         self.resetCelebration = defaults.string(forKey: self.keys.resetCelebration)
             .flatMap(TokenBarResetCelebration.init(rawValue:)) ?? Self.defaultResetCelebration
+        self.syncEnabled = defaults.object(forKey: self.keys.syncEnabled) as? Bool
+            ?? Self.defaultSyncEnabled
+        self.syncServerURL = defaults.string(forKey: self.keys.syncServerURL)
+            ?? Self.defaultSyncServerURL
+        self.syncDeviceName = defaults.string(forKey: self.keys.syncDeviceName)
+            ?? Self.defaultSyncDeviceName
+        let storedDeviceID = defaults.string(forKey: self.keys.syncDeviceID)
+        self.syncDeviceID = storedDeviceID.flatMap { UUID(uuidString: $0) }?
+            .uuidString.lowercased() ?? UUID().uuidString.lowercased()
+        defaults.set(self.syncDeviceID, forKey: self.keys.syncDeviceID)
     }
 
     public func resetToDefaults() {
@@ -199,6 +229,9 @@ public final class TokenBarSettings {
         self.showsGrok = Self.defaultShowsGrok
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
         self.resetCelebration = Self.defaultResetCelebration
+        self.syncEnabled = Self.defaultSyncEnabled
+        self.syncServerURL = Self.defaultSyncServerURL
+        self.syncDeviceName = Self.defaultSyncDeviceName
     }
 
     private struct Keys {
@@ -210,6 +243,10 @@ public final class TokenBarSettings {
         let showsGrok: String
         let showsFullRequestContentOnHover: String
         let resetCelebration: String
+        let syncEnabled: String
+        let syncServerURL: String
+        let syncDeviceName: String
+        let syncDeviceID: String
 
         init(prefix: String) {
             self.theme = "\(prefix).theme"
@@ -220,6 +257,10 @@ public final class TokenBarSettings {
             self.showsGrok = "\(prefix).showsGrok"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
             self.resetCelebration = "\(prefix).resetCelebration"
+            self.syncEnabled = "\(prefix).syncEnabled"
+            self.syncServerURL = "\(prefix).syncServerURL"
+            self.syncDeviceName = "\(prefix).syncDeviceName"
+            self.syncDeviceID = "\(prefix).syncDeviceID"
         }
     }
 }

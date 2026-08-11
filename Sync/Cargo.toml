@@ -1,0 +1,27 @@
+[package]
+name = "tokenbar-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Windows collector and sync client for TokenBar activity snapshots"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokenbar-helper = { path = "../Helper" }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

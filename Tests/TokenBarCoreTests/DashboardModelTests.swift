@@ -503,6 +503,29 @@ struct DashboardModelTests {
         #expect(model.activity.value == localSnapshot)
     }
 
+    @Test("restarting activity refresh prevents stale in-flight results from landing")
+    @MainActor
+    func restartsActivityRefresh() async {
+        let stale = TestFixtures.activity(generatedAtMs: 1)
+        let current = TestFixtures.activity(generatedAtMs: 2)
+        let activity = PausingActivityProvider([stale, current])
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([]),
+            activityService: activity,
+            cache: nil)
+
+        let first = Task { @MainActor in
+            await model.refreshActivity()
+        }
+        await activity.waitForFirstRequest()
+        await model.restartActivityRefresh()
+        await activity.releaseFirstRequest()
+        await first.value
+
+        #expect(model.activity.value == current)
+        #expect(await activity.statisticsTimeZones.count == 2)
+    }
+
     private func quota(reset: Date, updatedAt: Date) -> QuotaSnapshot {
         QuotaSnapshot(
             session: nil,

@@ -7,18 +7,22 @@ final class SettingsWindowController: NSWindowController {
     init(
         settings: TokenBarSettings = .shared,
         memoryTelemetry: MemoryTelemetryController? = nil,
+        activitySync: ActivitySyncController? = nil,
+        syncNow: @escaping () -> Void = {},
         testResetAnimation: @escaping () -> Void = {})
     {
         let hostingController = NSHostingController(
             rootView: TokenBarSettingsView(
                 settings: settings,
                 memoryTelemetry: memoryTelemetry,
+                activitySync: activitySync,
+                syncNow: syncNow,
                 testResetAnimation: testResetAnimation))
         let window = NSWindow(contentViewController: hostingController)
         window.title = "TokenBar Settings"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 440, height: 760))
+        window.setContentSize(NSSize(width: 480, height: 820))
         window.center()
         super.init(window: window)
     }

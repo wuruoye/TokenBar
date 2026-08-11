@@ -13,9 +13,27 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let collapsedLimit: Int
     }
 
+    private struct SyncSettingsSignature: Equatable {
+        let enabled: Bool
+        let serverURL: String
+        let deviceName: String
+        let deviceID: String
+        let credentialRevision: Int
+
+        @MainActor
+        init(_ settings: TokenBarSettings, activitySync: ActivitySyncController) {
+            self.enabled = settings.syncEnabled
+            self.serverURL = settings.syncServerURL
+            self.deviceName = settings.syncDeviceName
+            self.deviceID = settings.syncDeviceID
+            self.credentialRevision = activitySync.configurationRevision
+        }
+    }
+
     private let model: DashboardModel
     private let settings: TokenBarSettings
     private let memoryTelemetry: MemoryTelemetryController
+    private let activitySync: ActivitySyncController
     private let requestDetailService: any RequestDetailProviding
     private let sessionLauncher: SessionLauncher
     private let showSettingsAction: () -> Void
@@ -42,11 +60,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var isRootMenuOpen = false
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
+    private var syncSettingsSignature: SyncSettingsSignature
 
     init(
         model: DashboardModel,
         settings: TokenBarSettings = .shared,
         memoryTelemetry: MemoryTelemetryController,
+        activitySync: ActivitySyncController,
         showSettings: @escaping () -> Void,
         requestDetailService: any RequestDetailProviding = CodexRequestDetailService(),
         sessionLauncher: SessionLauncher = SessionLauncher())
@@ -54,9 +74,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.model = model
         self.settings = settings
         self.memoryTelemetry = memoryTelemetry
+        self.activitySync = activitySync
         self.showSettingsAction = showSettings
         self.requestDetailService = requestDetailService
         self.sessionLauncher = sessionLauncher
+        self.syncSettingsSignature = SyncSettingsSignature(
+            settings,
+            activitySync: activitySync)
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
@@ -322,10 +346,24 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.showsClaude
             _ = self.settings.showsGrok
             _ = self.settings.showsFullRequestContentOnHover
+            _ = self.settings.syncEnabled
+            _ = self.settings.syncServerURL
+            _ = self.settings.syncDeviceName
+            _ = self.settings.syncDeviceID
+            _ = self.activitySync.configurationRevision
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.observeSettings()
+                let syncSettingsSignature = SyncSettingsSignature(
+                    self.settings,
+                    activitySync: self.activitySync)
+                if syncSettingsSignature != self.syncSettingsSignature {
+                    self.syncSettingsSignature = syncSettingsSignature
+                    Task { @MainActor [weak self] in
+                        await self?.model.restartActivityRefresh()
+                    }
+                }
                 self.model.updateBackgroundRefreshInterval(self.settings.backgroundRefreshDuration)
                 if self.model.updateStatisticsTimeZone(self.settings.statisticsTimeZone) {
                     Task { @MainActor [weak self] in
@@ -672,7 +710,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let title = session.menuTitle
         let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
+        let isRemote = session.isSynchronizedRemote
         item.representedObject = session
+        item.action = isRemote ? nil : #selector(self.openSession(_:))
 
         let row = (item.view as? TokenMenuRowView) ?? TokenMenuRowView(width: Self.menuWidth)
         row.configure(
@@ -682,9 +722,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             trailing: time,
             showsChevron: true,
             badge: session.menuServiceTierBadge)
-        row.toolTip = "\(title)\n\(detail)\nEnded \(time)\nClick to open in "
-            + "\(session.platformID.displayName) · Hover to inspect turns"
-        row.onActivate = { [weak self, weak item] in
+        row.toolTip = isRemote
+            ? "\(title)\n\(detail)\nEnded \(time)\nSynced session (read-only) · Hover to inspect turns"
+            : "\(title)\n\(detail)\nEnded \(time)\nClick to open in "
+                + "\(session.platformID.displayName) · Hover to inspect turns"
+        row.onActivate = isRemote ? nil : { [weak self, weak item] in
             guard let self else { return }
             item?.menu?.cancelTracking()
             self.rootMenu.cancelTracking()
@@ -771,14 +813,25 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         menu.title = session.menuTitle
         menu.minimumWidth = Self.menuWidth
         menu.addItem(.sectionHeader(title: "Turns"))
-        let copySession = NSMenuItem(
-            title: "Copy Session",
-            action: #selector(self.copySession(_:)),
-            keyEquivalent: "")
-        copySession.target = self
-        copySession.representedObject = session
-        copySession.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
-        menu.addItem(copySession)
+        if session.isSynchronizedRemote {
+            let readOnly = NSMenuItem(
+                title: "Synced session · Read-only on this Mac",
+                action: nil,
+                keyEquivalent: "")
+            readOnly.isEnabled = false
+            menu.addItem(readOnly)
+        } else {
+            let copySession = NSMenuItem(
+                title: "Copy Session",
+                action: #selector(self.copySession(_:)),
+                keyEquivalent: "")
+            copySession.target = self
+            copySession.representedObject = session
+            copySession.image = NSImage(
+                systemSymbolName: "doc.on.doc",
+                accessibilityDescription: nil)
+            menu.addItem(copySession)
+        }
         menu.addItem(.separator())
 
         let requests = session.requests.sorted {
@@ -811,6 +864,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
         let item = NSMenuItem(title: "Turn", action: nil, keyEquivalent: "")
         item.isEnabled = true
+        let isRemote = turn.isSynchronizedRemote
 
         let row = TokenMenuRowView(width: Self.menuWidth)
         row.configure(
@@ -818,18 +872,25 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             cost: turn.menuCostText,
             detail: turn.menuDetail,
             trailing: "\(turn.startedAt.menuClockText) · \(turn.menuDurationText)",
-            showsChevron: physicalRequests.count > 1 || self.settings.showsFullRequestContentOnHover,
+            showsChevron: physicalRequests.count > 1
+                || (self.settings.showsFullRequestContentOnHover && !isRemote),
             badge: turn.menuServiceTierBadge)
         item.view = row
 
         if physicalRequests.count > 1 {
-            item.toolTip = "Hover to inspect the requests contributing to this turn"
+            item.toolTip = isRemote
+                ? "Synced turn (read-only) · Hover to inspect contributing requests"
+                : "Hover to inspect the requests contributing to this turn"
             item.submenu = self.makeAgentRequestMenu(
                 title: turn.menuTitle,
                 requests: physicalRequests)
         } else if let request = physicalRequests.first {
-            self.configureCopyInteraction(item: item, row: row, request: request)
-            if self.settings.showsFullRequestContentOnHover {
+            if isRemote {
+                item.toolTip = "Synced request details are not uploaded"
+            } else {
+                self.configureCopyInteraction(item: item, row: row, request: request)
+            }
+            if self.settings.showsFullRequestContentOnHover, !isRemote {
                 item.submenu = self.makeRequestDetailMenu(for: request)
             }
         }
@@ -856,11 +917,18 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 cost: request.menuCostText,
                 detail: request.menuDetail,
                 trailing: "\(request.startedAt.menuClockText) · \(request.menuDurationText)",
-                showsChevron: self.settings.showsFullRequestContentOnHover,
+                showsChevron: self.settings.showsFullRequestContentOnHover
+                    && !request.isSynchronizedRemote,
                 badge: request.menuServiceTierBadge)
             item.view = row
-            self.configureCopyInteraction(item: item, row: row, request: request)
-            if self.settings.showsFullRequestContentOnHover {
+            if request.isSynchronizedRemote {
+                item.toolTip = "Synced request details are not uploaded"
+            } else {
+                self.configureCopyInteraction(item: item, row: row, request: request)
+            }
+            if self.settings.showsFullRequestContentOnHover,
+               !request.isSynchronizedRemote
+            {
                 item.submenu = self.makeRequestDetailMenu(for: request)
             }
             menu.addItem(item)

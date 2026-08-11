@@ -19,6 +19,10 @@ struct TokenBarSettingsTests {
             #expect(settings.showsGrok)
             #expect(settings.showsFullRequestContentOnHover)
             #expect(settings.resetCelebration == .off)
+            #expect(!settings.syncEnabled)
+            #expect(settings.syncServerURL.isEmpty)
+            #expect(!settings.syncDeviceName.isEmpty)
+            #expect(UUID(uuidString: settings.syncDeviceID) != nil)
         }
     }
 
@@ -34,6 +38,10 @@ struct TokenBarSettingsTests {
             settings?.showsGrok = false
             settings?.showsFullRequestContentOnHover = false
             settings?.resetCelebration = .both
+            settings?.syncEnabled = true
+            settings?.syncServerURL = "https://sync.example.com"
+            settings?.syncDeviceName = "Studio"
+            let deviceID = settings?.syncDeviceID
             settings = nil
 
             let restored = TokenBarSettings(defaults: defaults, keyPrefix: prefix)
@@ -45,6 +53,10 @@ struct TokenBarSettingsTests {
             #expect(!restored.showsGrok)
             #expect(!restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .both)
+            #expect(restored.syncEnabled)
+            #expect(restored.syncServerURL == "https://sync.example.com")
+            #expect(restored.syncDeviceName == "Studio")
+            #expect(restored.syncDeviceID == deviceID)
         }
     }
 
@@ -78,6 +90,9 @@ struct TokenBarSettingsTests {
             settings.showsGrok = false
             settings.showsFullRequestContentOnHover = false
             settings.resetCelebration = .session
+            settings.syncEnabled = true
+            settings.syncServerURL = "https://sync.example.com"
+            settings.syncDeviceName = "Custom name"
 
             settings.resetToDefaults()
 
@@ -90,6 +105,9 @@ struct TokenBarSettingsTests {
             #expect(restored.showsGrok)
             #expect(restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .off)
+            #expect(!restored.syncEnabled)
+            #expect(restored.syncServerURL.isEmpty)
+            #expect(restored.syncDeviceName == TokenBarSettings.defaultSyncDeviceName)
         }
     }
 

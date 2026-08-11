@@ -60,6 +60,8 @@ public final class DashboardModel {
     @ObservationIgnored private let now: @Sendable () -> Date
     @ObservationIgnored private var quotaTimerTask: Task<Void, Never>?
     @ObservationIgnored private var refreshAllTask: Task<Void, Never>?
+    @ObservationIgnored private var activityRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var activityRefreshGeneration = 0
     @ObservationIgnored private var lastQuotaRefreshAttemptAt: [TokenPlatform: Date] = [:]
     @ObservationIgnored private var quotaRefreshEnabledPlatforms: Set<TokenPlatform>
     @ObservationIgnored private var quotaResetDetector = QuotaResetDetector()
@@ -158,6 +160,9 @@ public final class DashboardModel {
         self.quotaTimerTask = nil
         self.refreshAllTask?.cancel()
         self.refreshAllTask = nil
+        self.activityRefreshGeneration += 1
+        self.activityRefreshTask?.cancel()
+        self.activityRefreshTask = nil
     }
 
     public func updateBackgroundRefreshInterval(_ interval: Duration) {
@@ -431,7 +436,35 @@ public final class DashboardModel {
     }
 
     public func refreshActivity() async {
-        guard !self.activity.isRefreshing else { return }
+        await self.startActivityRefresh(restarting: false)
+    }
+
+    public func restartActivityRefresh() async {
+        await self.startActivityRefresh(restarting: true)
+    }
+
+    private func startActivityRefresh(restarting: Bool) async {
+        if restarting {
+            self.activityRefreshGeneration += 1
+            self.activityRefreshTask?.cancel()
+            self.activityRefreshTask = nil
+        } else if self.activityRefreshTask != nil {
+            return
+        }
+        let generation = self.activityRefreshGeneration
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performActivityRefresh(generation: generation)
+        }
+        self.activityRefreshTask = task
+        await task.value
+        if generation == self.activityRefreshGeneration {
+            self.activityRefreshTask = nil
+        }
+    }
+
+    private func performActivityRefresh(generation: Int) async {
+        guard generation == self.activityRefreshGeneration else { return }
         self.activity = DashboardSourceState(
             value: self.activity.value,
             isRefreshing: true,
@@ -443,16 +476,19 @@ public final class DashboardModel {
                     sinceWeeklyResetAtByPlatform: self.weeklyResetDates(),
                     statisticsTimeZone: statisticsTimeZone)
                 try Task.checkCancellation()
+                guard generation == self.activityRefreshGeneration else { return }
                 guard statisticsTimeZone == self.statisticsTimeZone else { continue }
                 self.activity = DashboardSourceState(value: snapshot)
                 try? await self.cache?.saveActivity(snapshot)
                 return
             } catch is CancellationError {
+                guard generation == self.activityRefreshGeneration else { return }
                 self.activity = DashboardSourceState(
                     value: self.activity.value,
                     errorMessage: self.activity.errorMessage)
                 return
             } catch {
+                guard generation == self.activityRefreshGeneration else { return }
                 guard statisticsTimeZone == self.statisticsTimeZone else { continue }
                 self.activity = DashboardSourceState(
                     value: self.activity.value,

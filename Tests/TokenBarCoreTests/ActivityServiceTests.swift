@@ -89,7 +89,11 @@ struct ActivityServiceTests {
 
         _ = try await service.fetchActivity(sinceWeeklyResetAt: reset)
 
-        #expect(await runner.arguments == ["--days", "30", "--weekly-reset-ms", "1720000000125"])
+        #expect(await runner.arguments == [
+            "--days", "30",
+            "--statistics-timezone", "utc",
+            "--weekly-reset-ms", "1720000000125",
+        ])
         #expect(await runner.environments.last?["TZ"] == "UTC")
     }
 
@@ -111,6 +115,7 @@ struct ActivityServiceTests {
 
         #expect(await runner.arguments == [
             "--days", "30",
+            "--statistics-timezone", "utc",
             "--weekly-reset-ms", "1720000000125",
             "--claude-weekly-reset-ms", "1730000000500",
             "--grok-weekly-reset-ms", "1740000000750",
@@ -121,7 +126,11 @@ struct ActivityServiceTests {
     func passesStatisticsTimeZone() async throws {
         let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
         let service = ActivityService(
-            environment: ["PRESERVED": "yes", "TZ": "Old"],
+            environment: [
+                "PRESERVED": "yes",
+                "TZ": "Old",
+                "TOKENBAR_SYNC_TOKEN": "must-not-reach-helper",
+            ],
             resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
             runner: runner)
 
@@ -131,6 +140,8 @@ struct ActivityServiceTests {
 
         #expect(await runner.environments.last?["PRESERVED"] == "yes")
         #expect(await runner.environments.last?["TZ"] == TimeZone.autoupdatingCurrent.identifier)
+        #expect(await runner.environments.last?["TOKENBAR_SYNC_TOKEN"] == nil)
+        #expect(await runner.arguments == ["--statistics-timezone", "local"])
     }
 
     @Test("passes the TokenBar memory database to the activity snapshot helper")
@@ -144,6 +155,7 @@ struct ActivityServiceTests {
         _ = try await service.fetchActivity()
 
         #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
             "--memory-database", "/tmp/tokenbar-memory.sqlite",
         ])
     }
@@ -161,6 +173,7 @@ struct ActivityServiceTests {
         _ = try await service.fetchActivity()
 
         #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
             "--anthropic-pricing-markdown", "/tmp/anthropic-pricing.md",
         ])
     }

@@ -830,11 +830,16 @@ enum DemoPreviewRenderer {
     }
 
     static func renderSettings(path: String) throws {
-        let content = TokenBarSettingsView(settings: .shared)
+        let activitySync = ActivitySyncController(
+            settings: .shared,
+            credentials: DemoActivitySyncCredentialStore())
+        let content = TokenBarSettingsView(
+            settings: .shared,
+            activitySync: activitySync)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .light)
         let host = NSHostingView(rootView: content)
-        host.frame = NSRect(x: 0, y: 0, width: 440, height: 620)
+        host.frame = NSRect(x: 0, y: 0, width: 480, height: 820)
         let canvas = DemoRowPreviewCanvas(frame: host.bounds)
         host.frame = canvas.bounds
         canvas.addSubview(host)
@@ -914,6 +919,11 @@ private final class DemoRowPreviewCanvas: NSView {
         NSColor.windowBackgroundColor.setFill()
         self.bounds.fill()
     }
+}
+
+private struct DemoActivitySyncCredentialStore: ActivitySyncCredentialStoring {
+    func loadToken() throws -> String? { "demo-token" }
+    func saveToken(_: String?) throws {}
 }
 
 private extension Date {

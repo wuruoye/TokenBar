@@ -10,6 +10,12 @@ struct TokenBarApp: App {
             TokenBarSettingsView(
                 settings: .shared,
                 memoryTelemetry: self.appDelegate.memoryTelemetryController,
+                activitySync: self.appDelegate.activitySyncController,
+                syncNow: {
+                    Task { @MainActor in
+                        await self.appDelegate.refreshActivity()
+                    }
+                },
                 testResetAnimation: {
                     self.appDelegate.testResetAnimation()
                 })

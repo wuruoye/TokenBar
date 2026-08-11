@@ -1,0 +1,32 @@
+[Unit]
+Description=Upload sanitized TokenBar activity snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%E/tokenbar-sync/client.env
+Environment=PATH=%h/.local/lib/tokenbar-sync/bin:/usr/local/bin:/usr/bin
+Environment=TOKENBAR_SYNC_DEVICE_ID_FILE=%E/tokenbar-sync/device-id
+ExecStart=%h/.local/lib/tokenbar-sync/bin/tokenbar-sync-client upload
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%E/tokenbar-sync %S/tokenbar-sync
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LockPersonality=true
+LimitCORE=0
+MemoryMax=512M
+TasksMax=64
