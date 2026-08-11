@@ -76,6 +76,7 @@ struct CodexTokenUsage {
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
     cache_read_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
     total_tokens: Option<i64>,
 }
@@ -85,6 +86,7 @@ struct CodexTotals {
     input: i64,
     output: i64,
     cached: i64,
+    cache_write: i64,
     reasoning: i64,
 }
 
@@ -98,6 +100,7 @@ impl CodexTotals {
                 .unwrap_or(0)
                 .max(usage.cache_read_input_tokens.unwrap_or(0))
                 .max(0),
+            cache_write: usage.cache_write_input_tokens.unwrap_or(0).max(0),
             reasoning: usage.reasoning_output_tokens.unwrap_or(0).max(0),
         }
     }
@@ -106,6 +109,7 @@ impl CodexTotals {
         if self.input < previous.input
             || self.output < previous.output
             || self.cached < previous.cached
+            || self.cache_write < previous.cache_write
             || self.reasoning < previous.reasoning
         {
             return None;
@@ -114,6 +118,7 @@ impl CodexTotals {
             input: self.input - previous.input,
             output: self.output - previous.output,
             cached: self.cached - previous.cached,
+            cache_write: self.cache_write - previous.cache_write,
             reasoning: self.reasoning - previous.reasoning,
         })
     }
@@ -123,6 +128,7 @@ impl CodexTotals {
             input: self.input.saturating_add(other.input),
             output: self.output.saturating_add(other.output),
             cached: self.cached.saturating_add(other.cached),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
             reasoning: self.reasoning.saturating_add(other.reasoning),
         }
     }
@@ -131,6 +137,7 @@ impl CodexTotals {
         self.input
             .saturating_add(self.output)
             .saturating_add(self.cached)
+            .saturating_add(self.cache_write)
             .saturating_add(self.reasoning)
     }
 
@@ -138,6 +145,7 @@ impl CodexTotals {
         self.input <= baseline.input
             && self.output <= baseline.output
             && self.cached <= baseline.cached
+            && self.cache_write <= baseline.cache_write
             && self.reasoning <= baseline.reasoning
     }
 
@@ -153,12 +161,18 @@ impl CodexTotals {
     }
 
     fn into_tokens(self) -> TokenBreakdown {
+        // Codex reports cache reads and writes as subcategories of
+        // `input_tokens`. TokenBar moves them into disjoint presentation
+        // buckets so adding the rows reconstructs the provider's raw input
+        // total exactly once.
         let clamped_cached = self.cached.min(self.input).max(0);
+        let remaining_input = self.input.saturating_sub(clamped_cached);
+        let clamped_cache_write = self.cache_write.min(remaining_input).max(0);
         TokenBreakdown {
-            input: (self.input - clamped_cached).max(0),
+            input: remaining_input.saturating_sub(clamped_cache_write),
             output: self.output.max(0),
             cache_read: clamped_cached,
-            cache_write: 0,
+            cache_write: clamped_cache_write,
             reasoning: self.reasoning.max(0),
         }
     }
@@ -918,13 +932,14 @@ fn codex_token_count_dedup_key(
 ) -> String {
     if let Some(total) = total_usage {
         return format!(
-            "codex:token_count-total:{}:{}:{}:{}:{}:{}:{}",
+            "codex:token_count-total:{}:{}:{}:{}:{}:{}:{}:{}",
             upstream_session_id,
             message.provider_id,
             model,
             total.input,
             total.output,
             total.cached,
+            total.cache_write,
             total.reasoning
         );
     }
@@ -1012,14 +1027,21 @@ fn parse_codex_headless_line(
         .or_else(|| extract_i64(usage.get("input")))
         .unwrap_or(0)
         .max(0);
+    let cache_write = extract_i64(usage.get("cache_write_input_tokens"))
+        .or_else(|| extract_i64(usage.get("cache_write_tokens")))
+        .unwrap_or(0)
+        .max(0);
     let output = extract_i64(usage.get("output_tokens"))
         .or_else(|| extract_i64(usage.get("completion_tokens")))
         .or_else(|| extract_i64(usage.get("output")))
         .unwrap_or(0)
         .max(0);
-    if input == 0 && output == 0 && cached == 0 {
+    if input == 0 && output == 0 && cached == 0 && cache_write == 0 {
         return None;
     }
+    let clamped_cached = cached.min(input);
+    let remaining_input = input.saturating_sub(clamped_cached);
+    let clamped_cache_write = cache_write.min(remaining_input);
     let model = extract_model_from_value(&value)
         .or_else(|| current_model.clone())
         .unwrap_or_else(|| "unknown".to_string());
@@ -1045,10 +1067,10 @@ fn parse_codex_headless_line(
         session_id,
         timestamp,
         TokenBreakdown {
-            input: input.saturating_sub(cached),
+            input: remaining_input.saturating_sub(clamped_cache_write),
             output,
-            cache_read: cached,
-            cache_write: 0,
+            cache_read: clamped_cached,
+            cache_write: clamped_cache_write,
             reasoning: 0,
         },
         0.0,
@@ -1148,6 +1170,37 @@ mod tests {
                         "output_tokens": last.1,
                         "cached_input_tokens": last.2,
                         "reasoning_output_tokens": last.3
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn token_line_with_cache_write(
+        timestamp: &str,
+        total: (i64, i64, i64, i64, i64),
+        last: (i64, i64, i64, i64, i64),
+    ) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": total.0,
+                        "output_tokens": total.1,
+                        "cached_input_tokens": total.2,
+                        "cache_write_input_tokens": total.3,
+                        "reasoning_output_tokens": total.4
+                    },
+                    "last_token_usage": {
+                        "input_tokens": last.0,
+                        "output_tokens": last.1,
+                        "cached_input_tokens": last.2,
+                        "cache_write_input_tokens": last.3,
+                        "reasoning_output_tokens": last.4
                     }
                 }
             }
@@ -1323,6 +1376,40 @@ mod tests {
             Some("Build this now")
         );
         assert_eq!(messages[0].workspace_label.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn cache_write_is_an_input_subcategory_without_double_counting() {
+        let lines = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            token_line_with_cache_write(
+                "2026-01-01T00:00:01Z",
+                (100, 20, 60, 10, 5),
+                (100, 20, 60, 10, 5)
+            ),
+            token_line_with_cache_write(
+                "2026-01-01T00:00:02Z",
+                (120, 25, 70, 15, 7),
+                (20, 5, 10, 5, 2)
+            )
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tokens.input, 30);
+        assert_eq!(messages[0].tokens.cache_read, 60);
+        assert_eq!(messages[0].tokens.cache_write, 10);
+        assert_eq!(
+            messages[0].tokens.input
+                + messages[0].tokens.cache_read
+                + messages[0].tokens.cache_write,
+            100
+        );
+        assert_eq!(messages[1].tokens.input, 5);
+        assert_eq!(messages[1].tokens.cache_read, 10);
+        assert_eq!(messages[1].tokens.cache_write, 5);
     }
 
     #[test]

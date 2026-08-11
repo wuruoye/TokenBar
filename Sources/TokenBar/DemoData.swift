@@ -409,8 +409,14 @@ struct DemoActivityProvider: ActivityProviding {
             sources.append(source)
         }
 
+        let demoEnvironment = ProcessInfo.processInfo.environment
+        let memoryIncludesData = demoEnvironment["TOKENBAR_DEMO_MEMORY_EMPTY"] != "1"
+            && demoEnvironment["TOKENBAR_DEMO_MEMORY_DISCONNECTED"] != "1"
+            && demoEnvironment["TOKENBAR_DEMO_MEMORY_WAITING"] != "1"
+        let memoryHasOtlpConnection = memoryIncludesData
+            || demoEnvironment["TOKENBAR_DEMO_MEMORY_WAITING"] == "1"
         let object: [String: Any] = [
-            "schemaVersion": 8,
+            "schemaVersion": 9,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [
@@ -431,8 +437,82 @@ struct DemoActivityProvider: ActivityProviding {
             "sessions": sessions,
             "days": days,
             "sources": sources,
+            "memoryUsage": self.makeMemoryUsage(
+                now: now,
+                formatter: formatter,
+                calendar: calendar,
+                includesData: memoryIncludesData,
+                hasOtlpConnection: memoryHasOtlpConnection),
         ]
         return try JSONDecoder().decode(ActivitySnapshot.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    private func makeMemoryUsage(
+        now: Date,
+        formatter: DateFormatter,
+        calendar: Calendar,
+        includesData: Bool,
+        hasOtlpConnection: Bool) -> [String: Any]
+    {
+        var phase1Range = DemoMemoryCounter()
+        var phase2Range = DemoMemoryCounter()
+        var memoryDays: [[String: Any]] = []
+        for offset in (0 ..< 30).reversed() {
+            let date = calendar.date(byAdding: .day, value: -offset, to: now) ?? now
+            let index = 29 - offset
+            let hasMemoryRun = includesData && ![3, 8, 14, 21, 26].contains(index)
+            let wave = Int64(index % 6)
+            let phase1 = hasMemoryRun
+                ? DemoMemoryCounter(
+                    total: 104_000 + wave * 9_200,
+                    input: 91_000 + wave * 8_000,
+                    cachedInput: 62_000 + wave * 5_600,
+                    cacheWriteInput: 3_200 + wave * 300,
+                    output: 13_000 + wave * 1_200,
+                    reasoningOutput: 3_900 + wave * 420)
+                : DemoMemoryCounter()
+            let phase2 = hasMemoryRun
+                ? DemoMemoryCounter(
+                    total: 47_000 + wave * 4_100,
+                    input: 39_000 + wave * 3_500,
+                    cachedInput: 26_000 + wave * 2_500,
+                    cacheWriteInput: 1_100 + wave * 100,
+                    output: 8_000 + wave * 600,
+                    reasoningOutput: 2_300 + wave * 220)
+                : DemoMemoryCounter()
+            phase1Range.add(phase1)
+            phase2Range.add(phase2)
+            memoryDays.append([
+                "date": formatter.string(from: date),
+                "phase1": phase1.object,
+                "phase2": phase2.object,
+            ])
+        }
+        let today = memoryDays.last ?? [
+            "phase1": DemoMemoryCounter().object,
+            "phase2": DemoMemoryCounter().object,
+        ]
+        return [
+            "collectedFromMs": Int64(
+                (calendar.date(byAdding: .day, value: -29, to: now) ?? now)
+                    .timeIntervalSince1970 * 1000),
+            "lastReceivedAtMs": hasOtlpConnection
+                ? Int64(now.addingTimeInterval(-6 * 60).timeIntervalSince1970 * 1000)
+                : NSNull(),
+            "lastMemoryReceivedAtMs": includesData
+                ? Int64(now.addingTimeInterval(-6 * 60).timeIntervalSince1970 * 1000)
+                : NSNull(),
+            "observationCount": includesData ? 300 : 0,
+            "today": [
+                "phase1": today["phase1"] ?? DemoMemoryCounter().object,
+                "phase2": today["phase2"] ?? DemoMemoryCounter().object,
+            ],
+            "rangeTotals": [
+                "phase1": phase1Range.object,
+                "phase2": phase2Range.object,
+            ],
+            "days": memoryDays,
+        ]
     }
 }
 
@@ -512,6 +592,35 @@ private struct DemoTokenCounter {
             cacheRead: self.cacheRead - other.cacheRead,
             cacheWrite: self.cacheWrite - other.cacheWrite,
             reasoning: self.reasoning - other.reasoning)
+    }
+}
+
+private struct DemoMemoryCounter {
+    var total: Int64 = 0
+    var input: Int64 = 0
+    var cachedInput: Int64 = 0
+    var cacheWriteInput: Int64 = 0
+    var output: Int64 = 0
+    var reasoningOutput: Int64 = 0
+
+    var object: [String: Int64] {
+        [
+            "total": self.total,
+            "input": self.input,
+            "cachedInput": self.cachedInput,
+            "cacheWriteInput": self.cacheWriteInput,
+            "output": self.output,
+            "reasoningOutput": self.reasoningOutput,
+        ]
+    }
+
+    mutating func add(_ other: DemoMemoryCounter) {
+        self.total += other.total
+        self.input += other.input
+        self.cachedInput += other.cachedInput
+        self.cacheWriteInput += other.cacheWriteInput
+        self.output += other.output
+        self.reasoningOutput += other.reasoningOutput
     }
 }
 
@@ -638,6 +747,64 @@ enum DemoPreviewRenderer {
             y: 0,
             width: ActivityDetailView.preferredWidth,
             height: ActivityDetailView.preferredHeight)
+        let canvas = DemoRowPreviewCanvas(frame: host.bounds)
+        host.frame = canvas.bounds
+        canvas.addSubview(host)
+        try self.render(view: canvas, scale: 2, path: path)
+    }
+
+    static func renderMemory(model: DashboardModel, path: String) throws {
+        let previewDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBarMemoryPreview-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: previewDirectory) }
+        let isEmpty = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MEMORY_EMPTY"] == "1"
+        let configurationService = CodexMemoryConfigurationService(
+            configurationURL: previewDirectory.appendingPathComponent("config.toml"))
+        if !isEmpty {
+            try configurationService.install()
+        }
+        let telemetry = MemoryTelemetryController(
+            paths: MemoryTelemetryPaths(directoryURL: previewDirectory),
+            configurationService: configurationService,
+            environment: [:],
+            initialReceiverState: .listening(
+                startedAt: Date().addingTimeInterval(-29 * 86_400)),
+            initialConfigurationState: isEmpty ? .notConfigured : .configured)
+        let usage = model.activitySnapshot?.memoryUsage
+        let content = HStack(alignment: .top, spacing: 20) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Menu summary")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                MemorySummarySection(
+                    usage: usage,
+                    receiverState: telemetry.receiverState,
+                    configurationState: telemetry.configurationState,
+                    accentColor: .purple)
+                    .frame(
+                        width: 384,
+                        height: MemorySummarySection.preferredHeight,
+                        alignment: .top)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Detail submenu")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                MemoryDetailView(
+                    model: model,
+                    telemetry: telemetry,
+                    accentColor: .purple)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .padding(20)
+        .frame(width: 984, height: 582, alignment: .topLeading)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.colorScheme, .light)
+        let host = NSHostingView(rootView: content)
+        host.frame = NSRect(x: 0, y: 0, width: 984, height: 582)
         let canvas = DemoRowPreviewCanvas(frame: host.bounds)
         host.frame = canvas.bounds
         canvas.addSubview(host)

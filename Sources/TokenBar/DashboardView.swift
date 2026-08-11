@@ -248,6 +248,12 @@ private struct QuotaSummarySection: View {
                 Text("Quota")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
+                if let snapshot = self.state.value {
+                    Text(self.sampleText(snapshot))
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
                 if self.state.errorMessage != nil {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
@@ -281,6 +287,18 @@ private struct QuotaSummarySection: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private func sampleText(_ snapshot: QuotaSnapshot) -> String {
+        let age = snapshot.updatedAt.compactPastText
+        switch snapshot.origin {
+        case .claudeDesktop:
+            return "Claude Desktop · \(age)"
+        case .liveProvider:
+            return "Anthropic · \(age)"
+        case nil:
+            return "Sampled \(age)"
+        }
     }
 }
 
@@ -472,7 +490,9 @@ private struct QuotaProgressRow: View {
     }
 
     private var resetText: String {
-        guard let reset = self.window.resetsAt else { return "Reset time unavailable" }
+        guard let reset = self.window.resetsAt, reset > Date() else {
+            return "Reset time unavailable"
+        }
         return "Resets \(reset.compactFutureText)"
     }
 }
@@ -651,8 +671,8 @@ struct ActivityTotalsBreakdown: View {
             HStack(spacing: 16) {
                 TokenLegend(
                     label: "Input",
-                    value: self.totals.tokens.input,
-                    costUsd: self.totals.tokenCosts?.input,
+                    value: self.totals.tokens.displayedInput,
+                    costUsd: self.totals.tokenCosts?.displayedInput,
                     color: self.accentColor)
                 TokenLegend(
                     label: "Output",
@@ -663,8 +683,8 @@ struct ActivityTotalsBreakdown: View {
             HStack(spacing: 16) {
                 TokenLegend(
                     label: "Cache",
-                    value: self.totals.tokens.cacheRead + self.totals.tokens.cacheWrite,
-                    costUsd: self.totals.tokenCosts?.cache,
+                    value: self.totals.tokens.displayedCache,
+                    costUsd: self.totals.tokenCosts?.displayedCache,
                     color: TokenBarPalette.mint)
                 TokenLegend(
                     label: "Reasoning",
@@ -701,11 +721,11 @@ private struct TokenStackedBar: View {
 
     private var components: [TokenComponent] {
         [
-            TokenComponent(id: "input", value: self.tokens.input, color: self.accentColor),
+            TokenComponent(id: "input", value: self.tokens.displayedInput, color: self.accentColor),
             TokenComponent(id: "output", value: self.tokens.output, color: TokenBarPalette.blue),
             TokenComponent(
                 id: "cache",
-                value: self.tokens.cacheRead + self.tokens.cacheWrite,
+                value: self.tokens.displayedCache,
                 color: TokenBarPalette.mint),
             TokenComponent(id: "reasoning", value: self.tokens.reasoning, color: TokenBarPalette.orange),
         ].filter { $0.value > 0 }

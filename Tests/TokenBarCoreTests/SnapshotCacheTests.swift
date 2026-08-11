@@ -89,7 +89,13 @@ struct SnapshotCacheTests {
         let fileURL = directory.appendingPathComponent("quotas.json")
         let cache = QuotaSnapshotCache(fileURL: fileURL)
         let codex = TestFixtures.quota(usedPercent: 20)
-        let claude = TestFixtures.quota(usedPercent: 35)
+        let fixture = TestFixtures.quota(usedPercent: 35)
+        let claude = QuotaSnapshot(
+            session: fixture.session,
+            weekly: fixture.weekly,
+            resetCredits: fixture.resetCredits,
+            updatedAt: fixture.updatedAt,
+            origin: .claudeDesktop)
 
         try await cache.saveQuotas([.codex: codex, .claude: claude])
         let loaded = try await cache.loadQuotas()
@@ -98,6 +104,7 @@ struct SnapshotCacheTests {
 
         #expect(loaded[.codex] == codex)
         #expect(loaded[.claude] == claude)
+        #expect(loaded[.claude]?.origin == .claudeDesktop)
         #expect(permissions == 0o600)
     }
 }

@@ -264,6 +264,70 @@ struct DashboardModelTests {
         #expect(!model.activity.isRefreshing)
     }
 
+    @Test("missing reset metadata does not inherit an expired reset date")
+    @MainActor
+    func rejectsExpiredInheritedReset() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let previous = self.quota(
+            reset: now.addingTimeInterval(-60),
+            updatedAt: now.addingTimeInterval(-600))
+        let desktopSample = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 4,
+                windowMinutes: 10_080,
+                resetsAt: nil),
+            resetCredits: nil,
+            updatedAt: now,
+            origin: .claudeDesktop)
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([.success(previous), .success(desktopSample)]),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.refreshQuota()
+        await model.refreshQuota()
+
+        #expect(model.quota.value?.weekly?.usedPercent == 4)
+        #expect(model.quota.value?.weekly?.resetsAt == nil)
+        #expect(model.quota.value?.origin == .claudeDesktop)
+    }
+
+    @Test("missing reset metadata retains a compatible future reset date")
+    @MainActor
+    func retainsCompatibleFutureReset() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(2 * 86_400)
+        let previous = self.quota(reset: reset, updatedAt: now.addingTimeInterval(-600))
+        let desktopSample = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 4,
+                windowMinutes: 10_080,
+                resetsAt: nil),
+            resetCredits: nil,
+            updatedAt: now,
+            origin: .claudeDesktop)
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([.success(previous), .success(desktopSample)]),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.refreshQuota()
+        await model.refreshQuota()
+
+        #expect(model.quota.value?.weekly?.resetsAt == reset)
+        #expect(model.quota.value?.origin == .claudeDesktop)
+    }
+
     @Test("refresh passes the current weekly window start to activity")
     @MainActor
     func passesWeeklyWindowStart() async {

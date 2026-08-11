@@ -35,6 +35,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
+- On the **Codex** tab only, track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output.
 - Browse the selected platform's recent sessions, using provider-generated titles when available. Codex and Claude sessions open in their desktop apps; Grok sessions resume in Terminal from their original workspace.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
@@ -90,9 +91,10 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 2. Click a provider's `T/W` section to open its matching tab. Opening the menu refreshes local activity and any quota data older than one minute.
 3. Use the three tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
 4. Hover **Activity** for the daily chart and per-model breakdowns.
-5. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
-6. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
-7. Use **Copy Session** or click a request row to copy its stable locator.
+5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings.
+6. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
+7. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
+8. Use **Copy Session** or click a request row to copy its stable locator.
 
 Useful shortcuts:
 
@@ -126,10 +128,27 @@ cache-read tokens / (input tokens + cache-read tokens + cache-write tokens) × 1
 
 Costs prefixed with `~` are compatibility estimates based on pricing data maintained inside TokenBar, not provider invoices. Provider-reported costs, when present in the source data, remain authoritative. TokenBar reads only the non-sensitive `auth_mode` field from the active Codex home's `auth.json` to choose the Fast basis. ChatGPT subscription sessions follow Codex credit consumption—GPT-5.4 uses 2× and GPT-5.5/5.6 use 2.5×—while API Key sessions follow API Priority pricing, where GPT-5.6 uses 2×. The underlying dollar estimates still use standard API token rates, so subscription totals are best understood as credit-weighted compatibility estimates. See OpenAI's [Codex Fast mode documentation](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode), [pricing table](https://developers.openai.com/api/docs/pricing), and [Priority Processing guide](https://developers.openai.com/api/docs/guides/priority-processing). A model without an explicitly verified Fast multiplier keeps its standard estimate instead of receiving a guessed multiplier.
 
+Codex reports `cached_input_tokens` and `cache_write_input_tokens` as subcategories of `input_tokens`. TokenBar separates those buckets internally so their rows add back to the provider's raw input total exactly once. In the dashboard, cache writes are included in **Input**, while **Cache** means cache reads; the internal split is retained so each category can use its own price. For GPT-5.6, cache writes use OpenAI's documented 1.25× uncached-input rate; models without a verified cache-write rate remain unpriced if a nonzero write is reported. See the [GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#using-gpt-5-6).
+
 Recognized OpenAI model IDs retain the estimate behind custom Codex gateways, and the unpriced research-preview `gpt-5.3-codex-spark` ID uses the public GPT-5.3-Codex rate so historical totals stay aligned with Tokscale. Unknown model families remain unpriced. TokenBar also preserves the existing Tokscale long-context convention instead of silently applying a different `>272K` multiplier to old history.
+
+Claude compatibility estimates use a reviewed built-in fallback plus Anthropic's official [pricing table](https://platform.claude.com/docs/en/about-claude/pricing). TokenBar checks the official Markdown catalog at most once every 24 hours, validates its document shape before caching it, strictly validates the table schema and rates before use, and keeps the previous catalog or built-in rates when the request or validation fails. Claude Code's 5-minute and 1-hour cache-write token buckets are priced separately when the transcript exposes that breakdown. Unknown model IDs still remain unpriced instead of inheriting a nearby model's rate.
 
 Fast pricing never changes raw token/cache counts. Quota percentages come from Codex and are not multiplied again; quota and local token totals measure different things and should not be expected to map one-to-one.
 
+### Codex Memory tokens
+
+TokenBar runs a metrics-only OTLP/HTTP JSON receiver on `127.0.0.1:4318`. The receiver accepts only `POST /v1/metrics`, retains only `codex.memory.phase1.token_usage` and `codex.memory.phase2.token_usage`, and stores observations in `~/Library/Application Support/TokenBar/memory-telemetry.sqlite`. It reads histogram `sum`; histogram `count` is only the number of observations and is never treated as token usage.
+
+The owner-only database keeps each observation plus a persisted series watermark. DELTA points are added once per unique interval. CUMULATIVE points add only the increase over the latest in-order watermark; duplicate and out-of-order exports add zero, while a new start time or resource series is counted independently. This state survives TokenBar and Codex process restarts. The Memory detail view reports how many raw observations are stored locally.
+
+The main menu shows the 30-day Memory total, the Phase 1/Phase 2 split, and compact input/cache/output/reasoning fields. Its detail submenu adds Today/30 days selection, a daily stacked chart, complete token-type breakdowns for both phases, receiver/config status, collection timestamps, and the local observation count.
+
+Collection is opt-in. When no existing `[otel]` section is present, **Enable Memory Metrics** appends user-level Codex settings that enable analytics, route metrics to TokenBar in JSON, and keep log, trace, and prompt export disabled. TokenBar creates a backup before changing the file. If `[otel]` already exists, TokenBar preserves it and asks you to configure its metrics exporter manually. Codex loads the exporter when its local process starts, so restart Codex or ChatGPT once after enabling. Collection starts with future Memory runs; TokenBar does not invent or backfill historical Phase 1 usage.
+
+The UI distinguishes receiver health, the last OTLP connection from any Codex metric export, and the last recognized Phase 1 or Phase 2 export. A healthy receiver or OTLP connection alone does not mean that a qualifying asynchronous Memory run has occurred.
+
+The memory histogram does not provide reliable pricing attribution. TokenBar therefore shows those tokens without a guessed cost. Reasoning output is exposed as its own diagnostic field but remains a subset of output, so the component rows should not be added together.
 
 ## Privacy
 
@@ -139,13 +158,14 @@ TokenBar is designed to keep session content local:
 - It reads Claude Code JSONL logs under `~/.claude/projects`, or the equivalent directory selected by `CLAUDE_CONFIG_DIR`.
 - It reads Grok Build's `summary.json` and durable `updates.jsonl` files under `~/.grok/sessions`, or the equivalent directory selected by `GROK_HOME`.
 - Codex-generated titles are read from `session_index.jsonl` in the same Codex home directory.
-- Local activity parsing, turn attribution, and pricing do not upload session content, fetch remote pricing, or read a Tokscale runtime cache.
+- Local activity parsing, turn attribution, and pricing never upload session content or read a Tokscale runtime cache. The only pricing update is an unauthenticated read of Anthropic's public pricing Markdown at most once every 24 hours; the validated file is stored at `~/Library/Application Support/TokenBar/anthropic-pricing.md` with owner-only permissions.
 - Full prompt and output text is read lazily when a request detail menu opens and is retained in memory only for the current process.
 - The persistent activity cache omits titles, prompt/output previews, and source paths, including those nested under physical requests. It is stored at `~/Library/Application Support/TokenBar/activity-snapshot.json` with owner-only permissions.
 - The last successful provider quota snapshots are stored at `~/Library/Application Support/TokenBar/quota-snapshots.json`, also with owner-only permissions, so a temporary provider rate limit does not blank the menu.
-- TokenBar contains no telemetry or analytics integration.
+- The optional Codex Memory receiver stores token counts, timestamps, metric names, deduplication fingerprints, and a small allowlist of process identity fields. It discards the full request body and never stores prompts, traces, logs, arbitrary metric attributes, or unrelated metrics.
+- TokenBar does not send its own telemetry or analytics. The Codex Memory integration receives the two selected metrics over loopback only.
 
-Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when that endpoint rate-limits a refresh, TokenBar can use Claude Desktop's recent local usage sample. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
+Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when a live refresh is unavailable, TokenBar can use Claude Desktop's recent local usage sample and labels that source in the quota header. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
 
 ## Settings
 
@@ -157,6 +177,7 @@ Open **Settings** with `Command-,` to configure:
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
+- **Codex Memory:** inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
 - **Background refresh:** 1, 5, 10, or 15 minutes.
 - **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.
 

@@ -64,6 +64,10 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         }
     }
 
+    public var supportsCodexMemory: Bool {
+        self == .codex
+    }
+
     public static func visibleScopes(showsClaude: Bool, showsGrok: Bool) -> [Self] {
         Self.allCases.filter { scope in
             switch scope {
@@ -98,6 +102,14 @@ public struct TokenBreakdown: Codable, Equatable, Sendable {
             .saturatingAdd(self.reasoning)
     }
 
+    public var displayedInput: Int64 {
+        self.input.saturatingAdd(self.cacheWrite)
+    }
+
+    public var displayedCache: Int64 {
+        self.cacheRead
+    }
+
     public static let zero = TokenBreakdown(
         input: 0,
         output: 0,
@@ -121,8 +133,12 @@ public struct TokenCostBreakdown: Codable, Equatable, Sendable {
         self.reasoning = reasoning
     }
 
-    public var cache: Double {
-        self.cacheRead + self.cacheWrite
+    public var displayedInput: Double {
+        self.input + self.cacheWrite
+    }
+
+    public var displayedCache: Double {
+        self.cacheRead
     }
 
     public var total: Double {
@@ -150,11 +166,31 @@ public struct QuotaResetCreditsSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+public enum QuotaSnapshotOrigin: String, Codable, Equatable, Sendable {
+    case liveProvider
+    case claudeDesktop
+}
+
 public struct QuotaSnapshot: Codable, Equatable, Sendable {
     public let session: QuotaWindowSnapshot?
     public let weekly: QuotaWindowSnapshot?
     public let resetCredits: QuotaResetCreditsSnapshot?
     public let updatedAt: Date
+    public let origin: QuotaSnapshotOrigin?
+
+    public init(
+        session: QuotaWindowSnapshot?,
+        weekly: QuotaWindowSnapshot?,
+        resetCredits: QuotaResetCreditsSnapshot?,
+        updatedAt: Date,
+        origin: QuotaSnapshotOrigin? = nil)
+    {
+        self.session = session
+        self.weekly = weekly
+        self.resetCredits = resetCredits
+        self.updatedAt = updatedAt
+        self.origin = origin
+    }
 
     public var mostConstrainedWindow: (label: String, window: QuotaWindowSnapshot)? {
         [("5h", self.session), ("W", self.weekly)]
@@ -546,6 +582,131 @@ public struct ActivitySourceSnapshot: Codable, Equatable, Identifiable, Sendable
     public var id: TokenPlatform { self.platform }
 }
 
+public struct MemoryPhaseUsage: Codable, Equatable, Sendable {
+    public let total: Int64
+    public let input: Int64
+    public let cachedInput: Int64
+    public let cacheWriteInput: Int64
+    public let output: Int64
+    public let reasoningOutput: Int64
+
+    public init(
+        total: Int64,
+        input: Int64,
+        cachedInput: Int64,
+        cacheWriteInput: Int64,
+        output: Int64,
+        reasoningOutput: Int64)
+    {
+        self.total = total
+        self.input = input
+        self.cachedInput = cachedInput
+        self.cacheWriteInput = cacheWriteInput
+        self.output = output
+        self.reasoningOutput = reasoningOutput
+    }
+
+    public var cache: Int64 {
+        self.cachedInput.saturatingAdd(self.cacheWriteInput)
+    }
+
+    public func adding(_ other: MemoryPhaseUsage) -> MemoryPhaseUsage {
+        MemoryPhaseUsage(
+            total: self.total.saturatingAdd(other.total),
+            input: self.input.saturatingAdd(other.input),
+            cachedInput: self.cachedInput.saturatingAdd(other.cachedInput),
+            cacheWriteInput: self.cacheWriteInput.saturatingAdd(other.cacheWriteInput),
+            output: self.output.saturatingAdd(other.output),
+            reasoningOutput: self.reasoningOutput.saturatingAdd(other.reasoningOutput))
+    }
+
+    public static let zero = MemoryPhaseUsage(
+        total: 0,
+        input: 0,
+        cachedInput: 0,
+        cacheWriteInput: 0,
+        output: 0,
+        reasoningOutput: 0)
+}
+
+public struct MemoryUsageTotals: Codable, Equatable, Sendable {
+    public let phase1: MemoryPhaseUsage
+    public let phase2: MemoryPhaseUsage
+
+    public init(phase1: MemoryPhaseUsage, phase2: MemoryPhaseUsage) {
+        self.phase1 = phase1
+        self.phase2 = phase2
+    }
+
+    public var total: Int64 {
+        self.phase1.total.saturatingAdd(self.phase2.total)
+    }
+
+    public var combined: MemoryPhaseUsage {
+        self.phase1.adding(self.phase2)
+    }
+
+    public static let zero = MemoryUsageTotals(phase1: .zero, phase2: .zero)
+}
+
+public struct MemoryDailySummary: Codable, Equatable, Identifiable, Sendable {
+    public var id: String { self.date }
+
+    public let date: String
+    public let phase1: MemoryPhaseUsage
+    public let phase2: MemoryPhaseUsage
+
+    public init(date: String, phase1: MemoryPhaseUsage, phase2: MemoryPhaseUsage) {
+        self.date = date
+        self.phase1 = phase1
+        self.phase2 = phase2
+    }
+
+    public var totals: MemoryUsageTotals {
+        MemoryUsageTotals(phase1: self.phase1, phase2: self.phase2)
+    }
+}
+
+public struct MemoryUsageSnapshot: Codable, Equatable, Sendable {
+    public let collectedFromMs: Int64
+    public let lastReceivedAtMs: Int64?
+    public let lastMemoryReceivedAtMs: Int64?
+    public let observationCount: Int64
+    public let today: MemoryUsageTotals
+    public let rangeTotals: MemoryUsageTotals
+    public let days: [MemoryDailySummary]
+
+    public init(
+        collectedFromMs: Int64,
+        lastReceivedAtMs: Int64?,
+        lastMemoryReceivedAtMs: Int64?,
+        observationCount: Int64,
+        today: MemoryUsageTotals,
+        rangeTotals: MemoryUsageTotals,
+        days: [MemoryDailySummary])
+    {
+        self.collectedFromMs = collectedFromMs
+        self.lastReceivedAtMs = lastReceivedAtMs
+        self.lastMemoryReceivedAtMs = lastMemoryReceivedAtMs
+        self.observationCount = observationCount
+        self.today = today
+        self.rangeTotals = rangeTotals
+        self.days = days
+    }
+
+    public var collectedFrom: Date {
+        Date(timeIntervalSince1970: Double(self.collectedFromMs) / 1000)
+    }
+
+    public var lastReceivedAt: Date? {
+        self.lastReceivedAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+    }
+
+    public var lastMemoryReceivedAt: Date? {
+        self.lastMemoryReceivedAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+    }
+}
+
 public struct ActivitySnapshot: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let generatedAtMs: Int64
@@ -556,6 +717,7 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
     public let sessions: [SessionSummary]
     public let days: [DailySummary]
     public let sources: [ActivitySourceSnapshot]?
+    public let memoryUsage: MemoryUsageSnapshot?
 
     public init(
         schemaVersion: Int,
@@ -566,7 +728,8 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
         days: [DailySummary],
         weeklySinceReset: ActivityRangeSummary? = nil,
         sources: [ActivitySourceSnapshot]? = nil,
-        rangeTotals: ActivityTotals? = nil)
+        rangeTotals: ActivityTotals? = nil,
+        memoryUsage: MemoryUsageSnapshot? = nil)
     {
         self.schemaVersion = schemaVersion
         self.generatedAtMs = generatedAtMs
@@ -577,6 +740,7 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
         self.sessions = sessions
         self.days = days
         self.sources = sources
+        self.memoryUsage = memoryUsage
     }
 
     public var generatedAt: Date {
@@ -608,7 +772,8 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
                         sessionCount: 0)
                 },
                 sources: [],
-                rangeTotals: .zero)
+                rangeTotals: .zero,
+                memoryUsage: platform == .codex ? self.memoryUsage : nil)
         }
         return ActivitySnapshot(
             schemaVersion: self.schemaVersion,
@@ -619,7 +784,8 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
             days: source.days,
             weeklySinceReset: source.weeklySinceReset,
             sources: [source],
-            rangeTotals: source.rangeTotals)
+            rangeTotals: source.rangeTotals,
+            memoryUsage: platform == .codex ? self.memoryUsage : nil)
     }
 
     public func redactedForCache() -> ActivitySnapshot {
@@ -632,7 +798,8 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
             days: self.days,
             weeklySinceReset: self.weeklySinceReset,
             sources: self.sources,
-            rangeTotals: self.rangeTotals)
+            rangeTotals: self.rangeTotals,
+            memoryUsage: self.memoryUsage)
     }
 
     public func sessionMenu(limit: Int?) -> SessionMenuProjection {

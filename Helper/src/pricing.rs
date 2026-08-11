@@ -1,4 +1,12 @@
-use crate::usage::{ServiceTier, TokenBreakdown, TokenCostBreakdown};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+use chrono::{Local, NaiveDate};
+
+use crate::usage::{
+    CacheWriteBreakdown, ServiceTier, TokenBreakdown, TokenCostBreakdown,
+};
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
@@ -8,6 +16,15 @@ struct ModelRate {
     cached_input_per_million: f64,
     output_per_million: f64,
     cache_write_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AnthropicModelRate {
+    input_per_million: f64,
+    cache_write_5m_per_million: f64,
+    cache_write_1h_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
 }
 
 /// TokenBar's bundled Codex pricing catalog.
@@ -140,55 +157,274 @@ impl CodexPricing {
     }
 }
 
-/// Offline Anthropic pricing used for Claude Code compatibility estimates.
+/// Anthropic pricing used for Claude Code compatibility estimates.
 ///
-/// The model-family mapping and cache multipliers follow the Tokscale catalog
-/// pinned in THIRD_PARTY_NOTICES.md. Unknown or future model versions remain
-/// unpriced instead of silently inheriting a nearby model's rate.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AnthropicPricing;
+/// TokenBar ships a reviewed fallback catalog and can overlay a strictly
+/// validated copy of Anthropic's official pricing Markdown. Unknown or future
+/// model versions remain unpriced instead of silently inheriting a nearby
+/// model's rate.
+///
+/// Source: https://platform.claude.com/docs/en/about-claude/pricing.md
+#[derive(Debug, Clone)]
+pub struct AnthropicPricing {
+    effective_date: NaiveDate,
+    official_rates: HashMap<String, AnthropicModelRate>,
+}
+
+impl Default for AnthropicPricing {
+    fn default() -> Self {
+        Self::bundled_for_date(Local::now().date_naive())
+    }
+}
 
 impl AnthropicPricing {
+    pub fn bundled_for_date(effective_date: NaiveDate) -> Self {
+        Self {
+            effective_date,
+            official_rates: HashMap::new(),
+        }
+    }
+
+    pub fn from_official_markdown(
+        markdown: &str,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            effective_date,
+            official_rates: parse_official_anthropic_rates(markdown, effective_date)?,
+        })
+    }
+
+    pub fn from_official_markdown_file(
+        path: &Path,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        let markdown = fs::read_to_string(path)
+            .map_err(|error| format!("could not read Anthropic pricing catalog: {error}"))?;
+        Self::from_official_markdown(&markdown, effective_date)
+    }
+
     pub fn calculate_token_costs(
         &self,
         model_id: &str,
         usage: &TokenBreakdown,
     ) -> Option<TokenCostBreakdown> {
-        let rate = anthropic_rate_for_model(model_id)?;
+        self.calculate_token_costs_with_cache_writes(model_id, usage, None)
+    }
+
+    pub fn calculate_token_costs_with_cache_writes(
+        &self,
+        model_id: &str,
+        usage: &TokenBreakdown,
+        cache_writes: Option<&CacheWriteBreakdown>,
+    ) -> Option<TokenCostBreakdown> {
+        let rate = self.rate_for_model(model_id)?;
+        let cache_write = anthropic_cache_write_cost(usage.cache_write, cache_writes, rate);
         let costs = TokenCostBreakdown {
             input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
             output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
             cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
                 / TOKENS_PER_MILLION,
-            cache_write: usage.cache_write.max(0) as f64
-                * rate.cache_write_per_million?
-                / TOKENS_PER_MILLION,
+            cache_write,
             reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
                 / TOKENS_PER_MILLION,
         };
         costs.total().is_finite().then_some(costs)
     }
+
+    fn rate_for_model(&self, model_id: &str) -> Option<AnthropicModelRate> {
+        let normalized = normalize_anthropic_model_id(model_id);
+        self.official_rates
+            .get(&normalized)
+            .copied()
+            .or_else(|| bundled_anthropic_rate(&normalized, self.effective_date))
+    }
 }
 
-fn anthropic_rate_for_model(model_id: &str) -> Option<ModelRate> {
-    let normalized = normalize_anthropic_model_id(model_id);
-    let (input, output) = match normalized.as_str() {
-        "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7"
-        | "claude-opus-4-8" => (5.0, 25.0),
-        "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => (15.0, 75.0),
-        "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6"
-        | "claude-3-7-sonnet" | "claude-3-5-sonnet" => (3.0, 15.0),
-        "claude-haiku-4-5" | "claude-haiku-4-6" => (1.0, 5.0),
-        "claude-3-5-haiku" => (0.8, 4.0),
-        "claude-3-haiku" => (0.25, 1.25),
+fn bundled_anthropic_rate(
+    normalized_model_id: &str,
+    effective_date: NaiveDate,
+) -> Option<AnthropicModelRate> {
+    let (input, cache_write_5m, cache_write_1h, cache_read, output) =
+        match normalized_model_id {
+        "claude-fable-5" | "claude-mythos-5" => (10.0, 12.5, 20.0, 1.0, 50.0),
+        "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6"
+        | "claude-opus-4-7" | "claude-opus-4-8" => (5.0, 6.25, 10.0, 0.5, 25.0),
+        "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => {
+            (15.0, 18.75, 30.0, 1.5, 75.0)
+        }
+        "claude-sonnet-5"
+            if effective_date <= NaiveDate::from_ymd_opt(2026, 8, 31).unwrap() =>
+        {
+            (2.0, 2.5, 4.0, 0.2, 10.0)
+        }
+        "claude-sonnet-5" | "claude-sonnet-4" | "claude-sonnet-4-5"
+        | "claude-sonnet-4-6" | "claude-3-7-sonnet" | "claude-3-5-sonnet" => {
+            (3.0, 3.75, 6.0, 0.3, 15.0)
+        }
+        "claude-haiku-4-5" | "claude-haiku-4-6" => (1.0, 1.25, 2.0, 0.1, 5.0),
+        "claude-3-5-haiku" => (0.8, 1.0, 1.6, 0.08, 4.0),
+        "claude-3-haiku" => (0.25, 0.3, 0.5, 0.03, 1.25),
         _ => return None,
     };
-    Some(ModelRate {
+    Some(AnthropicModelRate {
         input_per_million: input,
-        cached_input_per_million: input * 0.1,
+        cache_write_5m_per_million: cache_write_5m,
+        cache_write_1h_per_million: cache_write_1h,
+        cached_input_per_million: cache_read,
         output_per_million: output,
-        cache_write_per_million: Some(input * 1.25),
     })
+}
+
+fn anthropic_cache_write_cost(
+    total_cache_write: i64,
+    breakdown: Option<&CacheWriteBreakdown>,
+    rate: AnthropicModelRate,
+) -> f64 {
+    let total = total_cache_write.max(0);
+    let one_hour = breakdown
+        .map(|value| value.one_hour.max(0).min(total))
+        .unwrap_or(0);
+    let remaining = total.saturating_sub(one_hour);
+    let five_minute = breakdown
+        .map(|value| value.five_minute.max(0).min(remaining))
+        .unwrap_or(0);
+    let unclassified = remaining.saturating_sub(five_minute);
+    (one_hour as f64 * rate.cache_write_1h_per_million
+        + five_minute.saturating_add(unclassified) as f64
+            * rate.cache_write_5m_per_million)
+        / TOKENS_PER_MILLION
+}
+
+fn parse_official_anthropic_rates(
+    markdown: &str,
+    effective_date: NaiveDate,
+) -> Result<HashMap<String, AnthropicModelRate>, String> {
+    let mut lines = markdown.lines();
+    let Some(header) = lines.find(|line| {
+        line.trim_start().starts_with("| Model")
+            && line.contains("Base Input Tokens")
+            && line.contains("5m Cache Writes")
+            && line.contains("1h Cache Writes")
+            && line.contains("Cache Hits & Refreshes")
+            && line.contains("Output Tokens")
+    }) else {
+        return Err("official Anthropic pricing table header was not found".to_string());
+    };
+    if markdown_table_cells(header).len() != 6 {
+        return Err("official Anthropic pricing table has an unexpected schema".to_string());
+    }
+
+    let mut rates = HashMap::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            if !rates.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with("| -") {
+            continue;
+        }
+        let cells = markdown_table_cells(trimmed);
+        if cells.len() != 6 {
+            continue;
+        }
+        let label = cells[0];
+        if !official_pricing_row_applies(label, effective_date) {
+            continue;
+        }
+        let Some(model_id) = official_model_id(label) else {
+            continue;
+        };
+        let Some(rate) = official_rate_from_cells(&cells) else {
+            return Err(format!("official Anthropic pricing row is invalid: {label}"));
+        };
+        rates.insert(model_id, rate);
+    }
+
+    if rates.len() < 5 {
+        return Err("official Anthropic pricing table contained too few valid models".to_string());
+    }
+    Ok(rates)
+}
+
+fn markdown_table_cells(line: &str) -> Vec<&str> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect()
+}
+
+fn official_model_id(label: &str) -> Option<String> {
+    let mut words = label.split_whitespace();
+    if words.next()? != "Claude" {
+        return None;
+    }
+    let family = words.next()?.to_ascii_lowercase();
+    if !matches!(family.as_str(), "fable" | "mythos" | "opus" | "sonnet" | "haiku") {
+        return None;
+    }
+    let version = words.next()?.trim_matches(|character: char| {
+        !character.is_ascii_digit() && character != '.'
+    });
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return None;
+    }
+    Some(format!("claude-{family}-{}", version.replace('.', "-")))
+}
+
+fn official_pricing_row_applies(label: &str, effective_date: NaiveDate) -> bool {
+    if let Some((_, remainder)) = label.split_once("[through ") {
+        let Some((date, _)) = remainder.split_once(']') else {
+            return false;
+        };
+        return parse_english_date(date).is_some_and(|date| effective_date <= date);
+    }
+    if let Some((_, date)) = label.split_once(" starting ") {
+        return parse_english_date(date).is_some_and(|date| effective_date >= date);
+    }
+    true
+}
+
+fn parse_english_date(value: &str) -> Option<NaiveDate> {
+    let value = value.trim();
+    NaiveDate::parse_from_str(value, "%B %d, %Y")
+        .or_else(|_| NaiveDate::parse_from_str(value, "%B %e, %Y"))
+        .ok()
+}
+
+fn official_rate_from_cells(cells: &[&str]) -> Option<AnthropicModelRate> {
+    let rate = AnthropicModelRate {
+        input_per_million: parse_usd_per_mtok(cells.get(1)?)?,
+        cache_write_5m_per_million: parse_usd_per_mtok(cells.get(2)?)?,
+        cache_write_1h_per_million: parse_usd_per_mtok(cells.get(3)?)?,
+        cached_input_per_million: parse_usd_per_mtok(cells.get(4)?)?,
+        output_per_million: parse_usd_per_mtok(cells.get(5)?)?,
+    };
+    (rate.input_per_million > 0.0
+        && rate.cache_write_5m_per_million >= rate.input_per_million
+        && rate.cache_write_1h_per_million >= rate.cache_write_5m_per_million
+        && rate.cached_input_per_million > 0.0
+        && rate.cached_input_per_million <= rate.input_per_million
+        && rate.output_per_million >= rate.input_per_million)
+        .then_some(rate)
+}
+
+fn parse_usd_per_mtok(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if !value.ends_with("/ MTok") {
+        return None;
+    }
+    let number = value.strip_prefix('$')?.split_whitespace().next()?;
+    let price = number.replace(',', "").parse::<f64>().ok()?;
+    (price.is_finite() && price > 0.0 && price <= 1_000.0).then_some(price)
 }
 
 fn normalize_anthropic_model_id(model_id: &str) -> String {
@@ -221,6 +457,10 @@ fn normalize_anthropic_model_id(model_id: &str) -> String {
     }
 
     for (alias, canonical) in [
+        ("claude-5-fable", "claude-fable-5"),
+        ("claude-5-mythos", "claude-mythos-5"),
+        ("claude-5-opus", "claude-opus-5"),
+        ("claude-5-sonnet", "claude-sonnet-5"),
         ("claude-4-8-opus", "claude-opus-4-8"),
         ("claude-4-7-opus", "claude-opus-4-7"),
         ("claude-4-6-opus", "claude-opus-4-6"),
@@ -229,6 +469,10 @@ fn normalize_anthropic_model_id(model_id: &str) -> String {
         ("claude-4-5-sonnet", "claude-sonnet-4-5"),
         ("claude-4-6-haiku", "claude-haiku-4-6"),
         ("claude-4-5-haiku", "claude-haiku-4-5"),
+        ("fable-5", "claude-fable-5"),
+        ("mythos-5", "claude-mythos-5"),
+        ("opus-5", "claude-opus-5"),
+        ("sonnet-5", "claude-sonnet-5"),
         ("opus-4-8", "claude-opus-4-8"),
         ("opus-4-7", "claude-opus-4-7"),
         ("opus-4-6", "claude-opus-4-6"),
@@ -434,6 +678,30 @@ mod tests {
         assert_eq!(costs.cache_write, 0.0);
         assert!((costs.reasoning - 0.45).abs() < 1e-9);
         assert!((costs.total() - cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prices_gpt_5_6_cache_writes_at_the_verified_input_premium() {
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+            ..Default::default()
+        };
+        let pricing = CodexPricing::bundled();
+
+        let costs = pricing
+            .calculate_token_costs_with_provider("gpt-5.6-sol", Some("openai"), &usage)
+            .unwrap();
+
+        assert!((costs.input - 5.0).abs() < 1e-9);
+        assert!((costs.cache_read - 0.5).abs() < 1e-9);
+        assert!((costs.cache_write - 6.25).abs() < 1e-9);
+        assert!((costs.output - 30.0).abs() < 1e-9);
+        assert!(pricing
+            .calculate_token_costs_with_provider("gpt-5.5", Some("openai"), &usage)
+            .is_none());
     }
 
     #[test]
@@ -644,7 +912,10 @@ mod tests {
             cache_write: 1_000_000,
             ..Default::default()
         };
-        let costs = AnthropicPricing
+        let pricing = AnthropicPricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+        );
+        let costs = pricing
             .calculate_token_costs("anthropic/claude-sonnet-4-5-20250929", &usage)
             .unwrap();
 
@@ -652,8 +923,101 @@ mod tests {
         assert!((costs.output - 15.0).abs() < 1e-9);
         assert!((costs.cache_read - 0.3).abs() < 1e-9);
         assert!((costs.cache_write - 3.75).abs() < 1e-9);
-        assert!(AnthropicPricing
+        assert!(pricing
             .calculate_token_costs("claude-future-99", &usage)
             .is_none());
+    }
+
+    #[test]
+    fn estimates_claude_five_models_and_cache_write_ttls() {
+        let pricing = AnthropicPricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+        );
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+            ..Default::default()
+        };
+        let cache_writes = CacheWriteBreakdown {
+            five_minute: 250_000,
+            one_hour: 750_000,
+        };
+
+        let opus = pricing
+            .calculate_token_costs_with_cache_writes(
+                "claude-opus-5",
+                &usage,
+                Some(&cache_writes),
+            )
+            .unwrap();
+        assert!((opus.input - 5.0).abs() < 1e-9);
+        assert!((opus.output - 25.0).abs() < 1e-9);
+        assert!((opus.cache_read - 0.5).abs() < 1e-9);
+        assert!((opus.cache_write - 9.0625).abs() < 1e-9);
+
+        let fable = pricing
+            .calculate_token_costs_with_cache_writes(
+                "claude-fable-5",
+                &usage,
+                Some(&cache_writes),
+            )
+            .unwrap();
+        assert!((fable.input - 10.0).abs() < 1e-9);
+        assert!((fable.output - 50.0).abs() < 1e-9);
+        assert!((fable.cache_read - 1.0).abs() < 1e-9);
+        assert!((fable.cache_write - 18.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_the_official_markdown_table_and_selects_dated_rows() {
+        const MARKDOWN: &str = r#"
+## Model pricing
+
+| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+| --- | --- | --- | --- | --- | --- |
+| Claude Fable 5 | $10 / MTok | $12.50 / MTok | $20 / MTok | $1 / MTok | $50 / MTok |
+| Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| Claude Sonnet 5 [through August 31, 2026](/pricing) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
+| Claude Sonnet 5 starting September 1, 2026 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+| Claude Sonnet 4.6 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+| Claude Haiku 4.5 | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
+"#;
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            ..Default::default()
+        };
+
+        let introductory = AnthropicPricing::from_official_markdown(
+            MARKDOWN,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            introductory
+                .calculate_token_costs("claude-sonnet-5", &usage)
+                .unwrap()
+                .input,
+            2.0
+        );
+
+        let standard = AnthropicPricing::from_official_markdown(
+            MARKDOWN,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            standard
+                .calculate_token_costs("claude-sonnet-5", &usage)
+                .unwrap()
+                .input,
+            3.0
+        );
+        assert!(AnthropicPricing::from_official_markdown(
+            "# Pricing without a table",
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+        )
+        .is_err());
     }
 }

@@ -18,6 +18,9 @@ struct PlatformActivityTests {
         #expect(DashboardScope.codex.platform == .codex)
         #expect(DashboardScope.claude.platform == .claude)
         #expect(DashboardScope.grok.platform == .grok)
+        #expect(DashboardScope.codex.supportsCodexMemory)
+        #expect(!DashboardScope.claude.supportsCodexMemory)
+        #expect(!DashboardScope.grok.supportsCodexMemory)
     }
 
     @Test("scopes totals, days, and colliding session ids by platform")

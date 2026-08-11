@@ -9,6 +9,7 @@ struct TokenBarApp: App {
         Settings {
             TokenBarSettingsView(
                 settings: .shared,
+                memoryTelemetry: self.appDelegate.memoryTelemetryController,
                 testResetAnimation: {
                     self.appDelegate.testResetAnimation()
                 })

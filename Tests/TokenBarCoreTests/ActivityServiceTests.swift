@@ -36,6 +36,18 @@ private actor RecordingActivityHelperRunner: ActivityHelperRunning {
     }
 }
 
+private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
+    let fileURL: URL?
+
+    init(fileURL: URL?) {
+        self.fileURL = fileURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.fileURL
+    }
+}
+
 @Suite("ActivityService")
 struct ActivityServiceTests {
     @Test("decodes helper JSON without launching a process")
@@ -49,7 +61,8 @@ struct ActivityServiceTests {
         #expect(snapshot.schemaVersion == 3)
         #expect(snapshot.today.tokens.total == 21)
         #expect(snapshot.today.tokenCosts?.input == 0.05)
-        #expect(snapshot.today.tokenCosts?.cache == 0.05)
+        #expect(snapshot.today.tokenCosts?.displayedInput == 0.07)
+        #expect(snapshot.today.tokenCosts?.displayedCache == 0.03)
         #expect(abs((snapshot.today.tokenCosts?.total ?? 0) - 0.25) < 0.000_000_001)
         #expect(snapshot.today.averageGenerationTokensPerSecond == 6)
         #expect(snapshot.rangeTotals?.tokens.total == 84)
@@ -118,6 +131,38 @@ struct ActivityServiceTests {
 
         #expect(await runner.environments.last?["PRESERVED"] == "yes")
         #expect(await runner.environments.last?["TZ"] == TimeZone.autoupdatingCurrent.identifier)
+    }
+
+    @Test("passes the TokenBar memory database to the activity snapshot helper")
+    func passesMemoryDatabase() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let service = ActivityService(
+            memoryDatabaseURL: URL(fileURLWithPath: "/tmp/tokenbar-memory.sqlite"),
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+
+        #expect(await runner.arguments == [
+            "--memory-database", "/tmp/tokenbar-memory.sqlite",
+        ])
+    }
+
+    @Test("passes the refreshed Anthropic pricing catalog to the helper")
+    func passesAnthropicPricingCatalog() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let catalog = StubAnthropicPricingCatalog(
+            fileURL: URL(fileURLWithPath: "/tmp/anthropic-pricing.md"))
+        let service = ActivityService(
+            anthropicPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+
+        #expect(await runner.arguments == [
+            "--anthropic-pricing-markdown", "/tmp/anthropic-pricing.md",
+        ])
     }
 
     @Test("rejects malformed helper JSON")

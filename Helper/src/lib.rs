@@ -13,10 +13,11 @@ use crate::usage::{
 pub mod codex;
 pub mod claude;
 pub mod grok;
+pub mod memory;
 pub mod pricing;
 pub mod usage;
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -216,6 +217,8 @@ pub struct ActivitySnapshot {
     pub days: Vec<DailySummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<ActivitySourceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_usage: Option<memory::MemoryUsageSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -862,6 +865,7 @@ fn build_snapshot_core(
         sessions,
         days,
         sources: Vec::new(),
+        memory_usage: None,
     })
 }
 
@@ -1489,6 +1493,7 @@ mod tests {
                 cache_write: 0,
                 reasoning: 0,
             },
+            cache_write_breakdown: None,
             cost: 0.25,
             token_costs: None,
             cost_source: CostSource::Estimated,

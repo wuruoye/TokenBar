@@ -12,6 +12,12 @@ pub struct TokenBreakdown {
     pub reasoning: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheWriteBreakdown {
+    pub five_minute: i64,
+    pub one_hour: i64,
+}
+
 impl TokenBreakdown {
     pub fn total(&self) -> i64 {
         self.input
@@ -113,6 +119,8 @@ pub struct UnifiedMessage {
     pub timestamp: i64,
     pub date: String,
     pub tokens: TokenBreakdown,
+    #[serde(default, skip_serializing)]
+    pub cache_write_breakdown: Option<CacheWriteBreakdown>,
     pub cost: f64,
     #[serde(default)]
     pub token_costs: Option<TokenCostBreakdown>,
@@ -165,6 +173,7 @@ impl UnifiedMessage {
             timestamp,
             date: timestamp_to_date(timestamp),
             tokens,
+            cache_write_breakdown: None,
             cost,
             token_costs: None,
             cost_source: CostSource::Unknown,

@@ -42,6 +42,29 @@ struct MenuRowPresentationTests {
             reasoning: 0).cachePercentageText == "100.0%")
     }
 
+    @Test("Cache writes are presented as input without changing the total")
+    func cacheWritesArePresentedAsInput() {
+        let tokens = TokenBreakdown(
+            input: 100,
+            output: 20,
+            cacheRead: 300,
+            cacheWrite: 50,
+            reasoning: 10)
+        let costs = TokenCostBreakdown(
+            input: 1,
+            output: 2,
+            cacheRead: 3,
+            cacheWrite: 4,
+            reasoning: 5)
+
+        #expect(tokens.displayedInput == 150)
+        #expect(tokens.displayedCache == 300)
+        #expect(tokens.total == 480)
+        #expect(costs.displayedInput == 5)
+        #expect(costs.displayedCache == 3)
+        #expect(costs.total == 15)
+    }
+
     @Test("Subagent request title falls back to output")
     func subagentOutputFallback() {
         let request = self.makeRequest(

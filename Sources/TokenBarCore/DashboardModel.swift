@@ -344,7 +344,10 @@ public final class DashboardModel {
         mergingFrom previous: QuotaSnapshot?,
         for platform: TokenPlatform)
     {
-        let snapshot = Self.mergingMissingResetDates(in: snapshot, from: previous)
+        let snapshot = Self.mergingMissingResetDates(
+            in: snapshot,
+            from: previous,
+            now: self.now())
         self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
         let events = self.quotaResetDetector.observe(snapshot, for: platform)
         for event in events {
@@ -367,23 +370,48 @@ public final class DashboardModel {
 
     private static func mergingMissingResetDates(
         in snapshot: QuotaSnapshot,
-        from previous: QuotaSnapshot?) -> QuotaSnapshot
+        from previous: QuotaSnapshot?,
+        now: Date) -> QuotaSnapshot
     {
         func merge(
             _ window: QuotaWindowSnapshot?,
             previous: QuotaWindowSnapshot?) -> QuotaWindowSnapshot?
         {
             guard let window else { return nil }
+            let inheritedReset: Date? = {
+                guard window.resetsAt == nil,
+                      let reset = previous?.resetsAt,
+                      reset > now,
+                      reset > snapshot.updatedAt
+                else {
+                    return nil
+                }
+                if let currentMinutes = window.windowMinutes,
+                   let previousMinutes = previous?.windowMinutes,
+                   currentMinutes != previousMinutes
+                {
+                    return nil
+                }
+                guard let windowMinutes = window.windowMinutes ?? previous?.windowMinutes,
+                      windowMinutes > 0,
+                      reset.timeIntervalSince(snapshot.updatedAt)
+                      <= TimeInterval(windowMinutes * 60)
+                else {
+                    return nil
+                }
+                return reset
+            }()
             return QuotaWindowSnapshot(
                 usedPercent: window.usedPercent,
                 windowMinutes: window.windowMinutes ?? previous?.windowMinutes,
-                resetsAt: window.resetsAt ?? previous?.resetsAt)
+                resetsAt: window.resetsAt ?? inheritedReset)
         }
         return QuotaSnapshot(
             session: merge(snapshot.session, previous: previous?.session),
             weekly: merge(snapshot.weekly, previous: previous?.weekly),
             resetCredits: snapshot.resetCredits,
-            updatedAt: snapshot.updatedAt)
+            updatedAt: snapshot.updatedAt,
+            origin: snapshot.origin)
     }
 
     public var isRefreshing: Bool {

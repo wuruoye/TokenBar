@@ -3,6 +3,8 @@ import TokenBarCore
 
 @MainActor
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
+    let memoryTelemetryController = MemoryTelemetryController()
+    private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
         #if DEBUG
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MODE"] == "1" {
@@ -16,6 +18,9 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         return DashboardModel(
             quotaService: CodexQuotaService(),
             additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
+            activityService: ActivityService(
+                memoryDatabaseURL: self.memoryTelemetryController.paths.databaseURL,
+                anthropicPricingCatalog: self.anthropicPricingCatalog),
             quotaCache: QuotaSnapshotCache())
     }()
     private let settings = TokenBarSettings.shared
@@ -55,6 +60,15 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        if let previewPath = environment["TOKENBAR_RENDER_MEMORY_PREVIEW"] {
+            self.previewTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.model.start()
+                try? DemoPreviewRenderer.renderMemory(model: self.model, path: previewPath)
+                NSApplication.shared.terminate(nil)
+            }
+            return
+        }
         if let previewPath = environment["TOKENBAR_RENDER_REQUEST_DETAIL_PREVIEW"] {
             try? DemoPreviewRenderer.renderRequestDetail(path: previewPath)
             NSApplication.shared.terminate(nil)
@@ -71,6 +85,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         #endif
+        self.memoryTelemetryController.start()
         #if DEBUG
         let requestDetailService: any RequestDetailProviding = environment["TOKENBAR_DEMO_MODE"] == "1"
             ? DemoRequestDetailProvider()
@@ -82,6 +97,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         let controller = TokenBarStatusItemController(
             model: self.model,
             settings: self.settings,
+            memoryTelemetry: self.memoryTelemetryController,
             showSettings: { [weak self] in
                 self?.showSettings()
             },
@@ -96,6 +112,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         self.previewTask?.cancel()
         self.previewTask = nil
+        self.memoryTelemetryController.stop()
         self.model.quotaResetHandler = nil
         self.model.stop()
         self.confettiOverlayController.dismiss()
@@ -110,6 +127,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         if self.settingsWindowController == nil {
             self.settingsWindowController = SettingsWindowController(
                 settings: self.settings,
+                memoryTelemetry: self.memoryTelemetryController,
                 testResetAnimation: { [weak self] in
                     self?.testResetAnimation()
                 })

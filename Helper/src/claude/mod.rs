@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::pricing::AnthropicPricing;
 use crate::usage::{
-    content_preview_from_str, normalize_workspace_key, workspace_label_from_key, CostSource,
-    TokenBreakdown, UnifiedMessage,
+    content_preview_from_str, normalize_workspace_key, workspace_label_from_key,
+    CacheWriteBreakdown, CostSource, TokenBreakdown, UnifiedMessage,
 };
 use crate::RequestDetail;
 
@@ -62,7 +62,11 @@ pub fn parse_local_claude_messages(
             {
                 continue;
             }
-            if let Some(costs) = pricing.calculate_token_costs(&message.model_id, &message.tokens) {
+            if let Some(costs) = pricing.calculate_token_costs_with_cache_writes(
+                &message.model_id,
+                &message.tokens,
+                message.cache_write_breakdown.as_ref(),
+            ) {
                 message.cost = costs.total();
                 message.token_costs = Some(costs);
                 message.cost_source = CostSource::Estimated;
@@ -292,6 +296,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             cache_write: integer(usage.get("cache_creation_input_tokens")).max(0),
             reasoning: 0,
         };
+        let cache_write_breakdown = cache_write_breakdown(usage);
         if tokens.total() == 0 {
             continue;
         }
@@ -314,6 +319,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             merge_streaming_duplicate(
                 &mut messages[index],
                 &tokens,
+                cache_write_breakdown.as_ref(),
                 timestamp,
                 request_started_at,
                 message.get("content"),
@@ -332,6 +338,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             agent.clone(),
         );
         unified.physical_session_id = Some(physical_session_id.clone());
+        unified.cache_write_breakdown = cache_write_breakdown;
         unified.is_subagent = is_subagent;
         unified.dedup_key.clone_from(&dedup_key);
         unified.duration_ms = request_started_at
@@ -358,6 +365,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
 fn merge_streaming_duplicate(
     existing: &mut UnifiedMessage,
     tokens: &TokenBreakdown,
+    cache_write_breakdown: Option<&CacheWriteBreakdown>,
     timestamp: i64,
     request_started_at: Option<i64>,
     content: Option<&Value>,
@@ -366,6 +374,13 @@ fn merge_streaming_duplicate(
     existing.tokens.output = existing.tokens.output.max(tokens.output);
     existing.tokens.cache_read = existing.tokens.cache_read.max(tokens.cache_read);
     existing.tokens.cache_write = existing.tokens.cache_write.max(tokens.cache_write);
+    if let Some(incoming) = cache_write_breakdown {
+        let existing = existing
+            .cache_write_breakdown
+            .get_or_insert_with(CacheWriteBreakdown::default);
+        existing.five_minute = existing.five_minute.max(incoming.five_minute);
+        existing.one_hour = existing.one_hour.max(incoming.one_hour);
+    }
     if timestamp >= existing.timestamp {
         let start = existing
             .duration_ms
@@ -383,6 +398,15 @@ fn merge_streaming_duplicate(
             existing.set_output_preview(Some(preview));
         }
     }
+}
+
+fn cache_write_breakdown(usage: &Value) -> Option<CacheWriteBreakdown> {
+    let cache_creation = usage.get("cache_creation")?;
+    let breakdown = CacheWriteBreakdown {
+        five_minute: integer(cache_creation.get("ephemeral_5m_input_tokens")).max(0),
+        one_hour: integer(cache_creation.get("ephemeral_1h_input_tokens")).max(0),
+    };
+    (breakdown.five_minute > 0 || breakdown.one_hour > 0).then_some(breakdown)
 }
 
 fn human_prompt(entry: &Value) -> Option<String> {
@@ -609,12 +633,12 @@ mod tests {
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
         )
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"cache_read_input_tokens":45,"cache_creation_input_tokens":10}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"cache_read_input_tokens":45,"cache_creation_input_tokens":12,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":12}}}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
         )
         .unwrap();
 
@@ -626,6 +650,14 @@ mod tests {
         assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
         assert_eq!(messages[0].tokens.input, 110);
         assert_eq!(messages[0].tokens.output, 25);
+        assert_eq!(messages[0].tokens.cache_write, 12);
+        assert_eq!(
+            messages[0]
+                .cache_write_breakdown
+                .as_ref()
+                .map(|value| value.one_hour),
+            Some(12)
+        );
         assert_eq!(messages[0].duration_ms, Some(2_000));
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
         assert_eq!(messages[0].content_preview.as_deref(), Some("Add Claude support"));

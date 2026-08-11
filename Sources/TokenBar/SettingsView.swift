@@ -3,13 +3,16 @@ import TokenBarCore
 
 struct TokenBarSettingsView: View {
     @Bindable var settings: TokenBarSettings
+    let memoryTelemetry: MemoryTelemetryController?
     let testResetAnimation: () -> Void
 
     init(
         settings: TokenBarSettings,
+        memoryTelemetry: MemoryTelemetryController? = nil,
         testResetAnimation: @escaping () -> Void = {})
     {
         self.settings = settings
+        self.memoryTelemetry = memoryTelemetry
         self.testResetAnimation = testResetAnimation
     }
 
@@ -61,6 +64,51 @@ struct TokenBarSettingsView: View {
                     isOn: self.$settings.showsFullRequestContentOnHover)
             }
 
+            if let memoryTelemetry = self.memoryTelemetry {
+                Section("Codex Memory") {
+                    LabeledContent("Receiver") {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(memoryTelemetry.receiverState.isListening ? Color.green : Color.orange)
+                                .frame(width: 7, height: 7)
+                            Text(memoryTelemetry.receiverState.title)
+                        }
+                    }
+
+                    Text(memoryTelemetry.receiverState.detail ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    LabeledContent("Codex config") {
+                        Text(memoryTelemetry.configurationState.title)
+                    }
+
+                    Text(memoryTelemetry.configurationState.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if memoryTelemetry.configurationState.canInstall {
+                        Button(
+                            memoryTelemetry.configurationState == .needsAnalytics
+                                ? "Enable Codex Analytics"
+                                : "Enable Memory Metrics")
+                        {
+                            memoryTelemetry.installConfiguration()
+                        }
+                    }
+
+                    if let message = memoryTelemetry.configurationErrorMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+
+                    Text("Codex loads this setting when its local process starts. Restart Codex or ChatGPT once after enabling. Logs, traces, and prompt text stay disabled.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Updates") {
                 Picker("Refresh in background", selection: self.$settings.refreshInterval) {
                     ForEach(TokenBarRefreshInterval.allCases) { interval in
@@ -98,7 +146,7 @@ struct TokenBarSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 620)
+        .frame(width: 440, height: self.memoryTelemetry == nil ? 620 : 760)
     }
 }
 

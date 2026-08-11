@@ -30,6 +30,7 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
 
     private let loadAccessToken: @Sendable () throws -> String
     private let fetchUsage: @Sendable (String) async throws -> Data
+    private let loadCachedDesktopUsage: @Sendable (Date) -> Data?
     private let now: @Sendable () -> Date
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
@@ -68,14 +69,12 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
                 return data
             case 401, 403:
                 throw ClaudeQuotaServiceError.authorizationExpired
-            case 429:
-                if let cached = Self.cachedDesktopUsage() {
-                    return cached
-                }
-                throw ClaudeQuotaServiceError.requestFailed(response.statusCode)
             default:
                 throw ClaudeQuotaServiceError.requestFailed(response.statusCode)
             }
+        }
+        self.loadCachedDesktopUsage = { sampledAt in
+            Self.cachedDesktopUsage(at: sampledAt)
         }
         self.now = Date.init
     }
@@ -83,19 +82,39 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
     init(
         loadAccessToken: @escaping @Sendable () throws -> String,
         fetchUsage: @escaping @Sendable (String) async throws -> Data,
+        loadCachedDesktopUsage: @escaping @Sendable (Date) -> Data? = { _ in nil },
         now: @escaping @Sendable () -> Date = Date.init)
     {
         self.loadAccessToken = loadAccessToken
         self.fetchUsage = fetchUsage
+        self.loadCachedDesktopUsage = loadCachedDesktopUsage
         self.now = now
     }
 
     public func fetchQuota() async throws -> QuotaSnapshot {
-        let token = try self.loadAccessToken()
-        guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ClaudeQuotaServiceError.invalidCredentials
+        do {
+            let token = try self.loadAccessToken()
+            guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ClaudeQuotaServiceError.invalidCredentials
+            }
+            let data = try await self.fetchUsage(token)
+            return try self.decodeUsage(data, origin: .liveProvider)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            guard let data = self.loadCachedDesktopUsage(self.now()),
+                  let snapshot = try? self.decodeUsage(data, origin: .claudeDesktop)
+            else {
+                throw error
+            }
+            return snapshot
         }
-        let data = try await self.fetchUsage(token)
+    }
+
+    private func decodeUsage(
+        _ data: Data,
+        origin: QuotaSnapshotOrigin) throws -> QuotaSnapshot
+    {
         let response: UsageResponse
         do {
             response = try JSONDecoder().decode(UsageResponse.self, from: data)
@@ -111,7 +130,8 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
             resetCredits: nil,
             updatedAt: response.cachedAtMilliseconds.map {
                 Date(timeIntervalSince1970: $0 / 1000)
-            } ?? self.now())
+            } ?? self.now(),
+            origin: origin)
     }
 
     private static func credentialsURL(environment: [String: String]) -> URL {
@@ -180,7 +200,7 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         return result as? Data
     }
 
-    private static func cachedDesktopUsage() -> Data? {
+    private static func cachedDesktopUsage(at now: Date) -> Data? {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask).first
@@ -191,7 +211,8 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         guard let data = try? Data(contentsOf: url),
               let history = try? JSONDecoder().decode(PlanUsageHistory.self, from: data),
               let sample = history.samples.max(by: { $0.timestamp < $1.timestamp }),
-              Date().timeIntervalSince1970 * 1000 - Double(sample.timestamp) < 30 * 60 * 1000,
+              now.timeIntervalSince1970 * 1000 - Double(sample.timestamp) >= -60 * 1000,
+              now.timeIntervalSince1970 * 1000 - Double(sample.timestamp) < 30 * 60 * 1000,
               sample.usage.fiveHour != nil || sample.usage.sevenDay != nil
         else {
             return nil

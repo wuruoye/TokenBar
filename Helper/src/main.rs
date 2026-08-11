@@ -16,6 +16,7 @@ use tokenbar_helper::grok::{
     parse_local_grok_messages, LocalParseOptions as GrokParseOptions,
 };
 use serde::Deserialize;
+use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
@@ -23,7 +24,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -32,6 +33,8 @@ struct SnapshotConfig {
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
     grok_weekly_reset_ms: Option<i64>,
+    anthropic_pricing_markdown: Option<PathBuf>,
+    memory_database: Option<PathBuf>,
 }
 
 impl Default for SnapshotConfig {
@@ -42,6 +45,8 @@ impl Default for SnapshotConfig {
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
             grok_weekly_reset_ms: None,
+            anthropic_pricing_markdown: None,
+            memory_database: None,
         }
     }
 }
@@ -58,6 +63,7 @@ struct RequestDetailConfig {
 enum Command {
     Snapshot(SnapshotConfig),
     RequestDetail(RequestDetailConfig),
+    MemoryReceiver(MemoryReceiverConfig),
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(io::Error::other)?;
             write_json(&detail)
         }
+        Command::MemoryReceiver(config) => run_receiver(config).map_err(io::Error::other).map_err(Into::into),
     }
 }
 
@@ -148,6 +155,11 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(|path| load_codex_session_titles(&codex_messages, path))
         .unwrap_or_default();
+    let anthropic_pricing = config
+        .anthropic_pricing_markdown
+        .as_deref()
+        .and_then(|path| AnthropicPricing::from_official_markdown_file(path, today).ok())
+        .unwrap_or_else(|| AnthropicPricing::bundled_for_date(today));
     let claude_messages = parse_local_claude_messages(
         ClaudeParseOptions {
             home_dir: home_dir.clone(),
@@ -155,7 +167,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
             since: Some(scan_first_day.format("%Y-%m-%d").to_string()),
             until: Some(today.format("%Y-%m-%d").to_string()),
         },
-        &AnthropicPricing,
+        &anthropic_pricing,
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_claude_session_titles(&claude_messages));
@@ -182,7 +194,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     if let Some(timestamp) = config.grok_weekly_reset_ms {
         weekly_resets.insert("grok".to_string(), timestamp);
     }
-    let snapshot = build_snapshot_with_platform_resets(
+    let mut snapshot = build_snapshot_with_platform_resets(
         messages,
         today,
         now.timestamp_millis(),
@@ -192,6 +204,15 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         &weekly_resets,
     )
     .map_err(io::Error::other)?;
+    if let Some(database_path) = config.memory_database.as_deref() {
+        snapshot.memory_usage = load_usage_snapshot(
+            database_path,
+            today,
+            now.timestamp_millis(),
+            config.days,
+        )
+        .map_err(io::Error::other)?;
+    }
 
     write_json(&snapshot)
 }
@@ -245,6 +266,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
 
     if first.to_str() == Some("request-detail") {
         return parse_request_detail_args(args).map(Command::RequestDetail);
+    }
+    if first.to_str() == Some("memory-receiver") {
+        return parse_memory_receiver_args(args).map(Command::MemoryReceiver);
     }
 
     parse_snapshot_args(std::iter::once(first).chain(args)).map(Command::Snapshot)
@@ -307,6 +331,16 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .map_err(|_| "--grok-weekly-reset-ms must be an integer")?,
                 );
             }
+            Some("--memory-database") => {
+                let value = args.next().ok_or("--memory-database requires a path")?;
+                config.memory_database = Some(PathBuf::from(value));
+            }
+            Some("--anthropic-pricing-markdown") => {
+                let value = args
+                    .next()
+                    .ok_or("--anthropic-pricing-markdown requires a path")?;
+                config.anthropic_pricing_markdown = Some(PathBuf::from(value));
+            }
             Some("--help" | "-h") => {
                 return Err(USAGE.to_string());
             }
@@ -316,6 +350,63 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
     }
 
     Ok(config)
+}
+
+fn parse_memory_receiver_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<MemoryReceiverConfig, String> {
+    let mut database_path = None;
+    let mut status_path = None;
+    let mut port = DEFAULT_PORT;
+    let mut parent_pid = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--database") => {
+                database_path = Some(PathBuf::from(
+                    args.next().ok_or("--database requires a path")?,
+                ));
+            }
+            Some("--status-file") => {
+                status_path = Some(PathBuf::from(
+                    args.next().ok_or("--status-file requires a path")?,
+                ));
+            }
+            Some("--port") => {
+                let value = args.next().ok_or("--port requires a value")?;
+                let value = value.to_str().ok_or("--port must be valid UTF-8")?;
+                port = value
+                    .parse::<u16>()
+                    .map_err(|_| "--port must be between 1 and 65535")?;
+                if port == 0 {
+                    return Err("--port must be between 1 and 65535".to_string());
+                }
+            }
+            Some("--parent-pid") => {
+                let value = args.next().ok_or("--parent-pid requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--parent-pid must be valid UTF-8")?;
+                parent_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "--parent-pid must be a positive integer")?,
+                );
+                if parent_pid == Some(0) {
+                    return Err("--parent-pid must be a positive integer".to_string());
+                }
+            }
+            Some("--help" | "-h") => return Err(USAGE.to_string()),
+            Some(value) => return Err(format!("unknown memory-receiver argument: {value}")),
+            None => return Err("arguments must be valid UTF-8".to_string()),
+        }
+    }
+    Ok(MemoryReceiverConfig {
+        database_path: database_path.ok_or("memory-receiver requires --database")?,
+        status_path,
+        port,
+        parent_pid,
+    })
 }
 
 fn parse_request_detail_args(
@@ -402,6 +493,8 @@ mod tests {
             OsString::from("1799000000000"),
             OsString::from("--grok-weekly-reset-ms"),
             OsString::from("1798000000000"),
+            OsString::from("--anthropic-pricing-markdown"),
+            OsString::from("/tmp/anthropic-pricing.md"),
         ])
         .unwrap();
 
@@ -413,6 +506,34 @@ mod tests {
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
+                anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
+                memory_database: None,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_memory_receiver_mode() {
+        let command = parse_args([
+            OsString::from("memory-receiver"),
+            OsString::from("--database"),
+            OsString::from("/tmp/memory.sqlite"),
+            OsString::from("--status-file"),
+            OsString::from("/tmp/memory-status.json"),
+            OsString::from("--port"),
+            OsString::from("5318"),
+            OsString::from("--parent-pid"),
+            OsString::from("123"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            command,
+            Command::MemoryReceiver(MemoryReceiverConfig {
+                database_path: PathBuf::from("/tmp/memory.sqlite"),
+                status_path: Some(PathBuf::from("/tmp/memory-status.json")),
+                port: 5318,
+                parent_pid: Some(123),
             })
         );
     }

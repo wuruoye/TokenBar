@@ -54,6 +54,7 @@ struct ClaudeQuotaServiceTests {
         #expect(quota.weekly?.resetsAt == ISO8601DateFormatter().date(from: "2027-01-20T08:00:00Z"))
         #expect(quota.resetCredits == nil)
         #expect(quota.updatedAt == now)
+        #expect(quota.origin == .liveProvider)
     }
 
     @Test("rejects a response without supported quota windows")
@@ -67,12 +68,15 @@ struct ClaudeQuotaServiceTests {
         }
     }
 
-    @Test("uses the desktop cache timestamp when usage came from a local sample")
-    func decodesCachedUsageTimestamp() async throws {
+    @Test("falls back to a fresh Claude Desktop sample when credentials are unavailable")
+    func fallsBackToDesktopUsageWithoutCredentials() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_100)
         let service = ClaudeQuotaService(
-            loadAccessToken: { "token" },
-            fetchUsage: { _ in
-                Data(
+            loadAccessToken: { throw ClaudeQuotaServiceError.credentialsUnavailable },
+            fetchUsage: { _ in throw ClaudeQuotaFixtureError.wrongToken },
+            loadCachedDesktopUsage: { sampledAt in
+                guard sampledAt == now else { return nil }
+                return Data(
                     """
                     {
                       "_cached_at_ms": 1800000000123,
@@ -81,12 +85,15 @@ struct ClaudeQuotaServiceTests {
                     }
                     """.utf8)
             },
-            now: { Date(timeIntervalSince1970: 1_900_000_000) })
+            now: { now })
 
         let quota = try await service.fetchQuota()
 
         #expect(quota.session?.usedPercent == 39)
         #expect(quota.weekly?.usedPercent == 4)
+        #expect(quota.session?.resetsAt == nil)
+        #expect(quota.weekly?.resetsAt == nil)
         #expect(quota.updatedAt == Date(timeIntervalSince1970: 1_800_000_000.123))
+        #expect(quota.origin == .claudeDesktop)
     }
 }

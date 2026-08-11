@@ -83,39 +83,43 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let arguments: [String]
     private let environment: [String: String]
     private let timeout: TimeInterval
+    private let memoryDatabaseURL: URL?
+    private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
     private let runner: any ActivityHelperRunning
 
     public init(
         helperURL: URL? = nil,
         arguments: [String] = [],
+        memoryDatabaseURL: URL? = nil,
+        anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeout: TimeInterval = 120,
         runner: any ActivityHelperRunning = SubprocessActivityHelperRunner())
     {
         self.arguments = arguments
+        self.memoryDatabaseURL = memoryDatabaseURL
+        self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.runner = runner
-        let candidates = Self.helperCandidates(explicitURL: helperURL, environment: environment)
         self.resolveHelper = {
-            if let candidate = candidates.first(where: {
-                FileManager.default.isExecutableFile(atPath: $0.path)
-            }) {
-                return candidate
-            }
-            throw ActivityServiceError.helperNotFound(candidates.map(\.path))
+            try Self.resolveHelperExecutable(explicitURL: helperURL, environment: environment)
         }
     }
 
     init(
         arguments: [String] = [],
+        memoryDatabaseURL: URL? = nil,
+        anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
         timeout: TimeInterval = 120,
         resolveHelper: @escaping @Sendable () throws -> URL,
         runner: any ActivityHelperRunning)
     {
         self.arguments = arguments
+        self.memoryDatabaseURL = memoryDatabaseURL
+        self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.resolveHelper = resolveHelper
@@ -138,10 +142,12 @@ public struct ActivityService: ActivityProviding, Sendable {
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
         let helperURL = try self.resolveHelper()
+        let anthropicPricingURL = await self.anthropicPricingCatalog?.refreshIfNeeded()
         let data = try await self.runner.run(
             executableURL: helperURL,
             arguments: self.helperArguments(
-                sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform),
+                sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+                anthropicPricingURL: anthropicPricingURL),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
         guard !data.isEmpty else {
@@ -155,7 +161,8 @@ public struct ActivityService: ActivityProviding, Sendable {
     }
 
     private func helperArguments(
-        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date]) -> [String]
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        anthropicPricingURL: URL?) -> [String]
     {
         var arguments = self.arguments
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.codex]) {
@@ -166,6 +173,12 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.grok]) {
             arguments += ["--grok-weekly-reset-ms", String(value)]
+        }
+        if let memoryDatabaseURL = self.memoryDatabaseURL {
+            arguments += ["--memory-database", memoryDatabaseURL.path]
+        }
+        if let anthropicPricingURL {
+            arguments += ["--anthropic-pricing-markdown", anthropicPricingURL.path]
         }
         return arguments
     }
@@ -188,6 +201,19 @@ public struct ActivityService: ActivityProviding, Sendable {
         var environment = self.environment
         environment["TZ"] = statisticsTimeZone.processEnvironmentValue
         return environment
+    }
+
+    public static func resolveHelperExecutable(
+        explicitURL: URL? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment) throws -> URL
+    {
+        let candidates = Self.helperCandidates(explicitURL: explicitURL, environment: environment)
+        if let candidate = candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }) {
+            return candidate
+        }
+        throw ActivityServiceError.helperNotFound(candidates.map(\.path))
     }
 
     static func helperCandidates(

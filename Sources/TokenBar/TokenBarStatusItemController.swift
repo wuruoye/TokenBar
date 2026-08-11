@@ -15,6 +15,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private let model: DashboardModel
     private let settings: TokenBarSettings
+    private let memoryTelemetry: MemoryTelemetryController
     private let requestDetailService: any RequestDetailProviding
     private let sessionLauncher: SessionLauncher
     private let showSettingsAction: () -> Void
@@ -34,6 +35,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var sessionExpansionItem: NSMenuItem?
     private var sessionExpansionView: PersistentMenuActionRowView?
     private var sessionEmptyItem: NSMenuItem?
+    private var memoryItem: NSMenuItem?
     private var overviewHost: FixedMenuHostingView?
     private var highlightedRows: [ObjectIdentifier: any TokenMenuHighlighting] = [:]
     private var showsAllSessions = false
@@ -44,12 +46,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     init(
         model: DashboardModel,
         settings: TokenBarSettings = .shared,
+        memoryTelemetry: MemoryTelemetryController,
         showSettings: @escaping () -> Void,
         requestDetailService: any RequestDetailProviding = CodexRequestDetailService(),
         sessionLauncher: SessionLauncher = SessionLauncher())
     {
         self.model = model
         self.settings = settings
+        self.memoryTelemetry = memoryTelemetry
         self.showSettingsAction = showSettings
         self.requestDetailService = requestDetailService
         self.sessionLauncher = sessionLauncher
@@ -298,9 +302,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             Task { @MainActor in
                 guard let self else { return }
                 self.observeScope()
-                guard self.isRootMenuOpen,
-                      self.renderedMenuScope != self.model.scope
-                else {
+                guard self.isRootMenuOpen else { return }
+                self.updateMemoryVisibility(scope: self.model.scope)
+                guard self.renderedMenuScope != self.model.scope else {
                     return
                 }
                 self.updateOverviewHeight()
@@ -376,6 +380,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             context.allowsImplicitAnimation = false
             let quota = self.model.quotaState(for: scope.platform).value
             self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
+            self.updateMemoryVisibility(scope: scope)
             self.updateSessionProjectionAndVisibility(scope: scope)
             self.model.scope = scope
             window?.layoutIfNeeded()
@@ -396,6 +401,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.sessionExpansionItem = nil
         self.sessionExpansionView = nil
         self.sessionEmptyItem = nil
+        self.memoryItem = nil
         self.overviewHost = nil
         self.submenuSessionIDs.removeAll()
 
@@ -459,6 +465,29 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         activityItem.view = activityHost
         activityItem.submenu = self.makeActivityDetailMenu(accentColor: accentColor)
         self.rootMenu.addItem(activityItem)
+
+        let memoryHeight = MemorySummarySection.preferredHeight + 1
+        let memory = MenuMemorySummaryView(
+            model: self.model,
+            telemetry: self.memoryTelemetry,
+            accentColor: accentColor)
+            .allowsHitTesting(false)
+            .frame(width: Self.menuWidth, height: memoryHeight, alignment: .top)
+        let memoryHost = FixedMenuHostingView(
+            rootView: AnyView(memory),
+            width: Self.menuWidth,
+            height: memoryHeight)
+        let memoryItem = NSMenuItem(
+            title: "Codex Memory",
+            action: #selector(self.activityNoOp),
+            keyEquivalent: "")
+        memoryItem.target = self
+        memoryItem.isEnabled = true
+        memoryItem.view = memoryHost
+        memoryItem.submenu = self.makeMemoryDetailMenu(accentColor: accentColor)
+        memoryItem.isHidden = !self.model.scope.supportsCodexMemory
+        self.memoryItem = memoryItem
+        self.rootMenu.addItem(memoryItem)
         self.rootMenu.addItem(.separator())
 
         self.rootMenu.addItem(.sectionHeader(title: "Recent Sessions"))
@@ -581,6 +610,43 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         item.view = host
         menu.addItem(item)
         return menu
+    }
+
+    private func makeMemoryDetailMenu(accentColor: Color) -> TokenBarMenu {
+        let menu = TokenBarMenu(title: "Codex Memory")
+        menu.autoenablesItems = false
+        menu.minimumWidth = MemoryDetailView.preferredWidth
+        menu.delegate = self
+        menu.persistentActionDelegate = self
+
+        let detail = MemoryDetailView(
+            model: self.model,
+            telemetry: self.memoryTelemetry,
+            accentColor: accentColor)
+            .frame(
+                width: MemoryDetailView.preferredWidth,
+                height: MemoryDetailView.preferredHeight,
+                alignment: .topLeading)
+        let host = FixedMenuHostingView(
+            rootView: AnyView(detail),
+            width: MemoryDetailView.preferredWidth,
+            height: MemoryDetailView.preferredHeight)
+        let item = NSMenuItem(
+            title: "Codex Memory",
+            action: #selector(self.activityNoOp),
+            keyEquivalent: "")
+        item.target = self
+        item.isEnabled = true
+        item.view = host
+        menu.addItem(item)
+        return menu
+    }
+
+    private func updateMemoryVisibility(scope: DashboardScope) {
+        let isHidden = !scope.supportsCodexMemory
+        if self.memoryItem?.isHidden != isHidden {
+            self.memoryItem?.isHidden = isHidden
+        }
     }
 
     private func makeSessionItem() -> NSMenuItem {
@@ -1033,6 +1099,23 @@ private struct MenuActivitySummaryView: View {
                 state: self.model.visibleActivity,
                 accentColor: self.accentColor,
                 showsChevron: true)
+        }
+    }
+}
+
+private struct MenuMemorySummaryView: View {
+    @Bindable var model: DashboardModel
+    @Bindable var telemetry: MemoryTelemetryController
+    let accentColor: Color
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider().padding(.horizontal, 12)
+            MemorySummarySection(
+                usage: self.model.visibleActivitySnapshot?.memoryUsage,
+                receiverState: self.telemetry.receiverState,
+                configurationState: self.telemetry.configurationState,
+                accentColor: self.accentColor)
         }
     }
 }
