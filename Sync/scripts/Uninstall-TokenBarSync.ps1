@@ -12,6 +12,21 @@ $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserSid = $CurrentIdentity.User.Value
 $CurrentUserName = $CurrentIdentity.Name
 
+function Test-CurrentUserPrincipal {
+    param([string] $UserId)
+
+    if ($UserId -eq $CurrentUserSid -or $UserId -eq $CurrentUserName) {
+        return $true
+    }
+    try {
+        $resolvedSid = ([Security.Principal.NTAccount]::new($UserId)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        return $resolvedSid -eq $CurrentUserSid
+    } catch {
+        return $false
+    }
+}
+
 if (-not (Test-Path -LiteralPath $InstallRoot -PathType Container)) {
     throw 'TokenBar Sync is not installed for this user.'
 }
@@ -44,8 +59,7 @@ if ($null -ne $task) {
             [string] $task.Actions[0].Execute)) -ne
             [IO.Path]::GetFullPath([string] $marker.powerShellExe) -or
         [string] $task.Actions[0].Arguments -ne [string] $marker.taskArguments -or
-        ([string] $task.Principal.UserId -ne $CurrentUserSid -and
-            [string] $task.Principal.UserId -ne $CurrentUserName)) {
+        -not (Test-CurrentUserPrincipal ([string] $task.Principal.UserId))) {
         throw "Scheduled Task '$TaskName' is not owned by this TokenBar Sync install."
     }
 }

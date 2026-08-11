@@ -16,6 +16,21 @@ $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserSid = $CurrentIdentity.User.Value
 $CurrentUserName = $CurrentIdentity.Name
 
+function Test-CurrentUserPrincipal {
+    param([string] $UserId)
+
+    if ($UserId -eq $CurrentUserSid -or $UserId -eq $CurrentUserName) {
+        return $true
+    }
+    try {
+        $resolvedSid = ([Security.Principal.NTAccount]::new($UserId)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        return $resolvedSid -eq $CurrentUserSid
+    } catch {
+        return $false
+    }
+}
+
 $marker = $null
 $markerOwned = $false
 if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
@@ -44,10 +59,9 @@ if ($markerOwned -and $null -ne $task) {
         $task.Actions.Count -eq 1 -and
         [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
             [string] $task.Actions[0].Execute)) -eq
-            [IO.Path]::GetFullPath([string] $marker.powerShellExe) -and
+        [IO.Path]::GetFullPath([string] $marker.powerShellExe) -and
         [string] $task.Actions[0].Arguments -eq [string] $marker.taskArguments -and
-        ([string] $task.Principal.UserId -eq $CurrentUserSid -or
-            [string] $task.Principal.UserId -eq $CurrentUserName)
+        (Test-CurrentUserPrincipal ([string] $task.Principal.UserId))
     )
 }
 

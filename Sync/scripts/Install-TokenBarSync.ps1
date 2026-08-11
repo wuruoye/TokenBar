@@ -39,6 +39,21 @@ $TaskArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"
 $MarkerPath = Join-Path $InstallRoot $MarkerName
 $TokenPath = Join-Path $InstallRoot 'token.protected'
 
+function Test-CurrentUserPrincipal {
+    param([string] $UserId)
+
+    if ($UserId -eq $CurrentUserSid -or $UserId -eq $CurrentUserName) {
+        return $true
+    }
+    try {
+        $resolvedSid = ([Security.Principal.NTAccount]::new($UserId)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        return $resolvedSid -eq $CurrentUserSid
+    } catch {
+        return $false
+    }
+}
+
 function Read-OwnedMarker {
     param([string] $Path)
 
@@ -67,8 +82,7 @@ function Assert-OwnedTask {
         [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
             [string] $Task.Actions[0].Execute)) -ne $PowerShellExe -or
         [string] $Task.Actions[0].Arguments -ne $TaskArguments -or
-        ([string] $Task.Principal.UserId -ne $CurrentUserSid -and
-            [string] $Task.Principal.UserId -ne $CurrentUserName) -or
+        -not (Test-CurrentUserPrincipal ([string] $Task.Principal.UserId)) -or
         [string] $Task.Description -ne $TaskDescription) {
         throw "Scheduled Task '$TaskName' exists but is not owned by this TokenBar Sync install."
     }
