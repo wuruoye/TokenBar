@@ -1110,62 +1110,103 @@ public enum ActivitySyncCredentialError: LocalizedError, Sendable {
     }
 }
 
+struct ActivitySyncKeychainAccess: Sendable {
+    let load: @Sendable (_ service: String, _ account: String) throws -> Data?
+    let save: @Sendable (_ data: Data, _ service: String, _ account: String) throws -> Void
+
+    static let system = Self(
+        load: { service, account in
+            var query = Self.baseQuery(service: service, account: account)
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            query[kSecReturnData as String] = true
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            if status == errSecItemNotFound { return nil }
+            guard status == errSecSuccess, let data = result as? Data else {
+                throw ActivitySyncCredentialError.keychain(status)
+            }
+            return data
+        },
+        save: { data, service, account in
+            let query = Self.baseQuery(service: service, account: account)
+            let value = [kSecValueData as String: data] as CFDictionary
+            let updateStatus = SecItemUpdate(query as CFDictionary, value)
+            if updateStatus == errSecSuccess { return }
+            guard updateStatus == errSecItemNotFound else {
+                throw ActivitySyncCredentialError.keychain(updateStatus)
+            }
+
+            var insert = query
+            insert[kSecValueData as String] = data
+            let insertStatus = SecItemAdd(insert as CFDictionary, nil)
+            if insertStatus == errSecSuccess { return }
+            if insertStatus == errSecDuplicateItem,
+               SecItemUpdate(query as CFDictionary, value) == errSecSuccess
+            {
+                return
+            }
+            throw ActivitySyncCredentialError.keychain(insertStatus)
+        })
+
+    private static func baseQuery(service: String, account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+}
+
 public struct KeychainActivitySyncCredentialStore: ActivitySyncCredentialStoring, Sendable {
-    private let service: String
+    private let currentService: String
+    private let legacyService: String
     private let account: String
+    private let keychain: ActivitySyncKeychainAccess
 
     public init(
         service: String = "com.wuruoye.TokenBar.activity-sync",
         account: String = "shared-token")
     {
-        self.service = service
+        self.currentService = "\(service).v2"
+        self.legacyService = service
         self.account = account
+        self.keychain = .system
+    }
+
+    init(
+        service: String,
+        account: String,
+        keychain: ActivitySyncKeychainAccess)
+    {
+        self.currentService = "\(service).v2"
+        self.legacyService = service
+        self.account = account
+        self.keychain = keychain
     }
 
     public func loadToken() throws -> String? {
-        var query = self.baseQuery
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        query[kSecReturnData as String] = true
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw ActivitySyncCredentialError.keychain(status)
+        if let data = try self.keychain.load(self.currentService, self.account) {
+            return try Self.token(from: data)
         }
-        return String(data: data, encoding: .utf8)
+
+        guard let legacyData = try self.keychain.load(self.legacyService, self.account) else {
+            return nil
+        }
+        let token = try Self.token(from: legacyData)
+        try self.keychain.save(legacyData, self.currentService, self.account)
+        return token
     }
 
     public func saveToken(_ token: String?) throws {
         let value = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if value.isEmpty {
-            let status = SecItemDelete(self.baseQuery as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw ActivitySyncCredentialError.keychain(status)
-            }
-            return
-        }
-        let data = Data(value.utf8)
-        let updateStatus = SecItemUpdate(
-            self.baseQuery as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary)
-        if updateStatus == errSecSuccess { return }
-        guard updateStatus == errSecItemNotFound else {
-            throw ActivitySyncCredentialError.keychain(updateStatus)
-        }
-        var insert = self.baseQuery
-        insert[kSecValueData as String] = data
-        let insertStatus = SecItemAdd(insert as CFDictionary, nil)
-        guard insertStatus == errSecSuccess else {
-            throw ActivitySyncCredentialError.keychain(insertStatus)
-        }
+        try self.keychain.save(Data(value.utf8), self.currentService, self.account)
     }
 
-    private var baseQuery: [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: self.service,
-            kSecAttrAccount as String: self.account,
-        ]
+    private static func token(from data: Data) throws -> String {
+        guard let token = String(data: data, encoding: .utf8) else {
+            throw ActivitySyncCredentialError.keychain(errSecDecode)
+        }
+        return token
     }
 }
 

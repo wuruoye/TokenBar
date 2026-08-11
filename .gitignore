@@ -8,3 +8,4 @@ build/
 dist/
 *.log
 .DS_Store
+.tokenbar-codesign-identity

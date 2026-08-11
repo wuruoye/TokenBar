@@ -77,6 +77,15 @@ open TokenBar.app
 
 `package_app.sh` creates `TokenBar.app` for the current Mac architecture and ad-hoc signs it by default. It builds the Swift menu bar app and embeds the Rust activity helper in the bundle.
 
+Repeated local builds that use Keychain-backed settings should use a stable signing identity. Put the exact identity name in the Git-ignored `.tokenbar-codesign-identity` file once; `package_app.sh` will reuse it unless `CODESIGN_IDENTITY` is set explicitly. This prevents each ad-hoc rebuild from getting a new code identity and prompting again for access to an existing Keychain item.
+
+After upgrading from an ad-hoc build, TokenBar reads the legacy activity-sync credential once and immediately migrates it to a new Keychain item owned by the stable app identity. macOS can require one final authorization for that legacy read; later launches use only the migrated item.
+
+```bash
+printf '%s\n' 'Apple Development: Your Name (TEAMID)' > .tokenbar-codesign-identity
+./Scripts/package_app.sh
+```
+
 For a Developer ID build, provide a signing identity:
 
 ```bash
@@ -229,7 +238,7 @@ The packaging script supports these optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `CODESIGN_IDENTITY` | Signing identity; defaults to ad-hoc signing (`-`). |
+| `CODESIGN_IDENTITY` | Signing identity; overrides `.tokenbar-codesign-identity` and otherwise defaults to ad-hoc signing (`-`). |
 | `TOKENBAR_APP_PATH` | Output path for the app bundle. |
 | `TOKENBAR_BUNDLE_IDENTIFIER` | Override `CFBundleIdentifier` while packaging. |
 | `TOKENBAR_BUNDLE_DISPLAY_NAME` | Override the displayed bundle name. |

@@ -96,6 +96,37 @@ private actor RecordingHTTPTransport: TokenBarHTTPTransport {
     }
 }
 
+private final class RecordingActivitySyncKeychain: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data]
+    private(set) var loadedServices: [String] = []
+    private(set) var savedServices: [String] = []
+
+    init(values: [String: Data] = [:]) {
+        self.values = values
+    }
+
+    var access: ActivitySyncKeychainAccess {
+        ActivitySyncKeychainAccess(
+            load: { [self] service, _ in
+                self.lock.withLock {
+                    self.loadedServices.append(service)
+                    return self.values[service]
+                }
+            },
+            save: { [self] data, service, _ in
+                self.lock.withLock {
+                    self.savedServices.append(service)
+                    self.values[service] = data
+                }
+            })
+    }
+
+    func value(for service: String) -> Data? {
+        self.lock.withLock { self.values[service] }
+    }
+}
+
 @Suite("Multi-device activity sync")
 struct ActivitySyncTests {
     private let sharedToken = String(repeating: "s", count: 32)
@@ -109,6 +140,47 @@ struct ActivitySyncTests {
         name: "Windows PC",
         os: .windows,
         clientVersion: "1")
+
+    @Test("legacy Keychain token migrates once to the stable service")
+    func migratesLegacyKeychainToken() throws {
+        let legacyService = "test.activity-sync"
+        let currentService = "\(legacyService).v2"
+        let keychain = RecordingActivitySyncKeychain(values: [
+            legacyService: Data("legacy-token".utf8),
+        ])
+        let store = KeychainActivitySyncCredentialStore(
+            service: legacyService,
+            account: "account",
+            keychain: keychain.access)
+
+        #expect(try store.loadToken() == "legacy-token")
+        #expect(keychain.value(for: currentService) == Data("legacy-token".utf8))
+        #expect(keychain.loadedServices == [currentService, legacyService])
+        #expect(keychain.savedServices == [currentService])
+
+        #expect(try store.loadToken() == "legacy-token")
+        #expect(keychain.loadedServices == [currentService, legacyService, currentService])
+        #expect(keychain.savedServices == [currentService])
+    }
+
+    @Test("clearing a migrated token does not fall back to the legacy item")
+    func clearedKeychainTokenDoesNotFallBack() throws {
+        let legacyService = "test.activity-sync"
+        let currentService = "\(legacyService).v2"
+        let keychain = RecordingActivitySyncKeychain(values: [
+            legacyService: Data("legacy-token".utf8),
+        ])
+        let store = KeychainActivitySyncCredentialStore(
+            service: legacyService,
+            account: "account",
+            keychain: keychain.access)
+
+        try store.saveToken(nil)
+
+        #expect(try store.loadToken() == "")
+        #expect(keychain.value(for: currentService) == Data())
+        #expect(keychain.loadedServices == [currentService])
+    }
 
     @Test("sync redaction removes content and paths recursively")
     func redactsSensitiveFields() throws {
