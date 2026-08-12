@@ -83,6 +83,7 @@ $ownedFiles = @(
     'config.json',
     'device.json',
     'last-run.json',
+    'incremental-upload-v2.json',
     'snapshot.json',
     'remote-snapshots.json',
     'token.protected',

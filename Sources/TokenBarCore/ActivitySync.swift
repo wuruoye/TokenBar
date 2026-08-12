@@ -226,20 +226,27 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
     static let maximumUploadBytes = 16 * 1024 * 1024
     static let maximumDownloadBytes = 64 * 1024 * 1024
 
-    private let transport: any TokenBarHTTPTransport
-    private let timeout: TimeInterval
+    let transport: any TokenBarHTTPTransport
+    let timeout: TimeInterval
+    let incrementalStore: ActivitySyncIncrementalStore
 
     public init(timeout: TimeInterval = 15) {
         self.init(
             transport: EphemeralHTTPTransport(
                 allowsSameOriginRedirects: false,
                 bypassesProxy: true),
-            timeout: timeout)
+            timeout: timeout,
+            incrementalStore: ActivitySyncIncrementalStore())
     }
 
-    init(transport: any TokenBarHTTPTransport, timeout: TimeInterval = 15) {
+    init(
+        transport: any TokenBarHTTPTransport,
+        timeout: TimeInterval = 15,
+        incrementalStore: ActivitySyncIncrementalStore = ActivitySyncIncrementalStore())
+    {
         self.transport = transport
         self.timeout = timeout
+        self.incrementalStore = incrementalStore
     }
 
     public func upload(
@@ -358,13 +365,13 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         }
     }
 
-    private static func endpoint(baseURL: URL, components: [String]) -> URL {
+    static func endpoint(baseURL: URL, components: [String]) -> URL {
         components.reduce(baseURL) { url, component in
             url.appendingPathComponent(component, isDirectory: false)
         }
     }
 
-    private func perform(
+    func perform(
         _ request: URLRequest,
         maximumBodyBytes: Int) async throws -> TokenBarHTTPResponse
     {
@@ -384,7 +391,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         }
     }
 
-    private static func validate(
+    static func validate(
         device: ActivitySyncDevice,
         generatedAtMs: Int64,
         receivedAtMs: Int64?,
@@ -442,7 +449,13 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
             }
             try Self.validate(day: day)
         }
+        var sessionIDs = Set<String>()
         for session in snapshot.sessions {
+            let identity = "\(session.platformID.rawValue)\u{0}\(session.id)"
+            guard sessionIDs.insert(identity).inserted else {
+                throw ActivitySyncError.invalidResponse(
+                    "snapshot sessions contain duplicate identities")
+            }
             try Self.validate(session: session)
         }
         var sourcePlatforms = Set<TokenPlatform>()
@@ -479,8 +492,9 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
             }
             try Self.validate(memory: memory.today)
             try Self.validate(memory: memory.rangeTotals)
+            var memoryDayIDs = Set<String>()
             for day in memory.days {
-                guard !day.date.isEmpty else {
+                guard !day.date.isEmpty, memoryDayIDs.insert(day.date).inserted else {
                     throw ActivitySyncError.invalidResponse("snapshot memory day is invalid")
                 }
                 try Self.validate(memory: day.totals)
@@ -684,6 +698,76 @@ public struct SynchronizedActivityService: ActivityProviding, Sendable {
             device: configuration.device,
             generatedAtMs: local.generatedAtMs,
             snapshot: local.redactedForSync())
+        if let incremental = self.networking as? any ActivitySyncIncrementalNetworking {
+            do {
+                let outcome = try await incremental.synchronizeIncrementally(
+                    envelope,
+                    configuration: configuration)
+                guard await self.configuration() == configuration else {
+                    return local
+                }
+                guard let response = outcome.response else {
+                    let messages = [
+                        outcome.uploadErrorDescription,
+                        outcome.downloadErrorDescription,
+                    ].compactMap { $0 }.filter { !$0.isEmpty }
+                    await self.report(ActivitySyncReport(
+                        phase: outcome.uploadErrorDescription == nil ? .partial : .failure,
+                        attemptedAt: attemptedAt,
+                        succeededAt: outcome.uploadErrorDescription == nil ? self.now() : nil,
+                        deviceCount: 1,
+                        message: messages.isEmpty ? nil : messages.joined(separator: " ")))
+                    return local
+                }
+                let merged = ActivitySnapshotMerger.merge(
+                    local: local,
+                    localDevice: configuration.device,
+                    remote: response.snapshots)
+                let localDeviceID = configuration.device.id.lowercased()
+                let remoteDeviceIDs = Set(response.snapshots.compactMap { record -> String? in
+                    let deviceID = record.device.id.lowercased()
+                    return deviceID == localDeviceID ? nil : deviceID
+                })
+                let compatibleDeviceIDs = Set(response.snapshots.compactMap { record -> String? in
+                    let deviceID = record.device.id.lowercased()
+                    guard deviceID != localDeviceID,
+                          record.snapshot.timezone == local.timezone
+                    else {
+                        return nil
+                    }
+                    return deviceID
+                })
+                let incompatibleDeviceCount = remoteDeviceIDs
+                    .subtracting(compatibleDeviceIDs).count
+                var messages = [
+                    outcome.uploadErrorDescription,
+                    outcome.downloadErrorDescription,
+                ].compactMap { $0 }.filter { !$0.isEmpty }
+                if incompatibleDeviceCount > 0 {
+                    messages.append(
+                        incompatibleDeviceCount == 1
+                            ? "1 device uses a different statistics timezone."
+                            : "\(incompatibleDeviceCount) devices use a different statistics timezone.")
+                }
+                await self.report(ActivitySyncReport(
+                    phase: messages.isEmpty ? .success : .partial,
+                    attemptedAt: attemptedAt,
+                    succeededAt: self.now(),
+                    deviceCount: compatibleDeviceIDs.count + 1,
+                    message: messages.isEmpty ? nil : messages.joined(separator: " ")))
+                return merged
+            } catch is CancellationError {
+                await self.report(.ready)
+                return local
+            } catch {
+                await self.report(ActivitySyncReport(
+                    phase: .failure,
+                    attemptedAt: attemptedAt,
+                    deviceCount: 1,
+                    message: error.localizedDescription))
+                return local
+            }
+        }
         var uploadError: Error?
         do {
             try await self.networking.upload(envelope, configuration: configuration)

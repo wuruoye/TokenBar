@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
 use serde_json::Value;
 
+use crate::incremental::PROTOCOL_V2;
 use crate::protocol::DownloadResponse;
 
 const PLATFORMS: [&str; 3] = ["codex", "claude", "grok"];
@@ -11,7 +15,32 @@ pub struct PlatformWeeklyResets {
     pub grok: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetMetadataResponse {
+    pub protocol_version: u32,
+    pub resets: BTreeMap<String, i64>,
+}
+
 impl PlatformWeeklyResets {
+    pub fn from_metadata(response: &ResetMetadataResponse, now_ms: i64) -> Self {
+        if response.protocol_version != PROTOCOL_V2 || now_ms <= 0 {
+            return Self::default();
+        }
+        let mut result = Self::default();
+        for platform in PLATFORMS {
+            result.set(
+                platform,
+                response
+                    .resets
+                    .get(platform)
+                    .copied()
+                    .filter(|value| *value > 0 && *value <= now_ms),
+            );
+        }
+        result
+    }
+
     pub fn from_download(response: &DownloadResponse, now_ms: i64) -> Self {
         if now_ms <= 0 {
             return Self::default();

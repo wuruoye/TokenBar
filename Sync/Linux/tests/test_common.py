@@ -2,8 +2,13 @@ import unittest
 
 from tokenbar_sync.common import (
     ValidationError,
+    apply_partition_delta,
+    incremental_delta,
     json_loads_strict,
+    materialize_snapshot,
+    partition_manifest,
     sanitize_snapshot,
+    snapshot_partitions,
     validate_envelope,
 )
 
@@ -47,6 +52,53 @@ def envelope(snapshot=None):
 
 
 class CommonTests(unittest.TestCase):
+    def test_incremental_partitions_round_trip_and_replace_history(self):
+        snapshot = envelope()["snapshot"]
+        snapshot["days"] = [{
+            "date": "2026-08-11",
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "requestCount": 1,
+            "sessionCount": 0,
+            "models": [],
+        }]
+        snapshot["sessions"] = [{
+            "id": "session/a",
+            "platform": "codex",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "models": [],
+            "requests": [],
+        }]
+        previous = snapshot_partitions(snapshot)
+        rebuilt = materialize_snapshot(previous)
+        self.assertEqual(rebuilt, snapshot)
+
+        current = dict(snapshot)
+        current["generatedAtMs"] = 2
+        current["days"] = [{**snapshot["days"][0], "requestCount": 2}]
+        current["sessions"] = []
+        current_parts = snapshot_partitions(current)
+        upserts, deletes, manifest = incremental_delta(
+            current_parts,
+            partition_manifest(previous),
+        )
+        self.assertIn("summary", upserts)
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(apply_partition_delta(snapshot, upserts, deletes), current)
+        self.assertEqual(manifest, partition_manifest(current_parts))
+
+    def test_incremental_delta_rejects_private_content(self):
+        snapshot = envelope()["snapshot"]
+        with self.assertRaisesRegex(ValidationError, "privacy-sanitized"):
+            apply_partition_delta(
+                snapshot,
+                {"summary": {"promptPreview": "private"}},
+                [],
+            )
+
     def test_recursive_sanitizer(self):
         source = {
             "schemaVersion": 9,

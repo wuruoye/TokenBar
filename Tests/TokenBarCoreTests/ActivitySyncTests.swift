@@ -64,6 +64,40 @@ private actor CancellingSyncNetwork: ActivitySyncNetworking {
     }
 }
 
+private actor RecordingIncrementalSyncNetwork: ActivitySyncIncrementalNetworking {
+    enum Failure: Error {
+        case unexpectedLegacyCall
+    }
+
+    private(set) var envelopes: [ActivitySyncUploadEnvelope] = []
+    let outcome: ActivitySyncIncrementalOutcome
+
+    init(outcome: ActivitySyncIncrementalOutcome) {
+        self.outcome = outcome
+    }
+
+    func synchronizeIncrementally(
+        _ envelope: ActivitySyncUploadEnvelope,
+        configuration _: ActivitySyncConfiguration) async throws -> ActivitySyncIncrementalOutcome
+    {
+        self.envelopes.append(envelope)
+        return self.outcome
+    }
+
+    func upload(
+        _: ActivitySyncUploadEnvelope,
+        configuration _: ActivitySyncConfiguration) async throws
+    {
+        throw Failure.unexpectedLegacyCall
+    }
+
+    func download(
+        configuration _: ActivitySyncConfiguration) async throws -> ActivitySyncDownloadResponse
+    {
+        throw Failure.unexpectedLegacyCall
+    }
+}
+
 private struct StaticActivityProvider: ActivityProviding {
     let snapshot: ActivitySnapshot
 
@@ -94,6 +128,29 @@ private actor RecordingHTTPTransport: TokenBarHTTPTransport {
         self.requests.append(request)
         return self.responses.removeFirst()
     }
+}
+
+private struct TestV2UploadResponse: Encodable {
+    let protocolVersion = 2
+    let revision: Int64
+    let status: String
+    let receivedAtMs: Int64
+}
+
+private struct TestV2FullChange: Encodable {
+    let mode = "full"
+    let device: ActivitySyncDevice
+    let generatedAtMs: Int64
+    let receivedAtMs: Int64
+    let revision: Int64
+    let manifest: [String: String]
+    let snapshot: ActivitySnapshot
+}
+
+private struct TestV2QueryResponse: Encodable {
+    let protocolVersion = 2
+    let snapshots: [TestV2FullChange]
+    let deletedDeviceIds: [String]
 }
 
 private final class RecordingActivitySyncKeychain: @unchecked Sendable {
@@ -408,6 +465,169 @@ struct ActivitySyncTests {
         }
     }
 
+    @Test("remote client uploads and downloads partition deltas with a private cache")
+    func incrementalRoundTrip() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateURL = directory.appendingPathComponent("sync-v2.json")
+        let store = ActivitySyncIncrementalStore(fileURL: stateURL)
+        let base = TestFixtures.activity(promptPreview: "private prompt").redactedForSync()
+        let sessions = (0 ..< 20).map { index in
+            SessionSummary(
+                id: "session-\(index)",
+                workspaceLabel: nil,
+                startedAtMs: base.generatedAtMs,
+                endedAtMs: base.generatedAtMs + Int64(index + 1),
+                tokens: base.today.tokens,
+                costUsd: base.today.costUsd,
+                models: ["gpt-test"],
+                requests: [],
+                platform: .codex)
+        }
+        let first = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: base.today,
+            sessions: sessions,
+            days: base.days).redactedForSync()
+        let second = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs + 10_000,
+            timezone: base.timezone,
+            today: base.today,
+            sessions: Array(sessions.dropLast()),
+            days: base.days).redactedForSync()
+        let remote = TestFixtures.activity().redactedForSync()
+        let remoteManifest = try ActivitySyncSnapshotPartitioner.manifest(
+            ActivitySyncSnapshotPartitioner.partitions(remote))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let transport = RecordingHTTPTransport(responses: [
+            TokenBarHTTPResponse(
+                data: try encoder.encode(TestV2UploadResponse(
+                    revision: 1,
+                    status: "created",
+                    receivedAtMs: base.generatedAtMs + 1)),
+                statusCode: 201),
+            TokenBarHTTPResponse(
+                data: try encoder.encode(TestV2QueryResponse(
+                    snapshots: [TestV2FullChange(
+                        device: self.remoteDevice,
+                        generatedAtMs: remote.generatedAtMs,
+                        receivedAtMs: remote.generatedAtMs + 1,
+                        revision: 1,
+                        manifest: remoteManifest,
+                        snapshot: remote)],
+                    deletedDeviceIds: [])),
+                statusCode: 200),
+            TokenBarHTTPResponse(
+                data: try encoder.encode(TestV2UploadResponse(
+                    revision: 2,
+                    status: "updated",
+                    receivedAtMs: base.generatedAtMs + 2)),
+                statusCode: 200),
+            TokenBarHTTPResponse(
+                data: try encoder.encode(TestV2QueryResponse(
+                    snapshots: [],
+                    deletedDeviceIds: [])),
+                statusCode: 200),
+        ])
+        let client = ActivitySyncRemoteClient(
+            transport: transport,
+            incrementalStore: store)
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com/tokenbar",
+            token: self.sharedToken,
+            device: self.localDevice)
+
+        let firstOutcome = try await client.synchronizeIncrementally(
+            ActivitySyncUploadEnvelope(
+                device: self.localDevice,
+                generatedAtMs: first.generatedAtMs,
+                snapshot: first),
+            configuration: configuration)
+        let secondOutcome = try await client.synchronizeIncrementally(
+            ActivitySyncUploadEnvelope(
+                device: self.localDevice,
+                generatedAtMs: second.generatedAtMs,
+                snapshot: second),
+            configuration: configuration)
+        let requests = await transport.requests
+
+        #expect(firstOutcome.response?.snapshots.first?.device == self.remoteDevice)
+        #expect(secondOutcome.response?.snapshots.first?.snapshot == remote)
+        #expect(requests.map(\.httpMethod) == ["PUT", "POST", "PUT", "POST"])
+        #expect(requests[0].url?.path == "/tokenbar/v2/snapshots/11111111-1111-4111-8111-111111111111")
+        #expect(requests[1].url?.path == "/tokenbar/v2/snapshots/query")
+        let firstBody = try #require(requests[0].httpBody)
+        let secondBody = try #require(requests[2].httpBody)
+        let firstJSON = try #require(
+            try JSONSerialization.jsonObject(with: firstBody) as? [String: Any])
+        let secondJSON = try #require(
+            try JSONSerialization.jsonObject(with: secondBody) as? [String: Any])
+        #expect(firstJSON["mode"] as? String == "full")
+        #expect(secondJSON["mode"] as? String == "delta")
+        #expect(secondJSON["snapshot"] == nil)
+        #expect((secondJSON["deletes"] as? [String])?.count == 1)
+        let persisted = try String(contentsOf: stateURL, encoding: .utf8)
+        #expect(!persisted.contains(self.sharedToken))
+        #expect(!persisted.contains("private prompt"))
+        #expect((try FileManager.default.attributesOfItem(atPath: stateURL.path)[.posixPermissions]
+            as? NSNumber)?.intValue == 0o600)
+    }
+
+    @Test("incremental partition identity is cross-platform stable")
+    func stableIncrementalPartitionIdentity() {
+        #expect(
+            ActivitySyncSnapshotPartitioner.partitionKey("day", ["2026-08-12"])
+                == "day:3005fa68b64e26319d43538b047a5551c335b79681b787d90f713ef0a2079d03")
+    }
+
+    @Test("incremental client falls back to protocol v1 on HTTP 404")
+    func incrementalFallback() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let snapshot = TestFixtures.activity().redactedForSync()
+        let response = ActivitySyncDownloadResponse(snapshots: [
+            ActivitySyncStoredSnapshot(
+                device: self.remoteDevice,
+                generatedAtMs: snapshot.generatedAtMs,
+                receivedAtMs: snapshot.generatedAtMs + 1,
+                snapshot: snapshot),
+        ])
+        let transport = RecordingHTTPTransport(responses: [
+            TokenBarHTTPResponse(data: Data(), statusCode: 404),
+            TokenBarHTTPResponse(data: Data(), statusCode: 204),
+            TokenBarHTTPResponse(data: try JSONEncoder().encode(response), statusCode: 200),
+        ])
+        let client = ActivitySyncRemoteClient(
+            transport: transport,
+            incrementalStore: ActivitySyncIncrementalStore(
+                fileURL: directory.appendingPathComponent("state.json")))
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com",
+            token: self.sharedToken,
+            device: self.localDevice)
+
+        let outcome = try await client.synchronizeIncrementally(
+            ActivitySyncUploadEnvelope(
+                device: self.localDevice,
+                generatedAtMs: snapshot.generatedAtMs,
+                snapshot: snapshot),
+            configuration: configuration)
+        let requests = await transport.requests
+
+        #expect(outcome.response == response)
+        #expect(requests.map { $0.url?.path } == [
+            "/v2/snapshots/11111111-1111-4111-8111-111111111111",
+            "/v1/snapshots/11111111-1111-4111-8111-111111111111",
+            "/v1/snapshots",
+        ])
+    }
+
     @Test("merger replaces the local server echo and sums remote devices")
     func mergesDevices() throws {
         let local = TestFixtures.activity(
@@ -572,6 +792,37 @@ struct ActivitySyncTests {
         #expect(values.first?.phase == .syncing)
         #expect(values.last?.phase == .success)
         #expect(values.last?.deviceCount == 2)
+    }
+
+    @Test("synchronized provider uses the incremental network path")
+    func synchronizedProviderUsesIncrementalPath() async throws {
+        let local = TestFixtures.activity(promptPreview: "private")
+        let remote = local.redactedForSync()
+        let response = ActivitySyncDownloadResponse(snapshots: [
+            ActivitySyncStoredSnapshot(
+                device: self.remoteDevice,
+                generatedAtMs: remote.generatedAtMs,
+                receivedAtMs: remote.generatedAtMs + 1,
+                snapshot: remote),
+        ])
+        let network = RecordingIncrementalSyncNetwork(
+            outcome: ActivitySyncIncrementalOutcome(response: response))
+        let reports = RecordingSyncReports()
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com",
+            token: self.sharedToken,
+            device: self.localDevice)
+        let service = SynchronizedActivityService(
+            local: StaticActivityProvider(snapshot: local),
+            networking: network,
+            configuration: { configuration },
+            report: { await reports.append($0) })
+
+        let result = try await service.fetchActivity()
+
+        #expect(result.today.tokens.total == local.today.tokens.total * 2)
+        #expect(await network.envelopes.first?.snapshot.sessions.first?.title == nil)
+        #expect(await reports.values.last?.phase == .success)
     }
 
     @Test("synchronization failures preserve local activity")
