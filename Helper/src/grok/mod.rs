@@ -561,7 +561,11 @@ fn integer_field(value: &Value, camel: &str, snake: &str) -> Option<i64> {
 
 fn canonical_model(model: &str) -> String {
     let model = model.trim().to_ascii_lowercase();
-    (!model.is_empty()).then_some(model).unwrap_or_else(|| "grok".to_string())
+    if model.is_empty() {
+        "grok".to_string()
+    } else {
+        model
+    }
 }
 
 fn file_modified_timestamp_ms(path: &Path) -> i64 {
