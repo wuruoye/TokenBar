@@ -218,6 +218,10 @@ enum ActivitySyncSnapshotPartitioner {
         }
     }
 
+    static func snapshotDigest(_ snapshot: ActivitySnapshot) throws -> String {
+        self.sha256Hex(try self.canonicalData(snapshot))
+    }
+
     static func materialize(
         _ partitions: [String: ActivitySyncJSONValue]) throws -> ActivitySnapshot
     {
@@ -424,6 +428,7 @@ struct ActivitySyncV2RemoteEntry: Codable, Sendable {
     let receivedAtMs: Int64
     let revision: Int64
     let manifest: [String: String]
+    let cacheDigest: String?
     let snapshot: ActivitySnapshot
 
     var storedSnapshot: ActivitySyncStoredSnapshot {
@@ -921,6 +926,7 @@ extension ActivitySyncRemoteClient: ActivitySyncIncrementalNetworking {
                 receivedAtMs: change.receivedAtMs,
                 revision: change.revision,
                 manifest: change.manifest,
+                cacheDigest: try ActivitySyncSnapshotPartitioner.snapshotDigest(snapshot),
                 snapshot: snapshot)
         }
         next.remotes = entries.values.sorted { $0.device.id < $1.device.id }
@@ -946,6 +952,8 @@ extension ActivitySyncRemoteClient: ActivitySyncIncrementalNetworking {
                 guard remote.device.id != configuration.device.id,
                       remote.revision > 0,
                       self.valid(manifest: remote.manifest),
+                      remote.cacheDigest
+                          == (try ActivitySyncSnapshotPartitioner.snapshotDigest(remote.snapshot)),
                       deviceIDs.insert(remote.device.id).inserted
                 else {
                     throw ActivitySyncError.invalidResponse("cached incremental metadata is invalid")

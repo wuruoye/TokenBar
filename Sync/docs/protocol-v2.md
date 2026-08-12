@@ -12,7 +12,7 @@ Every privacy-sanitized `ActivitySnapshot` is deterministically split into:
 - `session`: one partition per platform and stable session ID;
 - `memory-day`: one partition per memory-usage date.
 
-Partition identity is `kind:sha256(kind + NUL + identity...)`. A manifest maps each identity to the SHA-256 of its canonical JSON value. Manifests contain identifiers and hashes only; they contain no prompt, output, path, or snapshot body.
+Partition identity is `kind:sha256(kind + NUL + identity...)`. A manifest maps each identity to the SHA-256 of its canonical JSON value. Manifests contain identifiers and hashes only; they contain no prompt, output, path, or snapshot body. An upload client compares only manifests it produced itself. Download manifests are produced by the server and echoed back by the Mac as opaque revision metadata, so correctness does not depend on different JSON runtimes rendering equivalent numbers identically.
 
 ## Upload
 
@@ -40,7 +40,7 @@ Content-Type: application/json
 
 The Mac client sends the server-issued revision and manifest for each cached remote device. Unchanged devices are omitted. A changed device is returned as a full snapshot when it has no usable base, a full calibration was requested, or the delta would be at least 70% of the full response; otherwise only its changed partitions and tombstones are returned. `deletedDeviceIds` removes server-side rows from the client cache.
 
-The Mac stores only privacy-sanitized materialized remote snapshots and their server manifests in a mode-0600 Application Support file. After applying and validating changes, it recomputes the combined display from the current local snapshot and every current remote snapshot. Aggregate counters are not incrementally added to a previously merged result.
+The Mac stores only privacy-sanitized materialized remote snapshots, their server manifests, and a separate Swift-local cache-integrity digest in a mode-0600 Application Support file. A missing or mismatched local digest discards the remote cache and forces a full download. After applying and validating changes, it recomputes the combined display from the current local snapshot and every current remote snapshot. Aggregate counters are not incrementally added to a previously merged result.
 
 ## Weekly reset metadata
 

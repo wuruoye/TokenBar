@@ -574,6 +574,11 @@ struct ActivitySyncTests {
         let persisted = try String(contentsOf: stateURL, encoding: .utf8)
         #expect(!persisted.contains(self.sharedToken))
         #expect(!persisted.contains("private prompt"))
+        let persistedJSON = try #require(
+            try JSONSerialization.jsonObject(with: Data(persisted.utf8)) as? [String: Any])
+        let persistedRemotes = try #require(persistedJSON["remotes"] as? [[String: Any]])
+        let cacheDigest = try #require(persistedRemotes.first?["cacheDigest"] as? String)
+        #expect(cacheDigest.count == 64)
         #expect((try FileManager.default.attributesOfItem(atPath: stateURL.path)[.posixPermissions]
             as? NSNumber)?.intValue == 0o600)
     }
@@ -583,6 +588,66 @@ struct ActivitySyncTests {
         #expect(
             ActivitySyncSnapshotPartitioner.partitionKey("day", ["2026-08-12"])
                 == "day:3005fa68b64e26319d43538b047a5551c335b79681b787d90f713ef0a2079d03")
+    }
+
+    @Test("invalid local cache digest forces a full remote calibration")
+    func invalidIncrementalCacheDigestForcesFull() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ActivitySyncIncrementalStore(
+            fileURL: directory.appendingPathComponent("state.json"))
+        let snapshot = TestFixtures.activity().redactedForSync()
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com",
+            token: self.sharedToken,
+            device: self.localDevice)
+        let manifest = try ActivitySyncSnapshotPartitioner.manifest(
+            ActivitySyncSnapshotPartitioner.partitions(snapshot))
+        try await store.save(ActivitySyncV2State(
+            stateVersion: 1,
+            serverURL: configuration.serverURL.absoluteString,
+            localDeviceID: configuration.device.id,
+            upload: nil,
+            lastDownloadFullAtMs: snapshot.generatedAtMs,
+            remotes: [ActivitySyncV2RemoteEntry(
+                device: self.remoteDevice,
+                generatedAtMs: snapshot.generatedAtMs,
+                receivedAtMs: snapshot.generatedAtMs + 1,
+                revision: 1,
+                manifest: manifest,
+                cacheDigest: String(repeating: "0", count: 64),
+                snapshot: snapshot)]))
+        let transport = RecordingHTTPTransport(responses: [
+            TokenBarHTTPResponse(
+                data: try JSONEncoder().encode(TestV2UploadResponse(
+                    revision: 1,
+                    status: "updated",
+                    receivedAtMs: snapshot.generatedAtMs + 2)),
+                statusCode: 200),
+            TokenBarHTTPResponse(
+                data: try JSONEncoder().encode(TestV2QueryResponse(
+                    snapshots: [],
+                    deletedDeviceIds: [])),
+                statusCode: 200),
+        ])
+        let client = ActivitySyncRemoteClient(
+            transport: transport,
+            incrementalStore: store)
+
+        _ = try await client.synchronizeIncrementally(
+            ActivitySyncUploadEnvelope(
+                device: self.localDevice,
+                generatedAtMs: snapshot.generatedAtMs,
+                snapshot: snapshot),
+            configuration: configuration)
+        let requests = await transport.requests
+        let queryData = try #require(requests[1].httpBody)
+        let query = try #require(
+            try JSONSerialization.jsonObject(with: queryData) as? [String: Any])
+
+        #expect(query["forceFull"] as? Bool == true)
+        #expect((query["known"] as? [[String: Any]])?.isEmpty == true)
     }
 
     @Test("incremental client falls back to protocol v1 on HTTP 404")
