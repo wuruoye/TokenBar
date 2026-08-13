@@ -18,6 +18,14 @@ thiserror = "2"
 tokenbar-helper = { path = "../Helper" }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

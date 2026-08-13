@@ -3,6 +3,9 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde_json::Value;
@@ -40,6 +43,8 @@ pub fn collect(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let mut child = command
         .spawn()
         .context("could not start tokenbar-helper")?;
