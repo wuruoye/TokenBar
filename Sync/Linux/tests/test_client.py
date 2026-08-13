@@ -110,7 +110,7 @@ class ClientTests(unittest.TestCase):
             snapshot = load_snapshot(path)
             self.assertEqual(snapshot["schemaVersion"], 8)
             session = snapshot["sessions"][0]
-            self.assertIsNone(session["title"])
+            self.assertEqual(session["title"], "private")
             self.assertIsNone(session["workspacePath"])
             self.assertIsNone(session["workspaceLabel"])
             self.assertIsNone(session["requests"][0]["promptPreview"])

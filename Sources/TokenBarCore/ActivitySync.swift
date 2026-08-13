@@ -559,7 +559,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               session.startedAtMs > 0,
               session.endedAtMs >= session.startedAtMs,
               Self.isNonnegativeFinite(session.costUsd),
-              session.title == nil,
+              session.title.map(isValidActivitySyncSessionTitle) ?? true,
               session.workspacePath == nil,
               session.workspaceLabel == nil
         else {
@@ -1093,7 +1093,7 @@ public enum ActivitySnapshotMerger {
             costUsd: session.costUsd,
             models: session.models,
             requests: session.requests.map { self.namespaced($0, for: device) },
-            title: nil,
+            title: session.title,
             workspacePath: nil,
             platform: session.platform)
     }
@@ -1154,13 +1154,17 @@ public extension SessionSummary {
             costUsd: redacted.costUsd,
             models: redacted.models,
             requests: redacted.requests,
-            title: nil,
+            title: sanitizedActivitySyncSessionTitle(self.title),
             workspacePath: nil,
             platform: redacted.platform)
     }
 
     var synchronizedDeviceID: String? {
         synchronizedDeviceIDForActivitySync(from: self.id)
+    }
+
+    var synchronizedOriginalSessionID: String? {
+        synchronizedIdentityForActivitySync(from: self.id)?.originalID
     }
 
     var isSynchronizedRemote: Bool {
@@ -1394,9 +1398,32 @@ private extension Double {
 }
 
 private func synchronizedDeviceIDForActivitySync(from value: String) -> String? {
+    synchronizedIdentityForActivitySync(from: value)?.deviceID
+}
+
+private func synchronizedIdentityForActivitySync(
+    from value: String) -> (deviceID: String, originalID: String)?
+{
     guard value.hasPrefix("sync:") else { return nil }
     let remainder = value.dropFirst("sync:".count)
     guard let separator = remainder.firstIndex(of: ":") else { return nil }
     let candidate = String(remainder[..<separator])
-    return UUID(uuidString: candidate)?.uuidString.lowercased()
+    let originalID = String(remainder[remainder.index(after: separator)...])
+    guard !originalID.isEmpty,
+          let deviceID = UUID(uuidString: candidate)?.uuidString.lowercased()
+    else {
+        return nil
+    }
+    return (deviceID, originalID)
+}
+
+private func sanitizedActivitySyncSessionTitle(_ value: String?) -> String? {
+    guard let value, isValidActivitySyncSessionTitle(value) else { return nil }
+    return value
+}
+
+private func isValidActivitySyncSessionTitle(_ value: String) -> Bool {
+    !value.isEmpty
+        && value.utf8.count <= 512
+        && !value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
 }

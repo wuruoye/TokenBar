@@ -239,7 +239,7 @@ struct ActivitySyncTests {
         #expect(keychain.loadedServices == [currentService])
     }
 
-    @Test("sync redaction removes content and paths recursively")
+    @Test("sync keeps session names while removing content and paths recursively")
     func redactsSensitiveFields() throws {
         let contribution = RequestSummary(
             id: "physical",
@@ -270,7 +270,7 @@ struct ActivitySyncTests {
         let request = try #require(session.requests.first)
         let nested = try #require(request.contributions?.first)
 
-        #expect(session.title == nil)
+        #expect(session.title == "private title")
         #expect(session.workspacePath == nil)
         #expect(session.workspaceLabel == nil)
         #expect(request.promptPreview == nil)
@@ -279,6 +279,10 @@ struct ActivitySyncTests {
         #expect(nested.promptPreview == nil)
         #expect(nested.outputPreview == nil)
         #expect(nested.sessionPath == nil)
+
+        let invalidTitle = TestFixtures.activity(
+            sessionTitle: String(repeating: "x", count: 513)).redactedForSync()
+        #expect(invalidTitle.sessions.first?.title == nil)
     }
 
     @Test("configuration requires HTTPS except on loopback")
@@ -740,7 +744,7 @@ struct ActivitySyncTests {
         })
         #expect(remoteSession.isSynchronizedRemote)
         #expect(remoteSession.synchronizedDeviceID == self.remoteDevice.id)
-        #expect(remoteSession.title == nil)
+        #expect(remoteSession.title == remote.sessions.first?.title)
         #expect(remoteSession.workspacePath == nil)
         #expect(remoteSession.workspaceLabel == "Windows PC")
         let remoteRequest = try #require(remoteSession.requests.first)
@@ -852,7 +856,7 @@ struct ActivitySyncTests {
         let values = await reports.values
 
         #expect(result.today.tokens.total == local.today.tokens.total * 2)
-        #expect(uploaded.snapshot.sessions.first?.title == nil)
+        #expect(uploaded.snapshot.sessions.first?.title == "private title")
         #expect(uploaded.snapshot.sessions.first?.requests.first?.promptPreview == nil)
         #expect(values.first?.phase == .syncing)
         #expect(values.last?.phase == .success)
@@ -886,7 +890,8 @@ struct ActivitySyncTests {
         let result = try await service.fetchActivity()
 
         #expect(result.today.tokens.total == local.today.tokens.total * 2)
-        #expect(await network.envelopes.first?.snapshot.sessions.first?.title == nil)
+        #expect(await network.envelopes.first?.snapshot.sessions.first?.title
+            == local.sessions.first?.title)
         #expect(await reports.values.last?.phase == .success)
     }
 

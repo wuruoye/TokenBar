@@ -108,6 +108,15 @@ class CommonTests(unittest.TestCase):
                 "sessionPath": "/private/session.jsonl",
                 "nested": [{"workspacePath": "C:\\Users\\example", "title": "secret"}],
             },
+            "session": {
+                "id": "session-1",
+                "title": "Synced session name",
+                "startedAtMs": 1,
+                "endedAtMs": 2,
+                "tokens": {},
+                "models": [],
+                "requests": [],
+            },
             "workspaceLabel": "safe-label",
             "api_key": "credential-value",
             "authToken": "credential-value",
@@ -120,11 +129,15 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(clean["request"]["sessionPath"], None)
         self.assertEqual(clean["request"]["nested"][0]["workspacePath"], None)
         self.assertEqual(clean["request"]["nested"][0]["title"], None)
+        self.assertEqual(clean["session"]["title"], "Synced session name")
         self.assertIsNone(clean["workspaceLabel"])
         self.assertNotIn("api_key", clean)
         self.assertNotIn("authToken", clean)
         self.assertEqual(clean["tokens"]["output"], 42)
         self.assertIsNone(clean["unknownPath"])
+
+        invalid_session = {**source["session"], "title": "line one\nline two"}
+        self.assertIsNone(sanitize_snapshot(invalid_session)["title"])
 
     def test_validate_rejects_unsanitized_snapshot(self):
         value = envelope()

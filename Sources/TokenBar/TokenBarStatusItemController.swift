@@ -820,18 +820,17 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 keyEquivalent: "")
             readOnly.isEnabled = false
             menu.addItem(readOnly)
-        } else {
-            let copySession = NSMenuItem(
-                title: "Copy Session",
-                action: #selector(self.copySession(_:)),
-                keyEquivalent: "")
-            copySession.target = self
-            copySession.representedObject = session
-            copySession.image = NSImage(
-                systemSymbolName: "doc.on.doc",
-                accessibilityDescription: nil)
-            menu.addItem(copySession)
         }
+        let copySession = NSMenuItem(
+            title: "Copy Session",
+            action: #selector(self.copySession(_:)),
+            keyEquivalent: "")
+        copySession.target = self
+        copySession.representedObject = session
+        copySession.image = NSImage(
+            systemSymbolName: "doc.on.doc",
+            accessibilityDescription: nil)
+        menu.addItem(copySession)
         menu.addItem(.separator())
 
         let requests = session.requests.sorted {

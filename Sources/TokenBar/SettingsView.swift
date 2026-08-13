@@ -122,7 +122,7 @@ struct TokenBarSettingsView: View {
                                     : Color.red)
                     }
 
-                    Text("Uploads token counts, models, timing, and coarse workspace labels. Prompt/output text, session titles, absolute paths, and provider credentials are removed before transmission. Sync failures never replace local activity data.")
+                    Text("Uploads session names and IDs with token counts, models, and timing so synced sessions can be identified and copied. Prompt/output text, workspace details, absolute paths, and provider credentials are removed before transmission. Sync failures never replace local activity data.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

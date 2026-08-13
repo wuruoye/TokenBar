@@ -28,7 +28,6 @@ PRIVACY_NULL_FIELDS = {
     "promptPreview",
     "outputPreview",
     "sessionPath",
-    "title",
     "workspacePath",
     "workspaceLabel",
     "promptText",
@@ -360,6 +359,22 @@ def _looks_like_absolute_local_path(value: str) -> bool:
     )
 
 
+def _is_activity_session(value: dict[str, Any]) -> bool:
+    return all(
+        key in value
+        for key in ("id", "startedAtMs", "endedAtMs", "tokens", "models", "requests")
+    )
+
+
+def _valid_session_title(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= 512
+        and not any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    )
+
+
 def sanitize_snapshot(value: Any, *, _depth: int = 0) -> Any:
     """Return a JSON-compatible privacy-sanitized deep copy.
 
@@ -372,12 +387,15 @@ def sanitize_snapshot(value: Any, *, _depth: int = 0) -> Any:
         raise ValidationError("snapshot nesting exceeds 100 levels")
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
+        is_session = _is_activity_session(value)
         for key, child in value.items():
             if not isinstance(key, str):
                 raise ValidationError("snapshot object keys must be strings")
             if _normalized_key(key) in CREDENTIAL_KEYS:
                 continue
-            if key in PRIVACY_NULL_FIELDS:
+            if key == "title" and is_session:
+                clean[key] = child if _valid_session_title(child) else None
+            elif key == "title" or key in PRIVACY_NULL_FIELDS:
                 clean[key] = None
             else:
                 clean[key] = sanitize_snapshot(child, _depth=_depth + 1)
@@ -545,6 +563,9 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
 def _validate_session(value: Any, label: str) -> None:
     session = _require_object(value, label)
     _require_string(session.get("id"), f"{label}.id")
+    title = session.get("title")
+    if title is not None and not _valid_session_title(title):
+        raise ValidationError(f"{label}.title must be a valid session name")
     started = _require_int64(session.get("startedAtMs"), f"{label}.startedAtMs", positive=True)
     ended = _require_int64(session.get("endedAtMs"), f"{label}.endedAtMs", positive=True)
     if ended < started:

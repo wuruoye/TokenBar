@@ -530,7 +530,7 @@ mod tests {
     fn download_uses_get_and_resanitizes_server_rows() {
         let id = Uuid::new_v4();
         let body = format!(
-            r#"{{"protocolVersion":1,"snapshots":[{{"device":{{"id":"{id}","name":"Windows test device","os":"windows"}},"generatedAtMs":123,"receivedAtMs":456,"snapshot":{{"schemaVersion":{SCHEMA_VERSION},"generatedAtMs":123,"timezone":"UTC","today":{{}},"sessions":[{{"title":"private","workspacePath":"C:\\private","workspaceLabel":"safe","requests":[{{"promptPreview":"private","outputPreview":"private","sessionPath":"C:\\private\\session.jsonl"}}]}}],"days":[]}}}}]}}"#
+            r#"{{"protocolVersion":1,"snapshots":[{{"device":{{"id":"{id}","name":"Windows test device","os":"windows"}},"generatedAtMs":123,"receivedAtMs":456,"snapshot":{{"schemaVersion":{SCHEMA_VERSION},"generatedAtMs":123,"timezone":"UTC","today":{{}},"sessions":[{{"id":"session-1","title":"private","workspacePath":"C:\\private","workspaceLabel":"safe","startedAtMs":1,"endedAtMs":2,"tokens":{{}},"models":[],"requests":[{{"promptPreview":"private","outputPreview":"private","sessionPath":"C:\\private\\session.jsonl"}}]}}],"days":[]}}}}]}}"#
         );
         let leaked: &'static str = Box::leak(body.into_boxed_str());
         let (origin, server) = serve_once(leaked);
@@ -540,7 +540,7 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.starts_with("GET /v1/snapshots HTTP/1.1\r\n"));
         let session = &response.snapshots[0].snapshot["sessions"][0];
-        assert!(session["title"].is_null());
+        assert_eq!(session["title"], "private");
         assert!(session["workspacePath"].is_null());
         assert!(session["workspaceLabel"].is_null());
         assert!(session["requests"][0]["promptPreview"].is_null());

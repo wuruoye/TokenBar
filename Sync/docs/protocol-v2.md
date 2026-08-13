@@ -56,5 +56,5 @@ This returns only the newest valid `codex`, `claude`, and `grok` weekly reset ti
 - Clients try v2 first and fall back to protocol-v1 full upload/download when v2 returns HTTP 404.
 - The request-body limit remains 16 MiB and the download limit remains 64 MiB.
 - Redirects and forward proxies are disabled for sync traffic; non-loopback endpoints require HTTPS.
-- Both full and incremental data use the protocol-v1 privacy boundary: prompt/output text, titles, workspace/session paths, raw session content, credentials, cookies, and bearer tokens are never accepted or stored.
+- Both full and incremental data use the protocol-v1 privacy boundary. Session names and stable session IDs are retained so remote sessions can be identified and copied. Prompt/output text, workspace/session paths, raw session content, credentials, cookies, bearer tokens, and `title` fields outside structurally valid session records are never accepted or stored.
 - The server stores only one current, fully materialized snapshot plus revision metadata per device. It does not retain a delta event history.

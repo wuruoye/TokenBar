@@ -29,6 +29,28 @@ struct TokscaleCopyLocatorTests {
         #expect(!request.tokscaleCopyText.contains("\n"))
     }
 
+    @Test("Synced session copy includes server and restores the remote session ID")
+    func syncedSessionLocator() {
+        let request = self.makeRequest()
+        let server = "11111111-1111-4111-8111-111111111111"
+        let session = SessionSummary(
+            id: "sync:\(server):root-session",
+            workspaceLabel: "Windows Workstation",
+            startedAtMs: request.startedAtMs,
+            endedAtMs: request.endedAtMs,
+            tokens: request.tokens,
+            costUsd: request.costUsd,
+            models: [request.model],
+            requests: [request],
+            title: "Remote session")
+
+        #expect(session.synchronizedDeviceID == server)
+        #expect(session.synchronizedOriginalSessionID == "root-session")
+        #expect(
+            session.tokscaleCopyText
+                == "platform=codex server=\(server) session_id=root-session")
+    }
+
     @Test("Claude copy uses the Claude platform locator")
     func claudeLocator() {
         let codex = self.makeRequest()
