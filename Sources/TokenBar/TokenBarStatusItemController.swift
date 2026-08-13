@@ -707,7 +707,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func configureSessionItem(_ item: NSMenuItem, session: SessionSummary) {
-        let title = session.menuTitle
+        let title = session.menuDisplayTitle
         let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
         let isRemote = session.isSynchronizedRemote
@@ -756,8 +756,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 let session = visibleSessions[index]
                 self.configureSessionItem(item, session: session)
                 if let submenu = item.submenu {
-                    if submenu.title != session.menuTitle {
-                        submenu.title = session.menuTitle
+                    if submenu.title != session.menuDisplayTitle {
+                        submenu.title = session.menuDisplayTitle
                     }
                     self.submenuSessionIDs[ObjectIdentifier(submenu)] = session.platformScopedID
                 }
@@ -810,7 +810,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             return
         }
 
-        menu.title = session.menuTitle
+        menu.title = session.menuDisplayTitle
         menu.minimumWidth = Self.menuWidth
         menu.addItem(.sectionHeader(title: "Turns"))
         if session.isSynchronizedRemote {

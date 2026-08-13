@@ -680,7 +680,7 @@ enum DemoPreviewRenderer {
                 height: TokenMenuRowView.rowHeight * CGFloat(rowCount)))
         let sessionRow = TokenMenuRowView(width: width)
         sessionRow.configure(
-            title: session.menuTitle,
+            title: session.menuDisplayTitle,
             cost: session.menuCostText,
             detail: session.menuDetail,
             trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
