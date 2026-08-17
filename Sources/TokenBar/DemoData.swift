@@ -648,6 +648,7 @@ enum DemoPreviewRenderer {
             model: model,
             showsClaude: showsClaude,
             showsGrok: showsGrok,
+            usesWeekdayWeeklyPacing: false,
             accentColor: .purple)
             .frame(width: 384, height: height, alignment: .top)
             .background(Color.white)

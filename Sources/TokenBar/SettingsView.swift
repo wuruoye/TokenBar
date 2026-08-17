@@ -70,6 +70,16 @@ struct TokenBarSettingsView: View {
                     isOn: self.$settings.showsFullRequestContentOnHover)
             }
 
+            Section("Quota") {
+                Toggle(
+                    "Use weekdays only for weekly pace",
+                    isOn: self.$settings.usesWeekdayWeeklyPacing)
+
+                Text("Splits weekly pace into five workdays. Saturday and Sunday do not advance expected usage.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let activitySync = self.activitySync {
                 Section("Multi-device sync") {
                     Toggle("Sync activity across devices", isOn: self.$settings.syncEnabled)

@@ -32,7 +32,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Track every provider's quota window independently without mixing percentages or reset cycles.
 - Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
 - Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
-- Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
+- Compare weekly usage with a linear seven-day pace calculated from the last weekly reset, or switch to a five-workday pace that pauses on weekends.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - On the **Codex** tab only, track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output.
@@ -175,7 +175,7 @@ TokenBar is designed to keep session content local:
 - The optional Codex Memory receiver stores token counts, timestamps, metric names, deduplication fingerprints, and a small allowlist of process identity fields. It discards the full request body and never stores prompts, traces, logs, arbitrary metric attributes, or unrelated metrics.
 - TokenBar does not send its own telemetry or analytics. The Codex Memory integration receives the two selected metrics over loopback only.
 
-Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when a live refresh is unavailable, TokenBar can use Claude Desktop's recent local usage sample and labels that source in the quota header. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
+Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when a live refresh is unavailable, TokenBar can use Claude Desktop's recent local usage sample and labels that source in the quota header. A Claude Code statusline can also write only its subscriber rate-limit windows and sample time to `~/Library/Application Support/TokenBar/claude-rate-limits.json`; TokenBar uses valid future reset times from that private local snapshot without storing the rest of the statusline payload. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
 
 ## Settings
 
@@ -184,6 +184,7 @@ Open **Settings** with `Command-,` to configure:
 - **Theme color:** System, Blue, Purple, Green, Orange, or Pink.
 - **Show Claude Code:** add or remove the Claude `T/W` section and Claude tab immediately. When hidden, TokenBar skips Claude quota refreshes and does not read the Claude credential from disk or the macOS Keychain.
 - **Show Grok Build:** add or remove the Grok `T/W` section and Grok tab immediately. When hidden, TokenBar skips Grok quota-log refreshes.
+- **Use weekdays only for weekly pace:** split weekly pace into five workdays and pause expected usage on Saturday and Sunday.
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.

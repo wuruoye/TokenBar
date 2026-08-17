@@ -427,7 +427,7 @@ public final class DashboardModel {
         self.quotas.reduce(into: [:]) { result, entry in
             guard self.quotaRefreshEnabledPlatforms.contains(entry.key),
                   let windowStart = entry.value.value?.weekly?
-                .weeklyPacing(at: self.now())?.windowStart
+                .weeklyPacing(at: self.now(), weekdaysOnly: false)?.windowStart
             else {
                 return
             }

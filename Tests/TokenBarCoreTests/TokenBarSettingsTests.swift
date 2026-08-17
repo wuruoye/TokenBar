@@ -17,6 +17,7 @@ struct TokenBarSettingsTests {
             #expect(settings.statisticsTimeZone == .utc)
             #expect(settings.showsClaude)
             #expect(settings.showsGrok)
+            #expect(!settings.usesWeekdayWeeklyPacing)
             #expect(settings.showsFullRequestContentOnHover)
             #expect(settings.resetCelebration == .off)
             #expect(!settings.syncEnabled)
@@ -36,6 +37,7 @@ struct TokenBarSettingsTests {
             settings?.statisticsTimeZone = .local
             settings?.showsClaude = false
             settings?.showsGrok = false
+            settings?.usesWeekdayWeeklyPacing = true
             settings?.showsFullRequestContentOnHover = false
             settings?.resetCelebration = .both
             settings?.syncEnabled = true
@@ -51,6 +53,7 @@ struct TokenBarSettingsTests {
             #expect(restored.statisticsTimeZone == .local)
             #expect(!restored.showsClaude)
             #expect(!restored.showsGrok)
+            #expect(restored.usesWeekdayWeeklyPacing)
             #expect(!restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .both)
             #expect(restored.syncEnabled)
@@ -88,6 +91,7 @@ struct TokenBarSettingsTests {
             settings.statisticsTimeZone = .local
             settings.showsClaude = false
             settings.showsGrok = false
+            settings.usesWeekdayWeeklyPacing = true
             settings.showsFullRequestContentOnHover = false
             settings.resetCelebration = .session
             settings.syncEnabled = true
@@ -103,6 +107,7 @@ struct TokenBarSettingsTests {
             #expect(restored.statisticsTimeZone == .utc)
             #expect(restored.showsClaude)
             #expect(restored.showsGrok)
+            #expect(!restored.usesWeekdayWeeklyPacing)
             #expect(restored.showsFullRequestContentOnHover)
             #expect(restored.resetCelebration == .off)
             #expect(!restored.syncEnabled)

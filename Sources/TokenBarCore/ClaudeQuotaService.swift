@@ -31,6 +31,7 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
     private let loadAccessToken: @Sendable () throws -> String
     private let fetchUsage: @Sendable (String) async throws -> Data
     private let loadCachedDesktopUsage: @Sendable (Date) -> Data?
+    private let loadCachedStatusLineUsage: @Sendable (Date) -> Data?
     private let now: @Sendable () -> Date
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
@@ -76,6 +77,10 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         self.loadCachedDesktopUsage = { sampledAt in
             Self.cachedDesktopUsage(at: sampledAt)
         }
+        let statusLineUsageURL = Self.statusLineUsageURL()
+        self.loadCachedStatusLineUsage = { _ in
+            try? Data(contentsOf: statusLineUsageURL)
+        }
         self.now = Date.init
     }
 
@@ -83,11 +88,13 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         loadAccessToken: @escaping @Sendable () throws -> String,
         fetchUsage: @escaping @Sendable (String) async throws -> Data,
         loadCachedDesktopUsage: @escaping @Sendable (Date) -> Data? = { _ in nil },
+        loadCachedStatusLineUsage: @escaping @Sendable (Date) -> Data? = { _ in nil },
         now: @escaping @Sendable () -> Date = Date.init)
     {
         self.loadAccessToken = loadAccessToken
         self.fetchUsage = fetchUsage
         self.loadCachedDesktopUsage = loadCachedDesktopUsage
+        self.loadCachedStatusLineUsage = loadCachedStatusLineUsage
         self.now = now
     }
 
@@ -102,13 +109,69 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            guard let data = self.loadCachedDesktopUsage(self.now()),
-                  let snapshot = try? self.decodeUsage(data, origin: .claudeDesktop)
-            else {
-                throw error
+            if let snapshot = self.cachedQuota(at: self.now()) {
+                return snapshot
             }
-            return snapshot
+            throw error
         }
+    }
+
+    private func cachedQuota(at referenceDate: Date) -> QuotaSnapshot? {
+        let desktop = self.loadCachedDesktopUsage(referenceDate)
+            .flatMap { try? self.decodeUsage($0, origin: .claudeDesktop) }
+        let statusLine = self.loadCachedStatusLineUsage(referenceDate)
+            .flatMap { try? self.decodeUsage($0, origin: .liveProvider) }
+
+        guard let desktop else {
+            guard let statusLine,
+                  Self.isFresh(statusLine, at: referenceDate)
+            else {
+                return nil
+            }
+            return statusLine
+        }
+        guard let statusLine else { return desktop }
+
+        let statusLineIsFresh = Self.isFresh(statusLine, at: referenceDate)
+        return QuotaSnapshot(
+            session: Self.mergedWindow(
+                desktop.session,
+                with: statusLine.session,
+                at: referenceDate,
+                includeObservedWindow: statusLineIsFresh),
+            weekly: Self.mergedWindow(
+                desktop.weekly,
+                with: statusLine.weekly,
+                at: referenceDate,
+                includeObservedWindow: statusLineIsFresh),
+            resetCredits: nil,
+            updatedAt: desktop.updatedAt,
+            origin: .claudeDesktop)
+    }
+
+    private static func isFresh(_ snapshot: QuotaSnapshot, at referenceDate: Date) -> Bool {
+        let age = referenceDate.timeIntervalSince(snapshot.updatedAt)
+        return age >= -60 && age < 30 * 60
+    }
+
+    private static func mergedWindow(
+        _ current: QuotaWindowSnapshot?,
+        with observed: QuotaWindowSnapshot?,
+        at referenceDate: Date,
+        includeObservedWindow: Bool) -> QuotaWindowSnapshot?
+    {
+        guard let current else { return includeObservedWindow ? observed : nil }
+        guard let reset = observed?.resetsAt,
+              let windowMinutes = current.windowMinutes,
+              reset > referenceDate,
+              reset.timeIntervalSince(referenceDate) <= TimeInterval(windowMinutes * 60)
+        else {
+            return current
+        }
+        return QuotaWindowSnapshot(
+            usedPercent: current.usedPercent,
+            windowMinutes: current.windowMinutes,
+            resetsAt: reset)
     }
 
     private func decodeUsage(
@@ -228,6 +291,16 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
             payload["seven_day"] = ["utilization": sevenDay]
         }
         return try? JSONSerialization.data(withJSONObject: payload)
+    }
+
+    private static func statusLineUsageURL() -> URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("TokenBar", isDirectory: true)
+            .appendingPathComponent("claude-rate-limits.json", isDirectory: false)
     }
 }
 

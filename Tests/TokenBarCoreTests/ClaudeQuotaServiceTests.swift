@@ -96,4 +96,104 @@ struct ClaudeQuotaServiceTests {
         #expect(quota.updatedAt == Date(timeIntervalSince1970: 1_800_000_000.123))
         #expect(quota.origin == .claudeDesktop)
     }
+
+    @Test("adds statusline reset times to a fresher Claude Desktop sample")
+    func mergesStatusLineResetsIntoDesktopUsage() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_100)
+        let service = ClaudeQuotaService(
+            loadAccessToken: { throw ClaudeQuotaServiceError.credentialsUnavailable },
+            fetchUsage: { _ in throw ClaudeQuotaFixtureError.wrongToken },
+            loadCachedDesktopUsage: { _ in
+                Data(
+                    """
+                    {
+                      "_cached_at_ms": 1800000000123,
+                      "five_hour": {"utilization": 39},
+                      "seven_day": {"utilization": 4}
+                    }
+                    """.utf8)
+            },
+            loadCachedStatusLineUsage: { _ in
+                Data(
+                    """
+                    {
+                      "_cached_at_ms": 1799900000000,
+                      "five_hour": {
+                        "utilization": 80,
+                        "resets_at": "2027-01-15T10:00:00Z"
+                      },
+                      "seven_day": {
+                        "utilization": 70,
+                        "resets_at": "2027-01-21T03:20:00Z"
+                      }
+                    }
+                    """.utf8)
+            },
+            now: { now })
+
+        let quota = try await service.fetchQuota()
+
+        #expect(quota.session?.usedPercent == 39)
+        #expect(quota.weekly?.usedPercent == 4)
+        #expect(quota.session?.resetsAt == ISO8601DateFormatter().date(
+            from: "2027-01-15T10:00:00Z"))
+        #expect(quota.weekly?.resetsAt == ISO8601DateFormatter().date(
+            from: "2027-01-21T03:20:00Z"))
+        #expect(quota.updatedAt == Date(timeIntervalSince1970: 1_800_000_000.123))
+        #expect(quota.origin == .claudeDesktop)
+    }
+
+    @Test("uses a fresh statusline snapshot when Claude Desktop has no sample")
+    func fallsBackToFreshStatusLineUsage() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_100)
+        let service = ClaudeQuotaService(
+            loadAccessToken: { throw ClaudeQuotaServiceError.credentialsUnavailable },
+            fetchUsage: { _ in throw ClaudeQuotaFixtureError.wrongToken },
+            loadCachedStatusLineUsage: { _ in
+                Data(
+                    """
+                    {
+                      "_cached_at_ms": 1800000050000,
+                      "seven_day": {
+                        "utilization": 21,
+                        "resets_at": "2027-01-21T03:20:00Z"
+                      }
+                    }
+                    """.utf8)
+            },
+            now: { now })
+
+        let quota = try await service.fetchQuota()
+
+        #expect(quota.session == nil)
+        #expect(quota.weekly?.usedPercent == 21)
+        #expect(quota.weekly?.resetsAt == ISO8601DateFormatter().date(
+            from: "2027-01-21T03:20:00Z"))
+        #expect(quota.updatedAt == Date(timeIntervalSince1970: 1_800_000_050))
+        #expect(quota.origin == .liveProvider)
+    }
+
+    @Test("does not surface stale statusline percentages without a current local sample")
+    func rejectsStaleStatusLineUsageAlone() async {
+        let service = ClaudeQuotaService(
+            loadAccessToken: { throw ClaudeQuotaServiceError.credentialsUnavailable },
+            fetchUsage: { _ in throw ClaudeQuotaFixtureError.wrongToken },
+            loadCachedStatusLineUsage: { _ in
+                Data(
+                    """
+                    {
+                      "_cached_at_ms": 1799900000000,
+                      "seven_day": {
+                        "utilization": 21,
+                        "resets_at": "2027-01-21T03:20:00Z"
+                      }
+                    }
+                    """.utf8)
+            },
+            now: { Date(timeIntervalSince1970: 1_800_000_100) })
+
+        await #expect(throws: ClaudeQuotaServiceError.self) {
+            _ = try await service.fetchQuota()
+        }
+    }
 }

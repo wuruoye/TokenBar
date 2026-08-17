@@ -345,6 +345,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.statisticsTimeZone
             _ = self.settings.showsClaude
             _ = self.settings.showsGrok
+            _ = self.settings.usesWeekdayWeeklyPacing
             _ = self.settings.showsFullRequestContentOnHover
             _ = self.settings.syncEnabled
             _ = self.settings.syncServerURL
@@ -472,6 +473,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let overviewHeight = DashboardOverviewView.contentHeight(quota: quota)
         let overview = DashboardOverviewContentView(
             model: self.model,
+            usesWeekdayWeeklyPacing: self.settings.usesWeekdayWeeklyPacing,
             accentColor: accentColor)
             .frame(width: Self.menuWidth, alignment: .top)
         let overviewHost = FixedMenuHostingView(
