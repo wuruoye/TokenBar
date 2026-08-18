@@ -697,15 +697,56 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         item.target = self
         item.isEnabled = true
         item.view = TokenMenuRowView(width: Self.menuWidth)
+        item.submenu = self.makeSessionSubmenu(title: "Session")
+        return item
+    }
 
-        let submenu = TokenBarMenu(title: "Session")
+    private func makeSessionSubmenu(title: String) -> TokenBarMenu {
+        let submenu = TokenBarMenu(title: title)
         submenu.autoenablesItems = false
         submenu.minimumWidth = Self.menuWidth
         submenu.delegate = self
         submenu.persistentActionDelegate = self
         submenu.addItem(NSMenuItem(title: "Loading turns…", action: nil, keyEquivalent: ""))
-        item.submenu = submenu
-        return item
+        return submenu
+    }
+
+    private func bindSessionSubmenu(_ item: NSMenuItem, to session: SessionSummary) {
+        let sessionID = session.platformScopedID
+        var submenu = item.submenu
+        if let current = submenu {
+            let menuID = ObjectIdentifier(current)
+            if let previousSessionID = self.submenuSessionIDs[menuID],
+               previousSessionID != sessionID
+            {
+                self.discardRequestDetailMenus(in: current)
+                self.submenuSessionIDs.removeValue(forKey: menuID)
+                self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
+                current.delegate = nil
+                (current as? TokenBarMenu)?.persistentActionDelegate = nil
+                item.submenu = nil
+                submenu = nil
+            }
+        }
+        if submenu == nil {
+            let replacement = self.makeSessionSubmenu(title: session.menuDisplayTitle)
+            item.submenu = replacement
+            submenu = replacement
+        }
+        guard let submenu else { return }
+        submenu.title = session.menuDisplayTitle
+        self.submenuSessionIDs[ObjectIdentifier(submenu)] = sessionID
+    }
+
+    private func unbindSessionSubmenu(_ item: NSMenuItem) {
+        guard let submenu = item.submenu else { return }
+        self.discardRequestDetailMenus(in: submenu)
+        let menuID = ObjectIdentifier(submenu)
+        self.submenuSessionIDs.removeValue(forKey: menuID)
+        self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
+        submenu.delegate = nil
+        (submenu as? TokenBarMenu)?.persistentActionDelegate = nil
+        item.submenu = nil
     }
 
     private func configureSessionItem(_ item: NSMenuItem, session: SessionSummary) {
@@ -757,17 +798,10 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             if sessionsChanged, index < visibleSessions.count {
                 let session = visibleSessions[index]
                 self.configureSessionItem(item, session: session)
-                if let submenu = item.submenu {
-                    if submenu.title != session.menuDisplayTitle {
-                        submenu.title = session.menuDisplayTitle
-                    }
-                    self.submenuSessionIDs[ObjectIdentifier(submenu)] = session.platformScopedID
-                }
+                self.bindSessionSubmenu(item, to: session)
             } else if sessionsChanged {
                 item.representedObject = nil
-                if let submenu = item.submenu {
-                    self.submenuSessionIDs.removeValue(forKey: ObjectIdentifier(submenu))
-                }
+                self.unbindSessionSubmenu(item)
             }
             let isHidden = index >= visibleSessions.count
                 || (!self.showsAllSessions && index >= projection.collapsedLimit)
@@ -799,6 +833,16 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             systemImageName: self.showsAllSessions ? "chevron.up" : "chevron.down",
             accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
     }
+
+    #if DEBUG
+    func selectScopeForTesting(_ scope: DashboardScope) {
+        self.selectScope(scope)
+    }
+
+    func firstSessionSubmenuForTesting() -> NSMenu? {
+        self.sessionItems.first?.submenu
+    }
+    #endif
 
     private func rebuildRequestMenu(_ menu: NSMenu, sessionScopedID: String) {
         self.discardRequestDetailMenus(in: menu)
