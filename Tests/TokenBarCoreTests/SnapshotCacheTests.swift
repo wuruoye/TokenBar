@@ -107,4 +107,36 @@ struct SnapshotCacheTests {
         #expect(loaded[.claude]?.origin == .claudeDesktop)
         #expect(permissions == 0o600)
     }
+
+    @Test("persists weekly quota usage ledgers")
+    func persistsWeeklyQuotaUsage() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBarWeeklyUsageTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("weekly-usage.json")
+        let cache = WeeklyQuotaUsageCache(fileURL: fileURL)
+        let windowStart = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = windowStart.addingTimeInterval(7 * 86_400)
+        func snapshot(usedPercent: Double, offset: TimeInterval) -> QuotaSnapshot {
+            QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: usedPercent,
+                    windowMinutes: 10_080,
+                    resetsAt: reset),
+                resetCredits: nil,
+                updatedAt: windowStart.addingTimeInterval(offset))
+        }
+        let history = try #require(WeeklyQuotaUsageHistory.starting(
+            with: snapshot(usedPercent: 25, offset: 2 * 86_400)))
+            .recording(snapshot(usedPercent: 31, offset: 2 * 86_400 + 300))
+
+        try await cache.saveWeeklyQuotaUsage([.codex: history])
+        let loaded = try await cache.loadWeeklyQuotaUsage()
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+
+        #expect(loaded[.codex] == history)
+        #expect(permissions == 0o600)
+    }
 }

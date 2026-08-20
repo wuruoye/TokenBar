@@ -31,7 +31,8 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             quotaService: CodexQuotaService(),
             additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
             activityService: synchronizedActivity,
-            quotaCache: QuotaSnapshotCache())
+            quotaCache: QuotaSnapshotCache(),
+            weeklyQuotaUsageCache: WeeklyQuotaUsageCache())
     }()
     private let settings = TokenBarSettings.shared
     private let confettiOverlayController = ScreenConfettiOverlayController()

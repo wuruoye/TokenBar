@@ -28,6 +28,7 @@ public final class DashboardModel {
     public static let automaticQuotaRefreshMinimumAge: TimeInterval = 60
 
     public private(set) var quotas: [TokenPlatform: DashboardSourceState<QuotaSnapshot>]
+    public private(set) var weeklyQuotaUsageHistories: [TokenPlatform: WeeklyQuotaUsageHistory] = [:]
     public private(set) var activity = DashboardSourceState<ActivitySnapshot>()
     public var scope: DashboardScope = .codex
 
@@ -53,6 +54,7 @@ public final class DashboardModel {
     @ObservationIgnored private let activityService: any ActivityProviding
     @ObservationIgnored private let cache: (any ActivitySnapshotCaching)?
     @ObservationIgnored private let quotaCache: (any QuotaSnapshotCaching)?
+    @ObservationIgnored private let weeklyQuotaUsageCache: (any WeeklyQuotaUsageCaching)?
     @ObservationIgnored private var quotaRefreshInterval: Duration
     @ObservationIgnored private var activityRefreshInterval: Duration
     @ObservationIgnored private var statisticsTimeZone: TokenBarStatisticsTimeZone
@@ -73,6 +75,7 @@ public final class DashboardModel {
         activityService: any ActivityProviding = ActivityService(),
         cache: (any ActivitySnapshotCaching)? = SnapshotCache(),
         quotaCache: (any QuotaSnapshotCaching)? = nil,
+        weeklyQuotaUsageCache: (any WeeklyQuotaUsageCaching)? = nil,
         quotaRefreshInterval: Duration = DashboardModel.defaultQuotaRefreshInterval,
         activityRefreshInterval: Duration = DashboardModel.defaultActivityRefreshInterval,
         statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone)
@@ -89,6 +92,7 @@ public final class DashboardModel {
         self.activityService = activityService
         self.cache = cache
         self.quotaCache = quotaCache
+        self.weeklyQuotaUsageCache = weeklyQuotaUsageCache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
         self.statisticsTimeZone = statisticsTimeZone
@@ -104,6 +108,7 @@ public final class DashboardModel {
         activityService: any ActivityProviding,
         cache: (any ActivitySnapshotCaching)?,
         quotaCache: (any QuotaSnapshotCaching)? = nil,
+        weeklyQuotaUsageCache: (any WeeklyQuotaUsageCaching)? = nil,
         quotaRefreshInterval: Duration,
         activityRefreshInterval: Duration,
         statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone,
@@ -122,6 +127,7 @@ public final class DashboardModel {
         self.activityService = activityService
         self.cache = cache
         self.quotaCache = quotaCache
+        self.weeklyQuotaUsageCache = weeklyQuotaUsageCache
         self.quotaRefreshInterval = quotaRefreshInterval
         self.activityRefreshInterval = activityRefreshInterval
         self.statisticsTimeZone = statisticsTimeZone
@@ -138,16 +144,28 @@ public final class DashboardModel {
         {
             self.activity = DashboardSourceState(value: cached)
         }
+        if let cachedUsage = try? await self.weeklyQuotaUsageCache?.loadWeeklyQuotaUsage() {
+            self.weeklyQuotaUsageHistories = cachedUsage.filter {
+                self.quotaServices[$0.key] != nil
+            }
+        }
+        var seededWeeklyQuotaUsage = false
         if let cachedQuotas = try? await self.quotaCache?.loadQuotas() {
             for (platform, snapshot) in cachedQuotas
                 where self.quotaServices[platform] != nil
                     && self.quotaState(for: platform).value == nil
             {
+                seededWeeklyQuotaUsage = self.recordWeeklyQuotaUsage(snapshot, for: platform)
+                    || seededWeeklyQuotaUsage
                 self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
                 if self.quotaRefreshEnabledPlatforms.contains(platform) {
                     _ = self.quotaResetDetector.observe(snapshot, for: platform)
                 }
             }
+        }
+        if seededWeeklyQuotaUsage {
+            try? await self.weeklyQuotaUsageCache?.saveWeeklyQuotaUsage(
+                self.weeklyQuotaUsageHistories)
         }
 
         self.startRefreshTimers()
@@ -284,6 +302,8 @@ public final class DashboardModel {
         }
         if savedSnapshot {
             try? await self.quotaCache?.saveQuotas(self.quotaSnapshots())
+            try? await self.weeklyQuotaUsageCache?.saveWeeklyQuotaUsage(
+                self.weeklyQuotaUsageHistories)
         }
     }
 
@@ -310,6 +330,8 @@ public final class DashboardModel {
                 mergingFrom: current.value,
                 for: platform)
             try? await self.quotaCache?.saveQuotas(self.quotaSnapshots())
+            try? await self.weeklyQuotaUsageCache?.saveWeeklyQuotaUsage(
+                self.weeklyQuotaUsageHistories)
         } catch is CancellationError {
             self.setQuotaState(
                 DashboardSourceState(
@@ -327,6 +349,25 @@ public final class DashboardModel {
 
     public func quotaState(for platform: TokenPlatform) -> DashboardSourceState<QuotaSnapshot> {
         self.quotas[platform] ?? DashboardSourceState()
+    }
+
+    public func weeklyQuotaUsage(for platform: TokenPlatform) -> WeeklyQuotaUsageHistory? {
+        self.weeklyQuotaUsageHistories[platform]
+    }
+
+    public func weeklyQuotaUsageToday(for platform: TokenPlatform) -> WeeklyQuotaDailyUsage? {
+        self.weeklyQuotaUsageHistories[platform]?.usage(
+            at: self.now(),
+            statisticsTimeZone: self.statisticsTimeZone)
+    }
+
+    public func weeklyQuotaUsage(
+        for platform: TokenPlatform,
+        on date: String) -> WeeklyQuotaDailyUsage?
+    {
+        self.weeklyQuotaUsageHistories[platform]?.usage(
+            on: date,
+            statisticsTimeZone: self.statisticsTimeZone)
     }
 
     private func setQuotaState(
@@ -353,11 +394,27 @@ public final class DashboardModel {
             in: snapshot,
             from: previous,
             now: self.now())
+        _ = self.recordWeeklyQuotaUsage(snapshot, for: platform)
         self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
         let events = self.quotaResetDetector.observe(snapshot, for: platform)
         for event in events {
             self.quotaResetHandler?(event)
         }
+    }
+
+    @discardableResult
+    private func recordWeeklyQuotaUsage(
+        _ snapshot: QuotaSnapshot,
+        for platform: TokenPlatform) -> Bool
+    {
+        let previous = self.weeklyQuotaUsageHistories[platform]
+        let history = previous?.recording(snapshot)
+            ?? WeeklyQuotaUsageHistory.starting(with: snapshot)
+        guard let history, history != previous else { return false }
+        var histories = self.weeklyQuotaUsageHistories
+        histories[platform] = history
+        self.weeklyQuotaUsageHistories = histories
+        return true
     }
 
     private func shouldAutomaticallyRefreshQuota(for platform: TokenPlatform) -> Bool {

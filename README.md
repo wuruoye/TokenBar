@@ -33,6 +33,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
 - Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
 - Compare weekly usage with a linear seven-day pace calculated from the last weekly reset, or switch to a five-workday pace that pauses on weekends.
+- Record each day's observed weekly-quota increase alongside Today and the selected Activity date, using the same UTC or local statistics timezone as token totals.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - On the **Codex** tab only, track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output.
@@ -172,6 +173,7 @@ TokenBar is designed to keep session content local:
 - Full prompt and output text is read lazily when a request detail menu opens and is retained in memory only for the current process.
 - The persistent activity cache omits titles, prompt/output previews, and source paths, including those nested under physical requests. It is stored at `~/Library/Application Support/TokenBar/activity-snapshot.json` with owner-only permissions.
 - The last successful provider quota snapshots are stored at `~/Library/Application Support/TokenBar/quota-snapshots.json`, also with owner-only permissions, so a temporary provider rate limit does not blank the menu.
+- Per-day weekly-quota changes are stored at `~/Library/Application Support/TokenBar/weekly-quota-usage.json` with owner-only permissions. Timestamped increases are retained for the 30-day Activity range and regroup when the statistics timezone changes. The first sample in each weekly cycle is a baseline, so usage from before that sample is not attributed to its day.
 - The optional Codex Memory receiver stores token counts, timestamps, metric names, deduplication fingerprints, and a small allowlist of process identity fields. It discards the full request body and never stores prompts, traces, logs, arbitrary metric attributes, or unrelated metrics.
 - TokenBar does not send its own telemetry or analytics. The Codex Memory integration receives the two selected metrics over loopback only.
 

@@ -46,7 +46,7 @@ struct DashboardOverviewView: View {
     static let compactHeaderHeight: CGFloat = 34
     private static let unavailableQuotaHeight: CGFloat = 56
     private static let weeklyQuotaHeight: CGFloat = 79
-    private static let fiveHourQuotaIncrement: CGFloat = 46
+    private static let fiveHourQuotaIncrement: CGFloat = 54
     private static let resetCreditsIncrement: CGFloat = 27
     static let todayHeight: CGFloat = 122
     static let weeklyResetActivityHeight: CGFloat = 64
@@ -176,7 +176,8 @@ struct DashboardOverviewContentView: View {
     let accentColor: Color
 
     var body: some View {
-        let quotaState = self.model.quotaState(for: self.model.scope.platform)
+        let platform = self.model.scope.platform
+        let quotaState = self.model.quotaState(for: platform)
         VStack(spacing: 0) {
             Divider().padding(.horizontal, 12)
             QuotaSummarySection(
@@ -189,6 +190,7 @@ struct DashboardOverviewContentView: View {
             Divider().padding(.horizontal, 12)
             TodaySummarySection(
                 state: self.model.visibleActivity,
+                weeklyQuotaUsage: self.model.weeklyQuotaUsageToday(for: platform),
                 accentColor: self.accentColor)
                 .frame(height: DashboardOverviewView.todayHeight)
             Divider().padding(.horizontal, 12)
@@ -638,6 +640,7 @@ private struct WeeklyResetActivitySection: View {
 
 private struct TodaySummarySection: View {
     let state: DashboardSourceState<ActivitySnapshot>
+    let weeklyQuotaUsage: WeeklyQuotaDailyUsage?
     let accentColor: Color
 
     var body: some View {
@@ -646,6 +649,12 @@ private struct TodaySummarySection: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
+                    if let weeklyQuotaUsage {
+                        Text("· Weekly quota \(weeklyQuotaUsage.menuValueText)")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .help(weeklyQuotaUsage.menuHelpText)
+                    }
                     Spacer()
                     Text(totals.tokens.total.compactCount)
                         .font(.system(size: 20, weight: .semibold, design: .rounded))
@@ -666,6 +675,12 @@ private struct TodaySummarySection: View {
                 HStack {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
+                    if let weeklyQuotaUsage {
+                        Text("· Weekly quota \(weeklyQuotaUsage.menuValueText)")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .help(weeklyQuotaUsage.menuHelpText)
+                    }
                     Spacer()
                     InlinePlaceholder(text: self.state.isRefreshing ? "Scanning activity…" : "No activity today")
                 }
@@ -1011,6 +1026,20 @@ extension String {
 
     var shortDateLabel: String {
         self.count >= 10 ? String(self.suffix(5)).replacingOccurrences(of: "-", with: "/") : self
+    }
+}
+
+extension WeeklyQuotaDailyUsage {
+    var menuValueText: String {
+        self.usedPercentagePoints.formatted(
+            .number.precision(.fractionLength(0 ... 1))) + "pp"
+    }
+
+    var menuHelpText: String {
+        let base = "Observed weekly-quota change between TokenBar samples on \(self.date)."
+        guard self.isPartial else { return base }
+        return base + " Tracking for a quota cycle began after some quota was already used, "
+            + "so the day's earlier usage is not included."
     }
 }
 

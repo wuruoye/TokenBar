@@ -170,7 +170,10 @@ struct ActivityDetailView: View {
     }
 
     private func dayDetail(_ day: DailySummary) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        let weeklyQuotaUsage = self.model.weeklyQuotaUsage(
+            for: self.model.scope.platform,
+            on: day.date)
+        return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(day.date)
@@ -182,12 +185,22 @@ struct ActivityDetailView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(day.tokens.total.compactCount)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                Text(day.costUsd.costText(tokenTotal: day.tokens.total))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(day.tokens.total.compactCount)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                        Text(day.costUsd.costText(tokenTotal: day.tokens.total))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                    }
+                    if let weeklyQuotaUsage {
+                        Text("Weekly quota \(weeklyQuotaUsage.menuValueText)")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .help(weeklyQuotaUsage.menuHelpText)
+                    }
+                }
             }
 
             Text("Models")
