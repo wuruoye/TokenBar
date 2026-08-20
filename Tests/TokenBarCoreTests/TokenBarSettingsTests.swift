@@ -17,7 +17,9 @@ struct TokenBarSettingsTests {
             #expect(settings.statisticsTimeZone == .utc)
             #expect(settings.showsClaude)
             #expect(settings.showsGrok)
+            #expect(!settings.usesWeekdayWeeklyPacing)
             #expect(settings.showsFullRequestContentOnHover)
+            #expect(settings.monitorsCodexMemory)
             #expect(settings.resetCelebration == .off)
             #expect(!settings.syncEnabled)
             #expect(settings.syncServerURL.isEmpty)
@@ -36,7 +38,9 @@ struct TokenBarSettingsTests {
             settings?.statisticsTimeZone = .local
             settings?.showsClaude = false
             settings?.showsGrok = false
+            settings?.usesWeekdayWeeklyPacing = true
             settings?.showsFullRequestContentOnHover = false
+            settings?.monitorsCodexMemory = false
             settings?.resetCelebration = .both
             settings?.syncEnabled = true
             settings?.syncServerURL = "https://sync.example.com"
@@ -51,7 +55,9 @@ struct TokenBarSettingsTests {
             #expect(restored.statisticsTimeZone == .local)
             #expect(!restored.showsClaude)
             #expect(!restored.showsGrok)
+            #expect(restored.usesWeekdayWeeklyPacing)
             #expect(!restored.showsFullRequestContentOnHover)
+            #expect(!restored.monitorsCodexMemory)
             #expect(restored.resetCelebration == .both)
             #expect(restored.syncEnabled)
             #expect(restored.syncServerURL == "https://sync.example.com")
@@ -88,7 +94,9 @@ struct TokenBarSettingsTests {
             settings.statisticsTimeZone = .local
             settings.showsClaude = false
             settings.showsGrok = false
+            settings.usesWeekdayWeeklyPacing = true
             settings.showsFullRequestContentOnHover = false
+            settings.monitorsCodexMemory = false
             settings.resetCelebration = .session
             settings.syncEnabled = true
             settings.syncServerURL = "https://sync.example.com"
@@ -103,7 +111,9 @@ struct TokenBarSettingsTests {
             #expect(restored.statisticsTimeZone == .utc)
             #expect(restored.showsClaude)
             #expect(restored.showsGrok)
+            #expect(!restored.usesWeekdayWeeklyPacing)
             #expect(restored.showsFullRequestContentOnHover)
+            #expect(restored.monitorsCodexMemory)
             #expect(restored.resetCelebration == .off)
             #expect(!restored.syncEnabled)
             #expect(restored.syncServerURL.isEmpty)

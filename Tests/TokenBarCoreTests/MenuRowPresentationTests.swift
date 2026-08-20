@@ -145,6 +145,13 @@ struct MenuRowPresentationTests {
             requestCount: 2,
             sessionCount: 1,
             averageGenerationTokensPerSecond: 62.5)
+        let day = DailySummary(
+            date: "2026-08-17",
+            tokens: session.tokens,
+            costUsd: 0,
+            requestCount: 2,
+            sessionCount: 1,
+            averageGenerationTokensPerSecond: 62.5)
 
         #expect(fast.averageGenerationTokensPerSecond == 100)
         #expect(turn.averageGenerationTokensPerSecond == 62.5)
@@ -153,6 +160,7 @@ struct MenuRowPresentationTests {
         #expect(session.averageGenerationTokensPerSecond == 62.5)
         #expect(activity.menuAverageTPSText == "Avg 62.5 tok/s")
         #expect(rangeTotals.menuAverageTPSText == "Avg 62.5 tok/s")
+        #expect(day.menuAverageTPSText == "Avg 62.5 tok/s")
         #expect(missingDuration.averageGenerationTokensPerSecond == nil)
     }
 

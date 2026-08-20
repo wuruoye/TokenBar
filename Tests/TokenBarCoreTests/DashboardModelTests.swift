@@ -110,6 +110,24 @@ private actor MemoryQuotaCache: QuotaSnapshotCaching {
     }
 }
 
+private actor MemoryWeeklyQuotaUsageCache: WeeklyQuotaUsageCaching {
+    var histories: [TokenPlatform: WeeklyQuotaUsageHistory]
+
+    init(histories: [TokenPlatform: WeeklyQuotaUsageHistory] = [:]) {
+        self.histories = histories
+    }
+
+    func loadWeeklyQuotaUsage() async throws -> [TokenPlatform: WeeklyQuotaUsageHistory] {
+        self.histories
+    }
+
+    func saveWeeklyQuotaUsage(
+        _ histories: [TokenPlatform: WeeklyQuotaUsageHistory]) async throws
+    {
+        self.histories = histories
+    }
+}
+
 private struct StaticPlatformQuotaProvider: QuotaProviding {
     let platform: TokenPlatform
     let snapshot: QuotaSnapshot
@@ -262,6 +280,46 @@ struct DashboardModelTests {
         #expect(model.activity.errorMessage != nil)
         #expect(!model.quota.isRefreshing)
         #expect(!model.activity.isRefreshing)
+    }
+
+    @Test("quota refresh records and persists daily weekly usage")
+    @MainActor
+    func recordsDailyWeeklyUsage() async {
+        let windowStart = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = windowStart.addingTimeInterval(7 * 86_400)
+        let latestSampleAt = windowStart.addingTimeInterval(2 * 86_400 + 300)
+        func quota(usedPercent: Double, offset: TimeInterval) -> QuotaSnapshot {
+            QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: usedPercent,
+                    windowMinutes: 10_080,
+                    resetsAt: reset),
+                resetCredits: nil,
+                updatedAt: windowStart.addingTimeInterval(offset))
+        }
+        let usageCache = MemoryWeeklyQuotaUsageCache()
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([
+                .success(quota(usedPercent: 32, offset: 2 * 86_400)),
+                .success(quota(usedPercent: 39, offset: 2 * 86_400 + 300)),
+            ]),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            weeklyQuotaUsageCache: usageCache,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { latestSampleAt })
+
+        await model.refreshQuota()
+        await model.refreshQuota()
+
+        #expect(model.weeklyQuotaUsage(for: .codex)?.usage(
+            at: latestSampleAt,
+            statisticsTimeZone: .utc)?.usedPercentagePoints == 7)
+        #expect(model.weeklyQuotaUsageToday(for: .codex)?.usedPercentagePoints == 7)
+        #expect(await usageCache.histories[.codex] == model.weeklyQuotaUsage(for: .codex))
     }
 
     @Test("missing reset metadata does not inherit an expired reset date")

@@ -102,7 +102,9 @@ public final class TokenBarSettings {
     public static let defaultStatisticsTimeZone = TokenBarStatisticsTimeZone.utc
     public static let defaultShowsClaude = true
     public static let defaultShowsGrok = true
+    public static let defaultUsesWeekdayWeeklyPacing = false
     public static let defaultShowsFullRequestContentOnHover = true
+    public static let defaultMonitorsCodexMemory = true
     public static let defaultResetCelebration = TokenBarResetCelebration.off
     public static let defaultSyncEnabled = false
     public static let defaultSyncServerURL = ""
@@ -147,11 +149,27 @@ public final class TokenBarSettings {
         }
     }
 
+    public var usesWeekdayWeeklyPacing: Bool {
+        didSet {
+            self.defaults.set(
+                self.usesWeekdayWeeklyPacing,
+                forKey: self.keys.usesWeekdayWeeklyPacing)
+        }
+    }
+
     public var showsFullRequestContentOnHover: Bool {
         didSet {
             self.defaults.set(
                 self.showsFullRequestContentOnHover,
                 forKey: self.keys.showsFullRequestContentOnHover)
+        }
+    }
+
+    public var monitorsCodexMemory: Bool {
+        didSet {
+            self.defaults.set(
+                self.monitorsCodexMemory,
+                forKey: self.keys.monitorsCodexMemory)
         }
     }
 
@@ -203,9 +221,15 @@ public final class TokenBarSettings {
         self.showsGrok = defaults.object(
             forKey: self.keys.showsGrok) as? Bool
             ?? Self.defaultShowsGrok
+        self.usesWeekdayWeeklyPacing = defaults.object(
+            forKey: self.keys.usesWeekdayWeeklyPacing) as? Bool
+            ?? Self.defaultUsesWeekdayWeeklyPacing
         self.showsFullRequestContentOnHover = defaults.object(
             forKey: self.keys.showsFullRequestContentOnHover) as? Bool
             ?? Self.defaultShowsFullRequestContentOnHover
+        self.monitorsCodexMemory = defaults.object(
+            forKey: self.keys.monitorsCodexMemory) as? Bool
+            ?? Self.defaultMonitorsCodexMemory
         self.resetCelebration = defaults.string(forKey: self.keys.resetCelebration)
             .flatMap(TokenBarResetCelebration.init(rawValue:)) ?? Self.defaultResetCelebration
         self.syncEnabled = defaults.object(forKey: self.keys.syncEnabled) as? Bool
@@ -227,7 +251,9 @@ public final class TokenBarSettings {
         self.statisticsTimeZone = Self.defaultStatisticsTimeZone
         self.showsClaude = Self.defaultShowsClaude
         self.showsGrok = Self.defaultShowsGrok
+        self.usesWeekdayWeeklyPacing = Self.defaultUsesWeekdayWeeklyPacing
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
+        self.monitorsCodexMemory = Self.defaultMonitorsCodexMemory
         self.resetCelebration = Self.defaultResetCelebration
         self.syncEnabled = Self.defaultSyncEnabled
         self.syncServerURL = Self.defaultSyncServerURL
@@ -241,7 +267,9 @@ public final class TokenBarSettings {
         let statisticsTimeZone: String
         let showsClaude: String
         let showsGrok: String
+        let usesWeekdayWeeklyPacing: String
         let showsFullRequestContentOnHover: String
+        let monitorsCodexMemory: String
         let resetCelebration: String
         let syncEnabled: String
         let syncServerURL: String
@@ -255,7 +283,9 @@ public final class TokenBarSettings {
             self.statisticsTimeZone = "\(prefix).statisticsTimeZone"
             self.showsClaude = "\(prefix).showsClaude"
             self.showsGrok = "\(prefix).showsGrok"
+            self.usesWeekdayWeeklyPacing = "\(prefix).usesWeekdayWeeklyPacing"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
+            self.monitorsCodexMemory = "\(prefix).monitorsCodexMemory"
             self.resetCelebration = "\(prefix).resetCelebration"
             self.syncEnabled = "\(prefix).syncEnabled"
             self.syncServerURL = "\(prefix).syncServerURL"

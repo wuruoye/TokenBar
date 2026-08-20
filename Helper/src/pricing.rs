@@ -9,6 +9,9 @@ use crate::usage::{
 };
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+const LONG_CONTEXT_INPUT_THRESHOLD: i64 = 272_000;
+const LONG_CONTEXT_INPUT_MULTIPLIER: f64 = 2.0;
+const LONG_CONTEXT_OUTPUT_MULTIPLIER: f64 = 1.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ModelRate {
@@ -16,6 +19,7 @@ struct ModelRate {
     cached_input_per_million: f64,
     output_per_million: f64,
     cache_write_per_million: Option<f64>,
+    long_context_pricing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,7 +34,7 @@ struct AnthropicModelRate {
 /// TokenBar's bundled Codex pricing catalog.
 ///
 /// Rates are standard API text-token prices in USD per million tokens, last
-/// reviewed 2026-07-14 against the official OpenAI model pages. TokenBar never
+/// reviewed 2026-08-17 against the official OpenAI model pages. TokenBar never
 /// reads Tokscale, LiteLLM, OpenRouter, or user-level pricing caches. A model
 /// without an explicit bundled rate returns `None`; callers must keep
 /// that request's cost source unknown instead of presenting a fabricated $0.
@@ -40,11 +44,9 @@ struct AnthropicModelRate {
 /// GPT-5.3-Codex's public rate. Recognized OpenAI model ids keep their estimate
 /// even when a local Codex gateway records a custom provider name.
 ///
-/// GPT-5.4, GPT-5.5, and GPT-5.6 documentation applies 2x input and 1.5x
-/// output pricing to prompts over 272K input tokens. TokenBar intentionally
-/// does not apply that multiplier yet so existing TokenBar/Tokscale history
-/// does not silently change. A future billing-estimate mode should expose the
-/// different semantic explicitly before enabling it.
+/// GPT-5.4, GPT-5.5, and GPT-5.6 apply long-context pricing to each request
+/// whose raw input exceeds 272K tokens: 2x for uncached input, cached input,
+/// and cache writes, plus 1.5x for output and reasoning output.
 ///
 /// Sources:
 /// - https://openai.com/index/introducing-gpt-5-3-codex-spark/
@@ -106,15 +108,38 @@ impl CodexPricing {
             return None;
         }
 
+        let raw_input_tokens = usage
+            .input
+            .max(0)
+            .saturating_add(usage.cache_read.max(0))
+            .saturating_add(usage.cache_write.max(0));
+        let long_context = rate.long_context_pricing
+            && raw_input_tokens > LONG_CONTEXT_INPUT_THRESHOLD;
+        let input_multiplier = if long_context {
+            LONG_CONTEXT_INPUT_MULTIPLIER
+        } else {
+            1.0
+        };
+        let output_multiplier = if long_context {
+            LONG_CONTEXT_OUTPUT_MULTIPLIER
+        } else {
+            1.0
+        };
+
         let costs = TokenCostBreakdown {
-            input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
-            output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            input: usage.input.max(0) as f64 * rate.input_per_million * input_multiplier
+                / TOKENS_PER_MILLION,
+            output: usage.output.max(0) as f64 * rate.output_per_million * output_multiplier
+                / TOKENS_PER_MILLION,
             cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
+                * input_multiplier
                 / TOKENS_PER_MILLION,
             cache_write: usage.cache_write.max(0) as f64
                 * rate.cache_write_per_million.unwrap_or_default()
+                * input_multiplier
                 / TOKENS_PER_MILLION,
             reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                * output_multiplier
                 / TOKENS_PER_MILLION,
         };
         costs.total().is_finite().then_some(costs)
@@ -518,6 +543,7 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
             cached_input_per_million: 0.375,
             output_per_million: 6.0,
             cache_write_per_million: None,
+            long_context_pricing: false,
         }),
         "gpt-5" | "gpt-5-codex" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.1-codex-max" => {
             Some(ModelRate {
@@ -525,6 +551,7 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
                 cached_input_per_million: 0.125,
                 output_per_million: 10.0,
                 cache_write_per_million: None,
+                long_context_pricing: false,
             })
         }
         "gpt-5-mini" | "gpt-5.1-codex-mini" => Some(ModelRate {
@@ -532,48 +559,56 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
             cached_input_per_million: 0.025,
             output_per_million: 2.0,
             cache_write_per_million: None,
+            long_context_pricing: false,
         }),
         "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" | "gpt-5.3-codex-spark" => Some(ModelRate {
             input_per_million: 1.75,
             cached_input_per_million: 0.175,
             output_per_million: 14.0,
             cache_write_per_million: None,
+            long_context_pricing: false,
         }),
         "gpt-5.4" => Some(ModelRate {
             input_per_million: 2.5,
             cached_input_per_million: 0.25,
             output_per_million: 15.0,
             cache_write_per_million: None,
+            long_context_pricing: true,
         }),
         "gpt-5.4-mini" => Some(ModelRate {
             input_per_million: 0.75,
             cached_input_per_million: 0.075,
             output_per_million: 4.5,
             cache_write_per_million: None,
+            long_context_pricing: false,
         }),
         "gpt-5.5" => Some(ModelRate {
             input_per_million: 5.0,
             cached_input_per_million: 0.5,
             output_per_million: 30.0,
             cache_write_per_million: None,
+            long_context_pricing: true,
         }),
         "gpt-5.6" | "gpt-5.6-sol" => Some(ModelRate {
             input_per_million: 5.0,
             cached_input_per_million: 0.5,
             output_per_million: 30.0,
             cache_write_per_million: Some(6.25),
+            long_context_pricing: true,
         }),
         "gpt-5.6-terra" => Some(ModelRate {
-            input_per_million: 2.5,
-            cached_input_per_million: 0.25,
-            output_per_million: 15.0,
-            cache_write_per_million: Some(3.125),
+            input_per_million: 2.0,
+            cached_input_per_million: 0.2,
+            output_per_million: 12.0,
+            cache_write_per_million: Some(2.5),
+            long_context_pricing: true,
         }),
         "gpt-5.6-luna" => Some(ModelRate {
-            input_per_million: 1.0,
-            cached_input_per_million: 0.1,
-            output_per_million: 6.0,
-            cache_write_per_million: Some(1.25),
+            input_per_million: 0.2,
+            cached_input_per_million: 0.02,
+            output_per_million: 1.2,
+            cache_write_per_million: Some(0.25),
+            long_context_pricing: true,
         }),
         _ => None,
     }
@@ -681,40 +716,75 @@ mod tests {
     }
 
     #[test]
-    fn prices_gpt_5_6_cache_writes_at_the_verified_input_premium() {
+    fn uses_current_gpt_5_6_short_context_rates() {
         let usage = TokenBreakdown {
-            input: 1_000_000,
-            output: 1_000_000,
-            cache_read: 1_000_000,
-            cache_write: 1_000_000,
+            input: 100_000,
+            output: 100_000,
+            cache_read: 100_000,
+            cache_write: 50_000,
             ..Default::default()
         };
         let pricing = CodexPricing::bundled();
 
-        let costs = pricing
-            .calculate_token_costs_with_provider("gpt-5.6-sol", Some("openai"), &usage)
-            .unwrap();
+        for (model, input, cache_read, cache_write, output) in [
+            ("gpt-5.6-sol", 0.5, 0.05, 0.3125, 3.0),
+            ("gpt-5.6-terra", 0.2, 0.02, 0.125, 1.2),
+            ("gpt-5.6-luna", 0.02, 0.002, 0.0125, 0.12),
+        ] {
+            let costs = pricing
+                .calculate_token_costs_with_provider(model, Some("openai"), &usage)
+                .unwrap();
 
-        assert!((costs.input - 5.0).abs() < 1e-9);
-        assert!((costs.cache_read - 0.5).abs() < 1e-9);
-        assert!((costs.cache_write - 6.25).abs() < 1e-9);
-        assert!((costs.output - 30.0).abs() < 1e-9);
+            assert!((costs.input - input).abs() < 1e-9, "{model}");
+            assert!((costs.cache_read - cache_read).abs() < 1e-9, "{model}");
+            assert!((costs.cache_write - cache_write).abs() < 1e-9, "{model}");
+            assert!((costs.output - output).abs() < 1e-9, "{model}");
+        }
         assert!(pricing
             .calculate_token_costs_with_provider("gpt-5.5", Some("openai"), &usage)
             .is_none());
     }
 
     #[test]
-    fn preserves_compatibility_pricing_for_long_context_usage() {
-        let usage = TokenBreakdown {
-            input: 300_000,
+    fn applies_long_context_rates_only_above_272k_raw_input_tokens() {
+        let at_threshold = TokenBreakdown {
+            input: 100_000,
+            cache_read: 100_000,
+            cache_write: 72_000,
             output: 100_000,
+            reasoning: 100_000,
             ..Default::default()
         };
-        let cost = CodexPricing::bundled()
-            .calculate_cost_with_provider("gpt-5.5", Some("openai"), &usage)
+        let pricing = CodexPricing::bundled();
+        let short = pricing
+            .calculate_token_costs_with_provider(
+                "gpt-5.6-terra",
+                Some("openai"),
+                &at_threshold,
+            )
             .unwrap();
-        assert!((cost - 4.5).abs() < 1e-9);
+        assert!((short.input - 0.2).abs() < 1e-9);
+        assert!((short.cache_read - 0.02).abs() < 1e-9);
+        assert!((short.cache_write - 0.18).abs() < 1e-9);
+        assert!((short.output - 1.2).abs() < 1e-9);
+        assert!((short.reasoning - 1.2).abs() < 1e-9);
+
+        let above_threshold = TokenBreakdown {
+            cache_write: 72_001,
+            ..at_threshold
+        };
+        let long = pricing
+            .calculate_token_costs_with_provider(
+                "gpt-5.6-terra",
+                Some("openai"),
+                &above_threshold,
+            )
+            .unwrap();
+        assert!((long.input - 0.4).abs() < 1e-9);
+        assert!((long.cache_read - 0.04).abs() < 1e-9);
+        assert!((long.cache_write - 0.360005).abs() < 1e-9);
+        assert!((long.output - 1.8).abs() < 1e-9);
+        assert!((long.reasoning - 1.8).abs() < 1e-9);
     }
 
     #[test]
@@ -871,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_4_keeps_the_compatibility_rate_above_272k() {
+    fn gpt_5_4_uses_long_context_rates_above_272k() {
         let usage = TokenBreakdown {
             input: 300_000,
             output: 100_000,
@@ -880,7 +950,7 @@ mod tests {
         let cost = CodexPricing::bundled()
             .calculate_cost_with_provider("gpt-5.4-2026-03-05", Some("openai"), &usage)
             .unwrap();
-        assert!((cost - 2.25).abs() < 1e-9);
+        assert!((cost - 3.75).abs() < 1e-9);
     }
 
     #[test]
@@ -900,7 +970,7 @@ mod tests {
         let custom_provider = pricing
             .calculate_cost_with_provider("gpt-5.5", Some("tencent"), &usage)
             .unwrap();
-        assert!((custom_provider - 35.5).abs() < 1e-9);
+        assert!((custom_provider - 56.0).abs() < 1e-9);
     }
 
     #[test]

@@ -702,11 +702,13 @@ struct ActivitySyncTests {
         let local = TestFixtures.activity(
             promptPreview: "local prompt",
             sessionTitle: "local title",
-            rangeTotals: TestFixtures.activity().today)
+            rangeTotals: TestFixtures.activity().today,
+            dailyAverageGenerationTokensPerSecond: 100)
         let remoteBase = TestFixtures.activity(
             promptPreview: "must be removed",
             sessionTitle: "must be removed",
-            rangeTotals: TestFixtures.activity().today)
+            rangeTotals: TestFixtures.activity().today,
+            dailyAverageGenerationTokensPerSecond: 50)
         let remote = ActivitySnapshot(
             schemaVersion: remoteBase.schemaVersion - 1,
             generatedAtMs: remoteBase.generatedAtMs,
@@ -737,6 +739,8 @@ struct ActivitySyncTests {
         #expect(merged.today.tokens.total == local.today.tokens.total * 2)
         #expect(merged.today.requestCount == 2)
         #expect(merged.rangeTotals?.tokens.total == local.today.tokens.total * 2)
+        let mergedDailyTPS = try #require(merged.days.first?.averageGenerationTokensPerSecond)
+        #expect(abs(mergedDailyTPS - 66.666_666_666_7) < 0.000_000_001)
         #expect(merged.sessions.count == 2)
         #expect(merged.sessions.contains { $0.title == "local title" })
         let remoteSession = try #require(merged.sessions.first {

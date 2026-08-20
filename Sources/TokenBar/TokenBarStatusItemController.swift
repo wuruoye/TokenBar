@@ -61,6 +61,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
     private var syncSettingsSignature: SyncSettingsSignature
+    private var monitorsCodexMemory: Bool
 
     init(
         model: DashboardModel,
@@ -81,6 +82,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.syncSettingsSignature = SyncSettingsSignature(
             settings,
             activitySync: activitySync)
+        self.monitorsCodexMemory = settings.monitorsCodexMemory
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
@@ -345,7 +347,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.statisticsTimeZone
             _ = self.settings.showsClaude
             _ = self.settings.showsGrok
+            _ = self.settings.usesWeekdayWeeklyPacing
             _ = self.settings.showsFullRequestContentOnHover
+            _ = self.settings.monitorsCodexMemory
             _ = self.settings.syncEnabled
             _ = self.settings.syncServerURL
             _ = self.settings.syncDeviceName
@@ -360,6 +364,17 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                     activitySync: self.activitySync)
                 if syncSettingsSignature != self.syncSettingsSignature {
                     self.syncSettingsSignature = syncSettingsSignature
+                    Task { @MainActor [weak self] in
+                        await self?.model.restartActivityRefresh()
+                    }
+                }
+                if self.monitorsCodexMemory != self.settings.monitorsCodexMemory {
+                    self.monitorsCodexMemory = self.settings.monitorsCodexMemory
+                    if self.monitorsCodexMemory {
+                        self.memoryTelemetry.start()
+                    } else {
+                        self.memoryTelemetry.stop()
+                    }
                     Task { @MainActor [weak self] in
                         await self?.model.restartActivityRefresh()
                     }
@@ -472,6 +487,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let overviewHeight = DashboardOverviewView.contentHeight(quota: quota)
         let overview = DashboardOverviewContentView(
             model: self.model,
+            usesWeekdayWeeklyPacing: self.settings.usesWeekdayWeeklyPacing,
             accentColor: accentColor)
             .frame(width: Self.menuWidth, alignment: .top)
         let overviewHost = FixedMenuHostingView(
@@ -504,28 +520,30 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         activityItem.submenu = self.makeActivityDetailMenu(accentColor: accentColor)
         self.rootMenu.addItem(activityItem)
 
-        let memoryHeight = MemorySummarySection.preferredHeight + 1
-        let memory = MenuMemorySummaryView(
-            model: self.model,
-            telemetry: self.memoryTelemetry,
-            accentColor: accentColor)
-            .allowsHitTesting(false)
-            .frame(width: Self.menuWidth, height: memoryHeight, alignment: .top)
-        let memoryHost = FixedMenuHostingView(
-            rootView: AnyView(memory),
-            width: Self.menuWidth,
-            height: memoryHeight)
-        let memoryItem = NSMenuItem(
-            title: "Codex Memory",
-            action: #selector(self.activityNoOp),
-            keyEquivalent: "")
-        memoryItem.target = self
-        memoryItem.isEnabled = true
-        memoryItem.view = memoryHost
-        memoryItem.submenu = self.makeMemoryDetailMenu(accentColor: accentColor)
-        memoryItem.isHidden = !self.model.scope.supportsCodexMemory
-        self.memoryItem = memoryItem
-        self.rootMenu.addItem(memoryItem)
+        if self.settings.monitorsCodexMemory {
+            let memoryHeight = MemorySummarySection.preferredHeight + 1
+            let memory = MenuMemorySummaryView(
+                model: self.model,
+                telemetry: self.memoryTelemetry,
+                accentColor: accentColor)
+                .allowsHitTesting(false)
+                .frame(width: Self.menuWidth, height: memoryHeight, alignment: .top)
+            let memoryHost = FixedMenuHostingView(
+                rootView: AnyView(memory),
+                width: Self.menuWidth,
+                height: memoryHeight)
+            let memoryItem = NSMenuItem(
+                title: "Codex Memory",
+                action: #selector(self.activityNoOp),
+                keyEquivalent: "")
+            memoryItem.target = self
+            memoryItem.isEnabled = true
+            memoryItem.view = memoryHost
+            memoryItem.submenu = self.makeMemoryDetailMenu(accentColor: accentColor)
+            memoryItem.isHidden = !self.model.scope.supportsCodexMemory
+            self.memoryItem = memoryItem
+            self.rootMenu.addItem(memoryItem)
+        }
         self.rootMenu.addItem(.separator())
 
         self.rootMenu.addItem(.sectionHeader(title: "Recent Sessions"))
@@ -681,7 +699,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func updateMemoryVisibility(scope: DashboardScope) {
-        let isHidden = !scope.supportsCodexMemory
+        let isHidden = !self.settings.monitorsCodexMemory || !scope.supportsCodexMemory
         if self.memoryItem?.isHidden != isHidden {
             self.memoryItem?.isHidden = isHidden
         }
@@ -695,19 +713,60 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         item.target = self
         item.isEnabled = true
         item.view = TokenMenuRowView(width: Self.menuWidth)
+        item.submenu = self.makeSessionSubmenu(title: "Session")
+        return item
+    }
 
-        let submenu = TokenBarMenu(title: "Session")
+    private func makeSessionSubmenu(title: String) -> TokenBarMenu {
+        let submenu = TokenBarMenu(title: title)
         submenu.autoenablesItems = false
         submenu.minimumWidth = Self.menuWidth
         submenu.delegate = self
         submenu.persistentActionDelegate = self
         submenu.addItem(NSMenuItem(title: "Loading turns…", action: nil, keyEquivalent: ""))
-        item.submenu = submenu
-        return item
+        return submenu
+    }
+
+    private func bindSessionSubmenu(_ item: NSMenuItem, to session: SessionSummary) {
+        let sessionID = session.platformScopedID
+        var submenu = item.submenu
+        if let current = submenu {
+            let menuID = ObjectIdentifier(current)
+            if let previousSessionID = self.submenuSessionIDs[menuID],
+               previousSessionID != sessionID
+            {
+                self.discardRequestDetailMenus(in: current)
+                self.submenuSessionIDs.removeValue(forKey: menuID)
+                self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
+                current.delegate = nil
+                (current as? TokenBarMenu)?.persistentActionDelegate = nil
+                item.submenu = nil
+                submenu = nil
+            }
+        }
+        if submenu == nil {
+            let replacement = self.makeSessionSubmenu(title: session.menuDisplayTitle)
+            item.submenu = replacement
+            submenu = replacement
+        }
+        guard let submenu else { return }
+        submenu.title = session.menuDisplayTitle
+        self.submenuSessionIDs[ObjectIdentifier(submenu)] = sessionID
+    }
+
+    private func unbindSessionSubmenu(_ item: NSMenuItem) {
+        guard let submenu = item.submenu else { return }
+        self.discardRequestDetailMenus(in: submenu)
+        let menuID = ObjectIdentifier(submenu)
+        self.submenuSessionIDs.removeValue(forKey: menuID)
+        self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
+        submenu.delegate = nil
+        (submenu as? TokenBarMenu)?.persistentActionDelegate = nil
+        item.submenu = nil
     }
 
     private func configureSessionItem(_ item: NSMenuItem, session: SessionSummary) {
-        let title = session.menuTitle
+        let title = session.menuDisplayTitle
         let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
         let isRemote = session.isSynchronizedRemote
@@ -755,17 +814,10 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             if sessionsChanged, index < visibleSessions.count {
                 let session = visibleSessions[index]
                 self.configureSessionItem(item, session: session)
-                if let submenu = item.submenu {
-                    if submenu.title != session.menuTitle {
-                        submenu.title = session.menuTitle
-                    }
-                    self.submenuSessionIDs[ObjectIdentifier(submenu)] = session.platformScopedID
-                }
+                self.bindSessionSubmenu(item, to: session)
             } else if sessionsChanged {
                 item.representedObject = nil
-                if let submenu = item.submenu {
-                    self.submenuSessionIDs.removeValue(forKey: ObjectIdentifier(submenu))
-                }
+                self.unbindSessionSubmenu(item)
             }
             let isHidden = index >= visibleSessions.count
                 || (!self.showsAllSessions && index >= projection.collapsedLimit)
@@ -798,6 +850,16 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
     }
 
+    #if DEBUG
+    func selectScopeForTesting(_ scope: DashboardScope) {
+        self.selectScope(scope)
+    }
+
+    func firstSessionSubmenuForTesting() -> NSMenu? {
+        self.sessionItems.first?.submenu
+    }
+    #endif
+
     private func rebuildRequestMenu(_ menu: NSMenu, sessionScopedID: String) {
         self.discardRequestDetailMenus(in: menu)
         menu.removeAllItems()
@@ -810,7 +872,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             return
         }
 
-        menu.title = session.menuTitle
+        menu.title = session.menuDisplayTitle
         menu.minimumWidth = Self.menuWidth
         menu.addItem(.sectionHeader(title: "Turns"))
         if session.isSynchronizedRemote {

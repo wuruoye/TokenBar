@@ -19,7 +19,7 @@ pub mod usage;
 
 pub use usage::StatisticsTimeZone;
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -198,6 +198,8 @@ pub struct DailySummary {
     pub date: String,
     pub tokens: TokenBreakdown,
     pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_generation_tokens_per_second: Option<f64>,
     pub request_count: usize,
     pub session_count: usize,
     #[serde(default)]
@@ -304,6 +306,8 @@ struct DailyAccumulator {
     tokens: TokenBreakdown,
     cost: f64,
     token_costs: OptionalTokenCostAccumulator,
+    generated_tokens: f64,
+    model_duration_ms: f64,
     turn_ids: HashSet<String>,
     session_ids: HashSet<(String, String)>,
     models: BTreeMap<(String, String, String), DailyModelAccumulator>,
@@ -786,6 +790,17 @@ fn build_snapshot_core(
             entry.tokens.add_assign(&request.tokens);
             entry.cost = add_cost(entry.cost, request.cost);
             entry.token_costs.add(request.token_costs.as_ref());
+            if let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) {
+                let generated_tokens = request
+                    .tokens
+                    .output
+                    .max(0)
+                    .saturating_add(request.tokens.reasoning.max(0));
+                if generated_tokens > 0 {
+                    entry.generated_tokens += generated_tokens as f64;
+                    entry.model_duration_ms += duration_ms as f64;
+                }
+            }
             entry.turn_ids.insert(turn.id.clone());
             entry
                 .session_ids
@@ -849,6 +864,10 @@ fn build_snapshot_core(
             date: date.format("%Y-%m-%d").to_string(),
             tokens: entry.map(|value| value.tokens.clone()).unwrap_or_default(),
             cost_usd: entry.map(|value| value.cost).unwrap_or(0.0),
+            average_generation_tokens_per_second: entry.and_then(|value| {
+                (value.generated_tokens > 0.0 && value.model_duration_ms > 0.0)
+                    .then_some(value.generated_tokens * 1_000.0 / value.model_duration_ms)
+            }),
             request_count: entry.map(|value| value.turn_ids.len()).unwrap_or(0),
             session_count: entry.map(|value| value.session_ids.len()).unwrap_or(0),
             models,
@@ -2464,6 +2483,14 @@ mod tests {
         assert_eq!(totals.average_generation_tokens_per_second, Some(62.5));
         assert!((totals.token_costs.unwrap().total() - 4.5).abs() < 1e-12);
         assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(50.0));
+        assert_eq!(
+            snapshot.days[0].average_generation_tokens_per_second,
+            Some(100.0)
+        );
+        assert_eq!(
+            snapshot.days[1].average_generation_tokens_per_second,
+            Some(50.0)
+        );
     }
 
     #[test]
@@ -2533,6 +2560,7 @@ mod tests {
         let day: DailySummary = serde_json::from_value(legacy).unwrap();
 
         assert!(day.models.is_empty());
+        assert_eq!(day.average_generation_tokens_per_second, None);
     }
 
     #[test]
@@ -2659,6 +2687,9 @@ mod tests {
         assert_eq!(value["rangeTotals"]["requestCount"], 0);
         assert_eq!(value["days"][0]["sessionCount"], 0);
         assert_eq!(value["days"][0]["models"], serde_json::json!([]));
+        assert!(value["days"][0]
+            .get("averageGenerationTokensPerSecond")
+            .is_none());
         assert!(value.get("schema_version").is_none());
     }
 

@@ -20,7 +20,13 @@ param(
 
     [string] $BinaryPath,
 
-    [string] $HelperBinaryPath
+    [string] $HelperBinaryPath,
+
+    [string] $BackgroundBinaryPath,
+
+    [string] $BackgroundHelperBinaryPath,
+
+    [string] $TaskRunnerBinaryPath
 )
 
 Set-StrictMode -Version Latest
@@ -33,9 +39,12 @@ $TaskDescription = 'TokenBar managed protocol-v1 activity snapshot upload.'
 $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserSid = $CurrentIdentity.User.Value
 $CurrentUserName = $CurrentIdentity.Name
-$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$LegacyPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $InvokeScript = Join-Path $InstallRoot 'Invoke-TokenBarSync.ps1'
-$TaskArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $InvokeScript
+$LegacyTaskArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $InvokeScript
+$LegacyHiddenTaskArguments = '-WindowStyle Hidden {0}' -f $LegacyTaskArguments
+$TaskExecutable = Join-Path $InstallRoot 'tokenbar-sync-task.exe'
+$TaskArguments = ''
 $MarkerPath = Join-Path $InstallRoot $MarkerName
 $TokenPath = Join-Path $InstallRoot 'token.protected'
 
@@ -63,33 +72,48 @@ function Read-OwnedMarker {
         throw "TokenBar Sync install marker is invalid: $Path"
     }
     $parsedInstallId = [Guid]::Empty
-    if ([int] $marker.schemaVersion -ne 1 -or
+    $schemaVersion = [int] $marker.schemaVersion
+    if (($schemaVersion -ne 1 -and $schemaVersion -ne 2) -or
         -not [Guid]::TryParse([string] $marker.installId, [ref] $parsedInstallId) -or
         [string] $marker.userSid -ne $CurrentUserSid -or
         [IO.Path]::GetFullPath([string] $marker.installRoot) -ne $InstallRoot -or
-        [string] $marker.taskName -ne $TaskName -or
-        [IO.Path]::GetFullPath([string] $marker.powerShellExe) -ne $PowerShellExe -or
-        [string] $marker.taskArguments -ne $TaskArguments) {
+        [string] $marker.taskName -ne $TaskName) {
         throw 'TokenBar Sync install marker does not belong to this user, path, and task.'
+    }
+    if ($schemaVersion -eq 1) {
+        if ([IO.Path]::GetFullPath([string] $marker.powerShellExe) -ne $LegacyPowerShellExe -or
+            [string] $marker.taskArguments -ne $LegacyTaskArguments) {
+            throw 'Legacy TokenBar Sync install marker is invalid.'
+        }
+    } elseif (
+        [IO.Path]::GetFullPath([string] $marker.taskExecutable) -ne $TaskExecutable -or
+        [string] $marker.taskArguments -ne $TaskArguments
+    ) {
+        throw 'TokenBar Sync native task marker is invalid.'
     }
     return $marker
 }
 
 function Assert-OwnedTask {
-    param($Task)
+    param($Task, $Marker)
 
     if ($Task.Actions.Count -ne 1 -or
-        [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
-            [string] $Task.Actions[0].Execute)) -ne $PowerShellExe -or
-        [string] $Task.Actions[0].Arguments -ne $TaskArguments -or
         -not (Test-CurrentUserPrincipal ([string] $Task.Principal.UserId)) -or
         [string] $Task.Description -ne $TaskDescription) {
         throw "Scheduled Task '$TaskName' exists but is not owned by this TokenBar Sync install."
     }
-}
-
-if (-not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
-    throw "Windows PowerShell 5.1 was not found at $PowerShellExe"
+    $execute = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
+        [string] $Task.Actions[0].Execute))
+    $arguments = [string] $Task.Actions[0].Arguments
+    if ([int] $Marker.schemaVersion -eq 1) {
+        if ($execute -ne $LegacyPowerShellExe -or
+            ($arguments -ne $LegacyTaskArguments -and
+             $arguments -ne $LegacyHiddenTaskArguments)) {
+            throw "Scheduled Task '$TaskName' does not match its legacy TokenBar Sync marker."
+        }
+    } elseif ($execute -ne $TaskExecutable -or $arguments -ne $TaskArguments) {
+        throw "Scheduled Task '$TaskName' does not match its native TokenBar Sync marker."
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
@@ -97,6 +121,15 @@ if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
 }
 if ([string]::IsNullOrWhiteSpace($HelperBinaryPath)) {
     $HelperBinaryPath = Join-Path $PSScriptRoot '..\target\release\tokenbar-helper.exe'
+}
+if ([string]::IsNullOrWhiteSpace($BackgroundBinaryPath)) {
+    $BackgroundBinaryPath = Join-Path $PSScriptRoot '..\target\release\tokenbar-sync-background.exe'
+}
+if ([string]::IsNullOrWhiteSpace($BackgroundHelperBinaryPath)) {
+    $BackgroundHelperBinaryPath = Join-Path $PSScriptRoot '..\target\release\tokenbar-helper-background.exe'
+}
+if ([string]::IsNullOrWhiteSpace($TaskRunnerBinaryPath)) {
+    $TaskRunnerBinaryPath = Join-Path $PSScriptRoot '..\target\release\tokenbar-sync-task.exe'
 }
 
 $endpointUri = $null
@@ -111,18 +144,6 @@ if ($endpointUri.Scheme -ne 'https' -or
     throw 'Endpoint must be an HTTPS origin without credentials, path, query, or fragment.'
 }
 
-$token = [Environment]::GetEnvironmentVariable('TOKENBAR_SYNC_TOKEN', 'Process')
-if ([string]::IsNullOrWhiteSpace($token)) {
-    throw 'Set TOKENBAR_SYNC_TOKEN in this PowerShell process before installation. It is used once and persisted with DPAPI CurrentUser protection.'
-}
-$token = $token.Trim()
-$invalidTokenCharacter = $token.ToCharArray() | Where-Object {
-    [int] $_ -lt 33 -or [int] $_ -gt 126
-} | Select-Object -First 1
-if ($token.Length -lt 32 -or $token.Length -gt 512 -or $null -ne $invalidTokenCharacter) {
-    throw 'TOKENBAR_SYNC_TOKEN must contain 32..512 non-whitespace ASCII characters.'
-}
-
 $sourceBinary = [IO.Path]::GetFullPath($BinaryPath)
 if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
     throw "Release binary not found: $sourceBinary. Run Build-TokenBarSync.ps1 first."
@@ -130,6 +151,16 @@ if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
 $sourceHelper = [IO.Path]::GetFullPath($HelperBinaryPath)
 if (-not (Test-Path -LiteralPath $sourceHelper -PathType Leaf)) {
     throw "Helper binary not found: $sourceHelper. Run Build-TokenBarSync.ps1 first."
+}
+$sourceTaskRunner = [IO.Path]::GetFullPath($TaskRunnerBinaryPath)
+if (-not (Test-Path -LiteralPath $sourceTaskRunner -PathType Leaf)) {
+    throw "Native task runner not found: $sourceTaskRunner. Run Build-TokenBarSync.ps1 first."
+}
+$sourceBackgroundBinary = [IO.Path]::GetFullPath($BackgroundBinaryPath)
+$sourceBackgroundHelper = [IO.Path]::GetFullPath($BackgroundHelperBinaryPath)
+if (-not (Test-Path -LiteralPath $sourceBackgroundBinary -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $sourceBackgroundHelper -PathType Leaf)) {
+    throw 'GUI-subsystem background binaries are missing. Run Build-TokenBarSync.ps1 first.'
 }
 $sourceLicense = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target\release\LICENSE.txt'))
 $sourceNotices = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target\release\ThirdPartyLicenses.html'))
@@ -163,7 +194,21 @@ if ($null -ne $existingTask) {
     if ($null -eq $marker) {
         throw "Scheduled Task '$TaskName' already exists without a matching TokenBar Sync marker."
     }
-    Assert-OwnedTask $existingTask
+    Assert-OwnedTask $existingTask $marker
+}
+
+$token = [Environment]::GetEnvironmentVariable('TOKENBAR_SYNC_TOKEN', 'Process')
+$replaceToken = -not [string]::IsNullOrWhiteSpace($token)
+if ($replaceToken) {
+    $token = $token.Trim()
+    $invalidTokenCharacter = $token.ToCharArray() | Where-Object {
+        [int] $_ -lt 33 -or [int] $_ -gt 126
+    } | Select-Object -First 1
+    if ($token.Length -lt 32 -or $token.Length -gt 512 -or $null -ne $invalidTokenCharacter) {
+        throw 'TOKENBAR_SYNC_TOKEN must contain 32..512 non-whitespace ASCII characters.'
+    }
+} elseif ($null -eq $marker -or -not (Test-Path -LiteralPath $TokenPath -PathType Leaf)) {
+    throw 'Set TOKENBAR_SYNC_TOKEN in this PowerShell process for a fresh install. Existing owned installs preserve their DPAPI token when it is omitted.'
 }
 
 if (-not $PSCmdlet.ShouldProcess($InstallRoot, "Install TokenBar Sync and register task $TaskName")) {
@@ -180,13 +225,19 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $installedBinary = Join-Path $InstallRoot 'tokenbar-sync.exe'
+$installedBackgroundBinary = Join-Path $InstallRoot 'tokenbar-sync-background.exe'
 $installedHelper = Join-Path $InstallRoot 'tokenbar-helper.exe'
+$installedBackgroundHelper = Join-Path $InstallRoot 'tokenbar-helper-background.exe'
+$installedTaskRunner = $TaskExecutable
 $installedStatus = Join-Path $InstallRoot 'Get-TokenBarSyncStatus.ps1'
 $installedUninstall = Join-Path $InstallRoot 'Uninstall-TokenBarSync.ps1'
 $configPath = Join-Path $InstallRoot 'config.json'
 
 Copy-Item -LiteralPath $sourceBinary -Destination $installedBinary -Force
+Copy-Item -LiteralPath $sourceBackgroundBinary -Destination $installedBackgroundBinary -Force
 Copy-Item -LiteralPath $sourceHelper -Destination $installedHelper -Force
+Copy-Item -LiteralPath $sourceBackgroundHelper -Destination $installedBackgroundHelper -Force
+Copy-Item -LiteralPath $sourceTaskRunner -Destination $installedTaskRunner -Force
 Copy-Item -LiteralPath $sourceLicense -Destination (Join-Path $InstallRoot 'LICENSE.txt') -Force
 Copy-Item -LiteralPath $sourceNotices -Destination (Join-Path $InstallRoot 'ThirdPartyLicenses.html') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Invoke-TokenBarSync.ps1') -Destination $InvokeScript -Force
@@ -198,42 +249,50 @@ $config = [ordered]@{
     deviceName = $DeviceName
     days = $Days
     codexHome = $resolvedCodexHome
-    helperPath = $installedHelper
+    helperPath = $installedBackgroundHelper
     statisticsTimezone = $StatisticsTimezone
     stateDir = $InstallRoot
 }
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 4), $utf8NoBom)
 
-Add-Type -AssemblyName System.Security
-$plainBytes = [Text.Encoding]::UTF8.GetBytes($token)
-$protectedBytes = $null
-try {
-    $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
-        $plainBytes,
-        $null,
-        [Security.Cryptography.DataProtectionScope]::CurrentUser)
-    $temporaryTokenPath = Join-Path $InstallRoot '.token.protected.tmp'
-    [IO.File]::WriteAllBytes($temporaryTokenPath, $protectedBytes)
-    Move-Item -LiteralPath $temporaryTokenPath -Destination $TokenPath -Force
-} finally {
-    if ($null -ne $plainBytes) {
-        [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+if ($replaceToken) {
+    Add-Type -AssemblyName System.Security
+    $plainBytes = [Text.Encoding]::UTF8.GetBytes($token)
+    $protectedBytes = $null
+    try {
+        $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
+            $plainBytes,
+            $null,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $temporaryTokenPath = Join-Path $InstallRoot '.token.protected.tmp'
+        [IO.File]::WriteAllBytes($temporaryTokenPath, $protectedBytes)
+        Move-Item -LiteralPath $temporaryTokenPath -Destination $TokenPath -Force
+    } finally {
+        if ($null -ne $plainBytes) {
+            [Array]::Clear($plainBytes, 0, $plainBytes.Length)
+        }
+        if ($null -ne $protectedBytes) {
+            [Array]::Clear($protectedBytes, 0, $protectedBytes.Length)
+        }
+        $token = $null
     }
-    if ($null -ne $protectedBytes) {
-        [Array]::Clear($protectedBytes, 0, $protectedBytes.Length)
-    }
-    $token = $null
+}
+$token = $null
+
+& $installedBinary --config $configPath --state-dir $InstallRoot device | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "TokenBar Sync could not initialize its stable device identity (exit $LASTEXITCODE)."
 }
 
 $installId = if ($null -ne $marker) { [string] $marker.installId } else { [Guid]::NewGuid().ToString() }
 $markerValue = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     installId = $installId
     userSid = $CurrentUserSid
     installRoot = $InstallRoot
     taskName = $TaskName
-    powerShellExe = $PowerShellExe
+    taskExecutable = $TaskExecutable
     taskArguments = $TaskArguments
 }
 $temporaryMarkerPath = Join-Path $InstallRoot '.tokenbar-sync-install.tmp'
@@ -241,19 +300,45 @@ $temporaryMarkerPath = Join-Path $InstallRoot '.tokenbar-sync-install.tmp'
     $temporaryMarkerPath,
     ($markerValue | ConvertTo-Json -Depth 4),
     $utf8NoBom)
-Move-Item -LiteralPath $temporaryMarkerPath -Destination $MarkerPath -Force
 
-& $installedBinary --config $configPath --state-dir $InstallRoot device | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "TokenBar Sync could not initialize its stable device identity (exit $LASTEXITCODE)."
-}
-
-$action = New-ScheduledTaskAction -Execute $PowerShellExe -Argument $TaskArguments
+$action = New-ScheduledTaskAction -Execute $TaskExecutable
 $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $principal = New-ScheduledTaskPrincipal -UserId $CurrentUserSid -LogonType Interactive -RunLevel Limited
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $TaskDescription -Force | Out-Null
+$previousTaskXml = if ($null -ne $existingTask) {
+    Export-ScheduledTask -TaskName $TaskName
+} else {
+    $null
+}
+$previousMarkerBytes = if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) {
+    [IO.File]::ReadAllBytes($MarkerPath)
+} else {
+    $null
+}
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $TaskDescription -Force | Out-Null
+    Move-Item -LiteralPath $temporaryMarkerPath -Destination $MarkerPath -Force
+} catch {
+    $installError = $_
+    try {
+        if ($null -ne $previousTaskXml) {
+            Register-ScheduledTask -TaskName $TaskName -Xml $previousTaskXml -Force | Out-Null
+        } else {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $previousMarkerBytes) {
+            [IO.File]::WriteAllBytes($temporaryMarkerPath, $previousMarkerBytes)
+            Move-Item -LiteralPath $temporaryMarkerPath -Destination $MarkerPath -Force
+        } else {
+            Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $temporaryMarkerPath -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        throw "TokenBar Sync installation failed and rollback also failed: $($installError.Exception.Message); rollback: $($_.Exception.Message)"
+    }
+    throw $installError
+}
 
 [pscustomobject]@{
     Installed = $true

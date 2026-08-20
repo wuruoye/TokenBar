@@ -23,6 +23,8 @@ struct DashboardLayoutTests {
             hasFiveHour: true,
             hasResetCredits: true)
 
+        #expect(weeklyOnly == 79)
+        #expect(weeklyAndFiveHour - weeklyOnly == 54)
         #expect(weeklyOnly < weeklyAndFiveHour)
         #expect(weeklyOnly < weeklyAndResetCredits)
         #expect(weeklyAndFiveHour < allRows)

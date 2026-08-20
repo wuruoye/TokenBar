@@ -537,6 +537,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
     private static func validate(day: DailySummary) throws {
         guard !day.date.isEmpty,
               Self.isNonnegativeFinite(day.costUsd),
+              day.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
               day.requestCount >= 0,
               day.sessionCount >= 0
         else {
@@ -1014,6 +1015,10 @@ public enum ActivitySnapshotMerger {
                     sessionCount: values.reduce(0) {
                         $0.saturatingAddForSync($1.sessionCount)
                     },
+                    averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                        values,
+                        tokens: { $0.tokens },
+                        rate: { $0.averageGenerationTokensPerSecond }),
                     models: models)
             }
             .sorted { $0.date < $1.date }
@@ -1036,7 +1041,11 @@ public enum ActivitySnapshotMerger {
             tokens: self.sumTokens(days.map(\.tokens)),
             costUsd: self.sumFinite(days.map(\.costUsd)),
             requestCount: days.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
-            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) })
+            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
+            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                days,
+                tokens: { $0.tokens },
+                rate: { $0.averageGenerationTokensPerSecond }))
     }
 
     private static func sumTotals(_ totals: [ActivityTotals]) -> ActivityTotals {
@@ -1048,21 +1057,33 @@ public enum ActivitySnapshotMerger {
                 cacheWrite: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.cacheWrite)),
                 reasoning: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.reasoning)))
             : nil
-        var generatedTokens = 0.0
-        var modeledSeconds = 0.0
-        for total in totals {
-            guard let rate = total.averageGenerationTokensPerSecond, rate > 0 else { continue }
-            let tokens = Double(total.tokens.output.saturatingAddForSync(total.tokens.reasoning))
-            generatedTokens = generatedTokens.saturatingAddForSync(tokens)
-            modeledSeconds = modeledSeconds.saturatingAddForSync(tokens / rate)
-        }
         return ActivityTotals(
             tokens: self.sumTokens(totals.map(\.tokens)),
             costUsd: self.sumFinite(totals.map(\.costUsd)),
             requestCount: totals.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
             sessionCount: totals.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
             tokenCosts: tokenCosts,
-            averageGenerationTokensPerSecond: modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil)
+            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                totals,
+                tokens: { $0.tokens },
+                rate: { $0.averageGenerationTokensPerSecond }))
+    }
+
+    private static func weightedAverageGenerationTokensPerSecond<Value>(
+        _ values: [Value],
+        tokens: (Value) -> TokenBreakdown,
+        rate: (Value) -> Double?) -> Double?
+    {
+        var generatedTokens = 0.0
+        var modeledSeconds = 0.0
+        for value in values {
+            guard let rate = rate(value), rate > 0 else { continue }
+            let tokens = tokens(value)
+            let count = Double(tokens.output.saturatingAddForSync(tokens.reasoning))
+            generatedTokens = generatedTokens.saturatingAddForSync(count)
+            modeledSeconds = modeledSeconds.saturatingAddForSync(count / rate)
+        }
+        return modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil
     }
 
     private static func sumTokens(_ values: [TokenBreakdown]) -> TokenBreakdown {

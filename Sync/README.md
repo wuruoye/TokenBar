@@ -23,6 +23,8 @@ Windows requires Rust's MSVC target and the Visual C++ build tools:
 
 The installer accepts this Windows installation's bearer token only from the current PowerShell process, protects it with DPAPI CurrentUser, and never writes it to `config.json` or the Scheduled Task command line. Each upload decrypts it only for the child process lifetime and clears that environment entry afterward. A one-shot upload collects a fresh, sanitized snapshot in memory. A v2 base-revision conflict immediately retries that same fresh collection as a full snapshot; other HTTP 409 responses discard it so the next invocation can collect a newer timestamp.
 
+The Scheduled Task points directly at a native Windows GUI-subsystem runner rather than PowerShell or `cmd.exe`. That runner starts dedicated GUI-subsystem copies of the sync client and helper with non-console standard handles and `CREATE_NO_WINDOW`, while the console-subsystem copies remain available for interactive status and troubleshooting commands. This prevents the recurring task from allocating a visible console or a TokenBar-owned `conhost.exe` process.
+
 Build first, set a 32–512 character random token only in the current PowerShell process, and install the fixed per-user Scheduled Task:
 
 ```powershell
@@ -32,7 +34,7 @@ Remove-Item Env:TOKENBAR_SYNC_TOKEN
 .\Sync\scripts\Get-TokenBarSyncStatus.ps1
 ```
 
-The installer owns only `%LOCALAPPDATA%\TokenBarSync` and the `TokenBarSync` task, verifies both before upgrades/removal, and never recursively deletes an arbitrary directory. It writes the two binaries, license files, non-secret configuration, a DPAPI-protected token, stable device UUID, and non-payload last-run status there.
+The installer owns only `%LOCALAPPDATA%\TokenBarSync` and the `TokenBarSync` task, verifies both before upgrades/removal, and never recursively deletes an arbitrary directory. It writes the command-line and background binaries, native task runner, license files, non-secret configuration, a DPAPI-protected token, stable device UUID, and non-payload last-run status there. Re-running the installer for an owned installation preserves the existing protected token when `TOKENBAR_SYNC_TOKEN` is omitted.
 
 ## macOS
 

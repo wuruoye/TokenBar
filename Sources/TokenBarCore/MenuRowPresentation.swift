@@ -120,6 +120,17 @@ public extension RequestSummary {
 }
 
 public extension SessionSummary {
+    var menuDisplayTitle: String {
+        let title = self.menuTitle
+        guard self.isSynchronizedRemote,
+              let deviceName = self.workspaceLabel?.compactMenuText,
+              deviceName != title
+        else {
+            return title
+        }
+        return "\(deviceName) · \(title)"
+    }
+
     var averageGenerationTokensPerSecond: Double? {
         weightedAverageGenerationTokensPerSecond(
             for: self.requests.flatMap(\.physicalRequests))
@@ -168,6 +179,12 @@ public extension ActivitySnapshot {
 }
 
 public extension ActivityTotals {
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+}
+
+public extension DailySummary {
     var menuAverageTPSText: String? {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
