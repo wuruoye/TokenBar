@@ -184,6 +184,12 @@ public extension ActivityTotals {
     }
 }
 
+public extension DailySummary {
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+}
+
 private func weightedAverageGenerationTokensPerSecond(
     for requests: [RequestSummary]) -> Double?
 {

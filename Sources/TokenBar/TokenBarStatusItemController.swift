@@ -61,6 +61,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
     private var syncSettingsSignature: SyncSettingsSignature
+    private var monitorsCodexMemory: Bool
 
     init(
         model: DashboardModel,
@@ -81,6 +82,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.syncSettingsSignature = SyncSettingsSignature(
             settings,
             activitySync: activitySync)
+        self.monitorsCodexMemory = settings.monitorsCodexMemory
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
@@ -347,6 +349,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.showsGrok
             _ = self.settings.usesWeekdayWeeklyPacing
             _ = self.settings.showsFullRequestContentOnHover
+            _ = self.settings.monitorsCodexMemory
             _ = self.settings.syncEnabled
             _ = self.settings.syncServerURL
             _ = self.settings.syncDeviceName
@@ -361,6 +364,17 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                     activitySync: self.activitySync)
                 if syncSettingsSignature != self.syncSettingsSignature {
                     self.syncSettingsSignature = syncSettingsSignature
+                    Task { @MainActor [weak self] in
+                        await self?.model.restartActivityRefresh()
+                    }
+                }
+                if self.monitorsCodexMemory != self.settings.monitorsCodexMemory {
+                    self.monitorsCodexMemory = self.settings.monitorsCodexMemory
+                    if self.monitorsCodexMemory {
+                        self.memoryTelemetry.start()
+                    } else {
+                        self.memoryTelemetry.stop()
+                    }
                     Task { @MainActor [weak self] in
                         await self?.model.restartActivityRefresh()
                     }
@@ -506,28 +520,30 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         activityItem.submenu = self.makeActivityDetailMenu(accentColor: accentColor)
         self.rootMenu.addItem(activityItem)
 
-        let memoryHeight = MemorySummarySection.preferredHeight + 1
-        let memory = MenuMemorySummaryView(
-            model: self.model,
-            telemetry: self.memoryTelemetry,
-            accentColor: accentColor)
-            .allowsHitTesting(false)
-            .frame(width: Self.menuWidth, height: memoryHeight, alignment: .top)
-        let memoryHost = FixedMenuHostingView(
-            rootView: AnyView(memory),
-            width: Self.menuWidth,
-            height: memoryHeight)
-        let memoryItem = NSMenuItem(
-            title: "Codex Memory",
-            action: #selector(self.activityNoOp),
-            keyEquivalent: "")
-        memoryItem.target = self
-        memoryItem.isEnabled = true
-        memoryItem.view = memoryHost
-        memoryItem.submenu = self.makeMemoryDetailMenu(accentColor: accentColor)
-        memoryItem.isHidden = !self.model.scope.supportsCodexMemory
-        self.memoryItem = memoryItem
-        self.rootMenu.addItem(memoryItem)
+        if self.settings.monitorsCodexMemory {
+            let memoryHeight = MemorySummarySection.preferredHeight + 1
+            let memory = MenuMemorySummaryView(
+                model: self.model,
+                telemetry: self.memoryTelemetry,
+                accentColor: accentColor)
+                .allowsHitTesting(false)
+                .frame(width: Self.menuWidth, height: memoryHeight, alignment: .top)
+            let memoryHost = FixedMenuHostingView(
+                rootView: AnyView(memory),
+                width: Self.menuWidth,
+                height: memoryHeight)
+            let memoryItem = NSMenuItem(
+                title: "Codex Memory",
+                action: #selector(self.activityNoOp),
+                keyEquivalent: "")
+            memoryItem.target = self
+            memoryItem.isEnabled = true
+            memoryItem.view = memoryHost
+            memoryItem.submenu = self.makeMemoryDetailMenu(accentColor: accentColor)
+            memoryItem.isHidden = !self.model.scope.supportsCodexMemory
+            self.memoryItem = memoryItem
+            self.rootMenu.addItem(memoryItem)
+        }
         self.rootMenu.addItem(.separator())
 
         self.rootMenu.addItem(.sectionHeader(title: "Recent Sessions"))
@@ -683,7 +699,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func updateMemoryVisibility(scope: DashboardScope) {
-        let isHidden = !scope.supportsCodexMemory
+        let isHidden = !self.settings.monitorsCodexMemory || !scope.supportsCodexMemory
         if self.memoryItem?.isHidden != isHidden {
             self.memoryItem?.isHidden = isHidden
         }

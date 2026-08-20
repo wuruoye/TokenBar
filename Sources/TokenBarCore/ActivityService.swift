@@ -83,7 +83,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let arguments: [String]
     private let environment: [String: String]
     private let timeout: TimeInterval
-    private let memoryDatabaseURL: URL?
+    private let memoryDatabaseURLProvider: @Sendable () async -> URL?
     private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
     private let runner: any ActivityHelperRunning
@@ -92,13 +92,14 @@ public struct ActivityService: ActivityProviding, Sendable {
         helperURL: URL? = nil,
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
+        memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeout: TimeInterval = 120,
         runner: any ActivityHelperRunning = SubprocessActivityHelperRunner())
     {
         self.arguments = arguments
-        self.memoryDatabaseURL = memoryDatabaseURL
+        self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
@@ -111,6 +112,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     init(
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
+        memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
         timeout: TimeInterval = 120,
@@ -118,7 +120,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         runner: any ActivityHelperRunning)
     {
         self.arguments = arguments
-        self.memoryDatabaseURL = memoryDatabaseURL
+        self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
@@ -142,11 +144,13 @@ public struct ActivityService: ActivityProviding, Sendable {
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
         let helperURL = try self.resolveHelper()
+        let memoryDatabaseURL = await self.memoryDatabaseURLProvider()
         let anthropicPricingURL = await self.anthropicPricingCatalog?.refreshIfNeeded()
         let data = try await self.runner.run(
             executableURL: helperURL,
             arguments: self.helperArguments(
                 sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+                memoryDatabaseURL: memoryDatabaseURL,
                 anthropicPricingURL: anthropicPricingURL,
                 statisticsTimeZone: statisticsTimeZone),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
@@ -163,6 +167,7 @@ public struct ActivityService: ActivityProviding, Sendable {
 
     private func helperArguments(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        memoryDatabaseURL: URL?,
         anthropicPricingURL: URL?,
         statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
@@ -177,7 +182,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.grok]) {
             arguments += ["--grok-weekly-reset-ms", String(value)]
         }
-        if let memoryDatabaseURL = self.memoryDatabaseURL {
+        if let memoryDatabaseURL {
             arguments += ["--memory-database", memoryDatabaseURL.path]
         }
         if let anthropicPricingURL {

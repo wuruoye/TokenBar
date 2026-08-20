@@ -140,46 +140,56 @@ struct TokenBarSettingsView: View {
 
             if let memoryTelemetry = self.memoryTelemetry {
                 Section("Codex Memory") {
-                    LabeledContent("Receiver") {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(memoryTelemetry.receiverState.isListening ? Color.green : Color.orange)
-                                .frame(width: 7, height: 7)
-                            Text(memoryTelemetry.receiverState.title)
-                        }
-                    }
+                    Toggle(
+                        "Monitor Codex Memory usage",
+                        isOn: self.$settings.monitorsCodexMemory)
 
-                    Text(memoryTelemetry.receiverState.detail ?? "")
+                    Text("When off, TokenBar stops its local receiver, hides Memory usage, and excludes Memory telemetry from multi-device sync. This does not change Codex's memory setting.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    LabeledContent("Codex config") {
-                        Text(memoryTelemetry.configurationState.title)
-                    }
-
-                    Text(memoryTelemetry.configurationState.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    if memoryTelemetry.configurationState.canInstall {
-                        Button(
-                            memoryTelemetry.configurationState == .needsAnalytics
-                                ? "Enable Codex Analytics"
-                                : "Enable Memory Metrics")
-                        {
-                            memoryTelemetry.installConfiguration()
+                    if self.settings.monitorsCodexMemory {
+                        LabeledContent("Receiver") {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(memoryTelemetry.receiverState.isListening ? Color.green : Color.orange)
+                                    .frame(width: 7, height: 7)
+                                Text(memoryTelemetry.receiverState.title)
+                            }
                         }
-                    }
 
-                    if let message = memoryTelemetry.configurationErrorMessage {
-                        Text(message)
+                        Text(memoryTelemetry.receiverState.detail ?? "")
                             .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+                            .foregroundStyle(.secondary)
 
-                    Text("Codex loads this setting when its local process starts. Restart Codex or ChatGPT once after enabling. Logs, traces, and prompt text stay disabled.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        LabeledContent("Codex config") {
+                            Text(memoryTelemetry.configurationState.title)
+                        }
+
+                        Text(memoryTelemetry.configurationState.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if memoryTelemetry.configurationState.canInstall {
+                            Button(
+                                memoryTelemetry.configurationState == .needsAnalytics
+                                    ? "Enable Codex Analytics"
+                                    : "Enable Memory Metrics")
+                            {
+                                memoryTelemetry.installConfiguration()
+                            }
+                        }
+
+                        if let message = memoryTelemetry.configurationErrorMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+
+                        Text("Codex loads this setting when its local process starts. Restart Codex or ChatGPT once after enabling. Logs, traces, and prompt text stay disabled.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 

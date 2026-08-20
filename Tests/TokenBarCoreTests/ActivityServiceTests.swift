@@ -48,6 +48,18 @@ private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
     }
 }
 
+private actor MemoryDatabaseURLPreference {
+    var value: URL?
+
+    init(value: URL?) {
+        self.value = value
+    }
+
+    func update(_ value: URL?) {
+        self.value = value
+    }
+}
+
 @Suite("ActivityService")
 struct ActivityServiceTests {
     @Test("decodes helper JSON without launching a process")
@@ -76,6 +88,7 @@ struct ActivityServiceTests {
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.physicalSessionId == "physical-1")
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.serviceTier == .fast)
         #expect(snapshot.days.first?.models.first?.model == "gpt-test")
+        #expect(snapshot.days.first?.averageGenerationTokensPerSecond == 6)
     }
 
     @Test("passes the exact weekly reset timestamp to the helper")
@@ -160,6 +173,27 @@ struct ActivityServiceTests {
         ])
     }
 
+    @Test("omits the memory database when monitoring is turned off")
+    func followsMemoryDatabasePreference() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let preference = MemoryDatabaseURLPreference(
+            value: URL(fileURLWithPath: "/tmp/tokenbar-memory.sqlite"))
+        let service = ActivityService(
+            memoryDatabaseURLProvider: { await preference.value },
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+        #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
+            "--memory-database", "/tmp/tokenbar-memory.sqlite",
+        ])
+
+        await preference.update(nil)
+        _ = try await service.fetchActivity()
+        #expect(await runner.arguments == ["--statistics-timezone", "utc"])
+    }
+
     @Test("passes the refreshed Anthropic pricing catalog to the helper")
     func passesAnthropicPricingCatalog() async throws {
         let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
@@ -198,6 +232,7 @@ struct ActivityServiceTests {
 
         #expect(day.models.isEmpty)
         #expect(day.tokens.total == 15)
+        #expect(day.averageGenerationTokensPerSecond == nil)
     }
 
     @Test("decodes legacy activity snapshots without weekly reset totals")
@@ -343,6 +378,7 @@ struct ActivityServiceTests {
             "date": "2024-07-03",
             "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
             "costUsd": 0.25,
+            "averageGenerationTokensPerSecond": 6.0,
             "requestCount": 1,
             "sessionCount": 1,
             "models": [{

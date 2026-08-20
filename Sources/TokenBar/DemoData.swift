@@ -270,6 +270,7 @@ struct DemoActivityProvider: ActivityProviding {
             let primaryModel = tokens.scaled(numerator: 2, denominator: 3)
             let secondaryModel = tokens.subtracting(primaryModel)
             let dayCost = Double(tokens.total) / 1_000_000 * 4.2
+            let dayAverageTPS = 24.5 + Double(wave) * 1.2
             let dayRequestCount = 12 + Int(wave)
             let daySessionCount = 4 + Int(wave % 3)
             let codexRequestCount = 8 + Int(wave / 2)
@@ -321,6 +322,9 @@ struct DemoActivityProvider: ActivityProviding {
                     "date": formatter.string(from: date),
                     "tokens": platformTokens.object,
                     "costUsd": platformCost,
+                    "averageGenerationTokensPerSecond": platform == .codex
+                        ? dayAverageTPS + 3
+                        : dayAverageTPS - 3,
                     "requestCount": platformRequestCount,
                     "sessionCount": platformSessionCount,
                     "models": [[
@@ -338,6 +342,7 @@ struct DemoActivityProvider: ActivityProviding {
                 "date": formatter.string(from: date),
                 "tokens": tokens.object,
                 "costUsd": dayCost,
+                "averageGenerationTokensPerSecond": dayAverageTPS,
                 "requestCount": dayRequestCount,
                 "sessionCount": daySessionCount,
                 "models": [
@@ -416,7 +421,7 @@ struct DemoActivityProvider: ActivityProviding {
         let memoryHasOtlpConnection = memoryIncludesData
             || demoEnvironment["TOKENBAR_DEMO_MEMORY_WAITING"] == "1"
         let object: [String: Any] = [
-            "schemaVersion": 9,
+            "schemaVersion": 10,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [

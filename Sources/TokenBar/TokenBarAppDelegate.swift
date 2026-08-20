@@ -16,8 +16,13 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                 cache: nil)
         }
         #endif
+        let memoryDatabaseURL = self.memoryTelemetryController.paths.databaseURL
         let localActivity = ActivityService(
-            memoryDatabaseURL: self.memoryTelemetryController.paths.databaseURL,
+            memoryDatabaseURLProvider: { [weak settings = self.settings] in
+                await MainActor.run {
+                    settings?.monitorsCodexMemory == true ? memoryDatabaseURL : nil
+                }
+            },
             anthropicPricingCatalog: self.anthropicPricingCatalog)
         let synchronizedActivity = SynchronizedActivityService(
             local: localActivity,
@@ -96,7 +101,9 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         #endif
-        self.memoryTelemetryController.start()
+        if self.settings.monitorsCodexMemory {
+            self.memoryTelemetryController.start()
+        }
         #if DEBUG
         let requestDetailService: any RequestDetailProviding = environment["TOKENBAR_DEMO_MODE"] == "1"
             ? DemoRequestDetailProvider()

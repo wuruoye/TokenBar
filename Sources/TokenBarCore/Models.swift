@@ -518,6 +518,7 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
     public let date: String
     public let tokens: TokenBreakdown
     public let costUsd: Double
+    public let averageGenerationTokensPerSecond: Double?
     public let requestCount: Int
     public let sessionCount: Int
     public let models: [DailyModelSummary]
@@ -528,11 +529,13 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         costUsd: Double,
         requestCount: Int,
         sessionCount: Int,
+        averageGenerationTokensPerSecond: Double? = nil,
         models: [DailyModelSummary] = [])
     {
         self.date = date
         self.tokens = tokens
         self.costUsd = costUsd
+        self.averageGenerationTokensPerSecond = averageGenerationTokensPerSecond
         self.requestCount = requestCount
         self.sessionCount = sessionCount
         self.models = models
@@ -542,6 +545,7 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         case date
         case tokens
         case costUsd
+        case averageGenerationTokensPerSecond
         case requestCount
         case sessionCount
         case models
@@ -552,6 +556,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         self.date = try container.decode(String.self, forKey: .date)
         self.tokens = try container.decode(TokenBreakdown.self, forKey: .tokens)
         self.costUsd = try container.decode(Double.self, forKey: .costUsd)
+        self.averageGenerationTokensPerSecond = try container.decodeIfPresent(
+            Double.self,
+            forKey: .averageGenerationTokensPerSecond)
         self.requestCount = try container.decode(Int.self, forKey: .requestCount)
         self.sessionCount = try container.decode(Int.self, forKey: .sessionCount)
         self.models = try container.decodeIfPresent([DailyModelSummary].self, forKey: .models) ?? []

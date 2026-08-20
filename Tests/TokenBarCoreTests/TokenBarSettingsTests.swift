@@ -19,6 +19,7 @@ struct TokenBarSettingsTests {
             #expect(settings.showsGrok)
             #expect(!settings.usesWeekdayWeeklyPacing)
             #expect(settings.showsFullRequestContentOnHover)
+            #expect(settings.monitorsCodexMemory)
             #expect(settings.resetCelebration == .off)
             #expect(!settings.syncEnabled)
             #expect(settings.syncServerURL.isEmpty)
@@ -39,6 +40,7 @@ struct TokenBarSettingsTests {
             settings?.showsGrok = false
             settings?.usesWeekdayWeeklyPacing = true
             settings?.showsFullRequestContentOnHover = false
+            settings?.monitorsCodexMemory = false
             settings?.resetCelebration = .both
             settings?.syncEnabled = true
             settings?.syncServerURL = "https://sync.example.com"
@@ -55,6 +57,7 @@ struct TokenBarSettingsTests {
             #expect(!restored.showsGrok)
             #expect(restored.usesWeekdayWeeklyPacing)
             #expect(!restored.showsFullRequestContentOnHover)
+            #expect(!restored.monitorsCodexMemory)
             #expect(restored.resetCelebration == .both)
             #expect(restored.syncEnabled)
             #expect(restored.syncServerURL == "https://sync.example.com")
@@ -93,6 +96,7 @@ struct TokenBarSettingsTests {
             settings.showsGrok = false
             settings.usesWeekdayWeeklyPacing = true
             settings.showsFullRequestContentOnHover = false
+            settings.monitorsCodexMemory = false
             settings.resetCelebration = .session
             settings.syncEnabled = true
             settings.syncServerURL = "https://sync.example.com"
@@ -109,6 +113,7 @@ struct TokenBarSettingsTests {
             #expect(restored.showsGrok)
             #expect(!restored.usesWeekdayWeeklyPacing)
             #expect(restored.showsFullRequestContentOnHover)
+            #expect(restored.monitorsCodexMemory)
             #expect(restored.resetCelebration == .off)
             #expect(!restored.syncEnabled)
             #expect(restored.syncServerURL.isEmpty)

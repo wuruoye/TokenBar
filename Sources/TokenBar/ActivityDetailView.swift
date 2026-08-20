@@ -179,8 +179,14 @@ struct ActivityDetailView: View {
                     Text(day.date)
                         .font(.system(size: 13, weight: .semibold))
                     Text(
-                        "\(day.sessionCount) sessions · \(day.requestCount) turns · "
-                            + "Cache \(day.tokens.cachePercentageText)")
+                        [
+                            "\(day.sessionCount) sessions",
+                            "\(day.requestCount) turns",
+                            "Cache \(day.tokens.cachePercentageText)",
+                            day.menuAverageTPSText,
+                        ]
+                        .compactMap(\.self)
+                        .joined(separator: " · "))
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }

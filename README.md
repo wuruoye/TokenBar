@@ -36,7 +36,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Record each day's observed weekly-quota increase alongside Today and the selected Activity date, using the same UTC or local statistics timezone as token totals.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
-- On the **Codex** tab only, track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output.
+- Optionally track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output on the **Codex** tab only.
 - Browse the selected platform's recent sessions, using provider-generated titles when available. Codex and Claude sessions open in their desktop apps; Grok sessions resume in Terminal from their original workspace.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
@@ -102,7 +102,7 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 2. Click a provider's `T/W` section to open its matching tab. Opening the menu refreshes local activity and any quota data older than one minute.
 3. Use the three tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
 4. Hover **Activity** for the daily chart and per-model breakdowns.
-5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings.
+5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings. Turn off **Monitor Codex Memory usage** in Settings to hide this section and stop its local receiver.
 6. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
 7. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
 8. Use **Copy Session** or click a request row to copy its stable locator.
@@ -149,7 +149,7 @@ Fast pricing never changes raw token/cache counts. Quota percentages come from C
 
 ### Codex Memory tokens
 
-TokenBar runs a metrics-only OTLP/HTTP JSON receiver on `127.0.0.1:4318`. The receiver accepts only `POST /v1/metrics`, retains only `codex.memory.phase1.token_usage` and `codex.memory.phase2.token_usage`, and stores observations in `~/Library/Application Support/TokenBar/memory-telemetry.sqlite`. It reads histogram `sum`; histogram `count` is only the number of observations and is never treated as token usage.
+When **Monitor Codex Memory usage** is on, TokenBar runs a metrics-only OTLP/HTTP JSON receiver on `127.0.0.1:4318`. The receiver accepts only `POST /v1/metrics`, retains only `codex.memory.phase1.token_usage` and `codex.memory.phase2.token_usage`, and stores observations in `~/Library/Application Support/TokenBar/memory-telemetry.sqlite`. It reads histogram `sum`; histogram `count` is only the number of observations and is never treated as token usage. Turning monitoring off stops the receiver, hides Memory usage, and excludes the local Memory snapshot from multi-device sync without changing Codex's own memory setting.
 
 The owner-only database keeps each observation plus a persisted series watermark. DELTA points are added once per unique interval. CUMULATIVE points add only the increase over the latest in-order watermark; duplicate and out-of-order exports add zero, while a new start time or resource series is counted independently. This state survives TokenBar and Codex process restarts. The Memory detail view reports how many raw observations are stored locally.
 
@@ -190,7 +190,7 @@ Open **Settings** with `Command-,` to configure:
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
-- **Codex Memory:** inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
+- **Codex Memory:** start or stop TokenBar's Memory monitor, inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
 - **Multi-device sync:** configure the optional HTTPS endpoint, Keychain-backed device access token, and this Mac's stable device identity. Headless Windows/Linux components and the self-hosted service are documented in [`Sync/README.md`](Sync/README.md).
 - **Background refresh:** 1, 5, 10, or 15 minutes.
 - **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.

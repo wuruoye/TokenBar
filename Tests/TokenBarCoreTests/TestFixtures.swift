@@ -24,6 +24,7 @@ enum TestFixtures {
         sessionTitle: String? = nil,
         weeklySinceReset: ActivityRangeSummary? = nil,
         rangeTotals: ActivityTotals? = nil,
+        dailyAverageGenerationTokensPerSecond: Double? = nil,
         requestContributions: [RequestSummary]? = nil) -> ActivitySnapshot
     {
         let tokens = TokenBreakdown(input: 10, output: 5, cacheRead: 3, cacheWrite: 2, reasoning: 1)
@@ -77,7 +78,8 @@ enum TestFixtures {
                 tokens: tokens,
                 costUsd: 0.25,
                 requestCount: 1,
-                sessionCount: 1)],
+                sessionCount: 1,
+                averageGenerationTokensPerSecond: dailyAverageGenerationTokensPerSecond)],
             weeklySinceReset: weeklySinceReset,
             rangeTotals: rangeTotals)
     }
