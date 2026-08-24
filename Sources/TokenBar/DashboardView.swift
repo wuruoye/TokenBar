@@ -604,7 +604,7 @@ private struct WeeklyResetActivitySection: View {
                 HStack {
                     Text(
                         "Cache \(totals.tokens.cachePercentageText) · "
-                            + self.averageTPSText(totals)
+                            + self.performanceText(totals)
                             + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
                     Spacer(minLength: 6)
                     Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
@@ -633,8 +633,8 @@ private struct WeeklyResetActivitySection: View {
         return self.state.errorMessage ?? "Weekly reset activity unavailable"
     }
 
-    private func averageTPSText(_ totals: ActivityTotals) -> String {
-        totals.menuAverageTPSText.map { "\($0) · " } ?? ""
+    private func performanceText(_ totals: ActivityTotals) -> String {
+        totals.menuPerformanceText.map { "\($0) · " } ?? ""
     }
 }
 
@@ -668,7 +668,8 @@ private struct TodaySummarySection: View {
 
                 ActivityTotalsBreakdown(
                     totals: totals,
-                    averageTPSText: totals.menuAverageTPSText ?? self.state.value?.menuAverageTPSText,
+                    performanceText: totals.menuPerformanceText
+                        ?? self.state.value?.menuPerformanceText,
                     accentColor: self.accentColor,
                     showsBar: false)
             } else {
@@ -694,7 +695,7 @@ private struct TodaySummarySection: View {
 
 struct ActivityTotalsBreakdown: View {
     let totals: ActivityTotals
-    let averageTPSText: String?
+    let performanceText: String?
     let accentColor: Color
     var showsBar = true
 
@@ -732,7 +733,7 @@ struct ActivityTotalsBreakdown: View {
             HStack {
                 Text(
                     "Cache \(self.totals.tokens.cachePercentageText) · "
-                        + self.averageTPSSuffix
+                        + self.performanceSuffix
                         + "\(self.totals.sessionCount) sessions · \(self.totals.requestCount) turns")
                 Spacer()
                 Text(self.totals.costUsd.costText(tokenTotal: self.totals.tokens.total))
@@ -746,8 +747,8 @@ struct ActivityTotalsBreakdown: View {
         }
     }
 
-    private var averageTPSSuffix: String {
-        self.averageTPSText.map { "\($0) · " } ?? ""
+    private var performanceSuffix: String {
+        self.performanceText.map { "\($0) · " } ?? ""
     }
 }
 

@@ -43,12 +43,14 @@ struct CodexPayload {
     model_info: Option<CodexModelInfo>,
     info: Option<CodexInfo>,
     turn_id: Option<String>,
+    time_to_first_token_ms: Option<i64>,
     source: Option<Value>,
     thread_source: Option<String>,
     cwd: Option<String>,
     model_provider: Option<String>,
     agent_nickname: Option<String>,
     message: Option<String>,
+    role: Option<String>,
     thread_settings: Option<CodexThreadSettings>,
 }
 
@@ -186,8 +188,10 @@ struct CodexParseState {
     service_tier_conflicted: bool,
     current_turn_start_ms: Option<i64>,
     current_model_request_start_ms: Option<i64>,
+    current_model_first_response_ms: Option<i64>,
     current_model_response_end_ms: Option<i64>,
     pending_next_model_request_start_ms: Option<i64>,
+    current_source_turn_id: Option<String>,
     previous_totals: Option<CodexTotals>,
     session_is_headless: bool,
     session_id_from_meta: Option<String>,
@@ -274,6 +278,8 @@ fn parse_codex_reader<R: BufRead>(
                 let is_response_item = entry_type == "response_item";
                 let response_item_is_tool_output =
                     is_response_item && codex_response_item_is_tool_output(&payload);
+                let response_item_is_model_input =
+                    is_response_item && codex_response_item_is_model_input(&payload);
                 let is_thread_settings_applied = entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("thread_settings_applied");
                 let service_tier_snapshot = is_thread_settings_applied
@@ -366,10 +372,18 @@ fn parse_codex_reader<R: BufRead>(
                     handled = true;
                 }
 
+                if entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_started")
+                {
+                    state.current_source_turn_id.clone_from(&payload.turn_id);
+                    handled = true;
+                }
+
                 if entry_type == "turn_context" {
                     state.current_model = payload_model.clone();
                     state.current_turn_start_ms = parsed_entry_timestamp;
                     state.current_model_request_start_ms = parsed_entry_timestamp;
+                    state.current_model_first_response_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
                     if let Some(model) = state.current_model.as_ref() {
@@ -389,6 +403,7 @@ fn parse_codex_reader<R: BufRead>(
                         state.pending_turn_start = true;
                         state.current_model_request_start_ms =
                             parsed_entry_timestamp.or(state.current_turn_start_ms);
+                        state.current_model_first_response_ms = None;
                         state.current_model_response_end_ms = None;
                         state.pending_next_model_request_start_ms = None;
                         state.pending_content_preview = payload
@@ -411,9 +426,29 @@ fn parse_codex_reader<R: BufRead>(
                     handled = true;
                 }
 
+                if entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_complete")
+                {
+                    if let Some(time_to_first_token_ms) = payload
+                        .time_to_first_token_ms
+                        .filter(|duration| *duration >= 0)
+                    {
+                        attach_time_to_first_token(
+                            &mut messages,
+                            &mut pending_model_messages,
+                            payload.turn_id.as_deref(),
+                            time_to_first_token_ms,
+                        );
+                    }
+                    if state.current_source_turn_id.as_deref() == payload.turn_id.as_deref() {
+                        state.current_source_turn_id = None;
+                    }
+                    handled = true;
+                }
+
                 if is_response_item {
                     if let Some(timestamp_ms) = parsed_entry_timestamp {
-                        if response_item_is_tool_output {
+                        if response_item_is_tool_output || response_item_is_model_input {
                             state.pending_next_model_request_start_ms = Some(
                                 state
                                     .pending_next_model_request_start_ms
@@ -428,6 +463,11 @@ fn parse_codex_reader<R: BufRead>(
                                 state.current_model_request_start_ms =
                                     state.current_turn_start_ms;
                             }
+                            state.current_model_first_response_ms = Some(
+                                state
+                                    .current_model_first_response_ms
+                                    .map_or(timestamp_ms, |existing| existing.min(timestamp_ms)),
+                            );
                             state.current_model_response_end_ms = Some(
                                 state
                                     .current_model_response_end_ms
@@ -440,16 +480,22 @@ fn parse_codex_reader<R: BufRead>(
 
                 if is_token_count {
                     handled = true;
+                    let model_request_start_ms = state
+                        .current_model_request_start_ms
+                        .or(state.current_turn_start_ms);
                     let model_duration_ms = duration_between_ms(
-                        state
-                            .current_model_request_start_ms
-                            .or(state.current_turn_start_ms),
+                        model_request_start_ms,
                         state.current_model_response_end_ms,
+                    );
+                    let time_to_first_token_ms = nonnegative_duration_between_ms(
+                        model_request_start_ms,
+                        state.current_model_first_response_ms,
                     );
                     state.current_model_request_start_ms = latest_timestamp_ms(
                         parsed_entry_timestamp,
                         state.pending_next_model_request_start_ms,
                     );
+                    state.current_model_first_response_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
 
@@ -545,6 +591,8 @@ fn parse_codex_reader<R: BufRead>(
                     message.service_tier = state.current_service_tier;
                     message.duration_ms = duration_ms;
                     message.model_duration_ms = model_duration_ms;
+                    message.time_to_first_token_ms = time_to_first_token_ms;
+                    message.source_turn_id = state.current_source_turn_id.clone();
                     if state.pending_turn_start {
                         message.is_turn_start = true;
                         state.pending_turn_start = false;
@@ -660,8 +708,10 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.service_tier_consensus = None;
             state.service_tier_conflicted = false;
             state.current_model_request_start_ms = None;
+            state.current_model_first_response_ms = None;
             state.current_model_response_end_ms = None;
             state.pending_next_model_request_start_ms = None;
+            state.current_source_turn_id = None;
         }
     }
     if let Some(provider) = payload.model_provider.as_ref() {
@@ -850,6 +900,11 @@ fn duration_between_ms(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<i64
     (duration > 0).then_some(duration)
 }
 
+fn nonnegative_duration_between_ms(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<i64> {
+    let duration = end_ms?.saturating_sub(start_ms?);
+    (duration >= 0).then_some(duration)
+}
+
 fn latest_timestamp_ms(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
@@ -858,11 +913,40 @@ fn latest_timestamp_ms(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+fn attach_time_to_first_token(
+    messages: &mut [UnifiedMessage],
+    pending_messages: &mut [UnifiedMessage],
+    source_turn_id: Option<&str>,
+    time_to_first_token_ms: i64,
+) {
+    let Some(source_turn_id) = source_turn_id else {
+        return;
+    };
+    if let Some(message) = messages
+        .iter_mut()
+        .chain(pending_messages.iter_mut())
+        .find(|message| {
+            message.is_turn_start
+                && message.source_turn_id.as_deref() == Some(source_turn_id)
+        })
+    {
+        message.time_to_first_token_ms = Some(time_to_first_token_ms);
+    }
+}
+
 fn codex_response_item_is_tool_output(payload: &CodexPayload) -> bool {
     payload
         .payload_type
         .as_deref()
         .is_some_and(|payload_type| payload_type.ends_with("_output"))
+}
+
+fn codex_response_item_is_model_input(payload: &CodexPayload) -> bool {
+    payload.payload_type.as_deref() == Some("message")
+        && payload
+            .role
+            .as_deref()
+            .is_some_and(|role| role != "assistant")
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -1228,6 +1312,15 @@ mod tests {
         .to_string()
     }
 
+    fn response_message_line(timestamp: &str, role: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {"type": "message", "role": role}
+        })
+        .to_string()
+    }
+
     #[test]
     fn homogeneous_fast_tier_backfills_usage_before_the_first_snapshot() {
         let lines = format!(
@@ -1415,12 +1508,13 @@ mod tests {
     #[test]
     fn model_request_duration_excludes_tool_execution() {
         let lines = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
             r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Run it"}}"#,
             response_item_line("2026-01-01T00:00:01.500Z", "reasoning"),
             response_item_line("2026-01-01T00:00:03Z", "function_call"),
             response_item_line("2026-01-01T00:00:53Z", "function_call_output"),
+            response_message_line("2026-01-01T00:00:53Z", "developer"),
             token_line("2026-01-01T00:00:53.010Z", (100, 100, 0, 20), (100, 100, 0, 20)),
             response_item_line("2026-01-01T00:00:54Z", "reasoning"),
             response_item_line("2026-01-01T00:00:55.500Z", "function_call"),
@@ -1433,6 +1527,8 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
         assert_eq!(messages[1].model_duration_ms, Some(2_490));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(500));
+        assert_eq!(messages[1].time_to_first_token_ms, Some(990));
         assert_eq!(messages[0].duration_ms, Some(53_010));
         assert_eq!(messages[1].duration_ms, Some(115_510));
     }
@@ -1457,6 +1553,26 @@ mod tests {
         assert_eq!(messages[1].content_preview.as_deref(), Some("Steer"));
         assert!(messages[1].is_turn_start);
         assert_eq!(messages[1].model_duration_ms, Some(2_000));
+    }
+
+    #[test]
+    fn task_completion_attaches_first_token_time_to_the_source_turn() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00.100Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:00.200Z","type":"event_msg","payload":{"type":"user_message","message":"Original"}}"#,
+            token_line("2026-01-01T00:00:01Z", (100, 20, 0, 5), (100, 20, 0, 5)),
+            r#"{"timestamp":"2026-01-01T00:00:01.100Z","type":"event_msg","payload":{"type":"user_message","message":"Steer"}}"#,
+            token_line("2026-01-01T00:00:02Z", (200, 40, 0, 10), (100, 20, 0, 5)),
+            r#"{"timestamp":"2026-01-01T00:00:02.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","time_to_first_token_ms":875}}"#
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].time_to_first_token_ms, Some(875));
+        assert_eq!(messages[1].time_to_first_token_ms, None);
     }
 
     #[test]

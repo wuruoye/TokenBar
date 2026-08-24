@@ -708,7 +708,9 @@ struct ActivitySyncTests {
             promptPreview: "must be removed",
             sessionTitle: "must be removed",
             rangeTotals: TestFixtures.activity().today,
-            dailyAverageGenerationTokensPerSecond: 50)
+            dailyAverageGenerationTokensPerSecond: 50,
+            dailyAverageTimeToFirstTokenMs: 1_800,
+            dailyFirstTokenSampleCount: 3)
         let remote = ActivitySnapshot(
             schemaVersion: remoteBase.schemaVersion - 1,
             generatedAtMs: remoteBase.generatedAtMs,
@@ -741,6 +743,8 @@ struct ActivitySyncTests {
         #expect(merged.rangeTotals?.tokens.total == local.today.tokens.total * 2)
         let mergedDailyTPS = try #require(merged.days.first?.averageGenerationTokensPerSecond)
         #expect(abs(mergedDailyTPS - 66.666_666_666_7) < 0.000_000_001)
+        #expect(merged.days.first?.averageTimeToFirstTokenMs == 1_575)
+        #expect(merged.days.first?.firstTokenSampleCount == 4)
         #expect(merged.sessions.count == 2)
         #expect(merged.sessions.contains { $0.title == "local title" })
         let remoteSession = try #require(merged.sessions.first {
@@ -798,7 +802,9 @@ struct ActivitySyncTests {
             requestCount: Int.max,
             sessionCount: 1,
             tokenCosts: base.today.tokenCosts,
-            averageGenerationTokensPerSecond: 6)
+            averageGenerationTokensPerSecond: 6,
+            averageTimeToFirstTokenMs: 600,
+            firstTokenSampleCount: 2)
         let local = ActivitySnapshot(
             schemaVersion: base.schemaVersion,
             generatedAtMs: base.generatedAtMs,
@@ -829,6 +835,8 @@ struct ActivitySyncTests {
         #expect(merged.rangeTotals?.sessionCount == 2)
         #expect(merged.rangeTotals?.tokenCosts?.input == (range.tokenCosts?.input ?? 0) * 2)
         #expect(merged.rangeTotals?.averageGenerationTokensPerSecond == 6)
+        #expect(merged.rangeTotals?.averageTimeToFirstTokenMs == 600)
+        #expect(merged.rangeTotals?.firstTokenSampleCount == 4)
     }
 
     @Test("synchronized provider uploads redacted data and returns the merged snapshot")

@@ -19,7 +19,7 @@ pub mod usage;
 
 pub use usage::StatisticsTimeZone;
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -129,6 +129,8 @@ pub struct RequestSummary {
     pub duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<i64>,
     pub tokens: TokenBreakdown,
     pub cost_usd: f64,
     pub cost_source: ActivityCostSource,
@@ -169,6 +171,10 @@ pub struct ActivityTotals {
     pub token_costs: Option<TokenCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_generation_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_time_to_first_token_ms: Option<f64>,
+    #[serde(default)]
+    pub first_token_sample_count: usize,
     pub request_count: usize,
     pub session_count: usize,
 }
@@ -200,6 +206,10 @@ pub struct DailySummary {
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_generation_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_time_to_first_token_ms: Option<f64>,
+    #[serde(default)]
+    pub first_token_sample_count: usize,
     pub request_count: usize,
     pub session_count: usize,
     #[serde(default)]
@@ -271,6 +281,7 @@ struct RequestRow {
     service_tier: ActivityServiceTier,
     duration_ms: Option<i64>,
     model_duration_ms: Option<i64>,
+    time_to_first_token_ms: Option<i64>,
     request_start_timestamp: Option<i64>,
     request_end_timestamp: i64,
     is_turn_start: bool,
@@ -308,6 +319,8 @@ struct DailyAccumulator {
     token_costs: OptionalTokenCostAccumulator,
     generated_tokens: f64,
     model_duration_ms: f64,
+    first_token_total_ms: f64,
+    first_token_sample_count: usize,
     turn_ids: HashSet<String>,
     session_ids: HashSet<(String, String)>,
     models: BTreeMap<(String, String, String), DailyModelAccumulator>,
@@ -821,6 +834,15 @@ fn build_snapshot_core(
                 .session_ids
                 .insert((request.source.clone(), request.session_id.clone()));
         }
+        if let Some(time_to_first_token_ms) = turn
+            .anchor
+            .time_to_first_token_ms
+            .filter(|duration| *duration >= 0)
+        {
+            let entry = daily.entry(turn.anchor.date).or_default();
+            entry.first_token_total_ms += time_to_first_token_ms as f64;
+            entry.first_token_sample_count = entry.first_token_sample_count.saturating_add(1);
+        }
     }
 
     let today_totals = activity_totals(&turns, |request| request.date == today);
@@ -868,6 +890,14 @@ fn build_snapshot_core(
                 (value.generated_tokens > 0.0 && value.model_duration_ms > 0.0)
                     .then_some(value.generated_tokens * 1_000.0 / value.model_duration_ms)
             }),
+            average_time_to_first_token_ms: entry.and_then(|value| {
+                (value.first_token_sample_count > 0).then_some(
+                    value.first_token_total_ms / value.first_token_sample_count as f64,
+                )
+            }),
+            first_token_sample_count: entry
+                .map(|value| value.first_token_sample_count)
+                .unwrap_or(0),
             request_count: entry.map(|value| value.turn_ids.len()).unwrap_or(0),
             session_count: entry.map(|value| value.session_ids.len()).unwrap_or(0),
             models,
@@ -898,6 +928,8 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
     let mut turn_count = 0_usize;
     let mut generated_tokens = 0.0;
     let mut model_duration_ms = 0.0;
+    let mut first_token_total_ms = 0.0;
+    let mut first_token_sample_count = 0_usize;
     for turn in turns {
         let mut included_turn = false;
         for request in turn.contributions.iter().filter(|request| include(request)) {
@@ -917,6 +949,16 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
         }
         if included_turn {
             turn_count = turn_count.saturating_add(1);
+            if include(&turn.anchor) {
+                if let Some(time_to_first_token_ms) = turn
+                    .anchor
+                    .time_to_first_token_ms
+                    .filter(|duration| *duration >= 0)
+                {
+                    first_token_total_ms += time_to_first_token_ms as f64;
+                    first_token_sample_count = first_token_sample_count.saturating_add(1);
+                }
+            }
         }
     }
     ActivityTotals {
@@ -928,6 +970,9 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
             && generated_tokens > 0.0
             && model_duration_ms > 0.0)
             .then_some(generated_tokens * 1_000.0 / model_duration_ms),
+        average_time_to_first_token_ms: (first_token_sample_count > 0)
+            .then_some(first_token_total_ms / first_token_sample_count as f64),
+        first_token_sample_count,
         request_count: turn_count,
         session_count: session_ids.len(),
     }
@@ -976,6 +1021,9 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         service_tier: message.service_tier.into(),
         duration_ms: message.duration_ms,
         model_duration_ms,
+        time_to_first_token_ms: message
+            .time_to_first_token_ms
+            .filter(|duration| *duration >= 0),
         request_start_timestamp,
         request_end_timestamp: message.timestamp,
         is_turn_start: message.is_turn_start,
@@ -1115,6 +1163,9 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
         (Some(left), Some(right)) => Some(left.saturating_add(right)),
         _ => None,
     };
+    if target.time_to_first_token_ms.is_none() {
+        target.time_to_first_token_ms = row.time_to_first_token_ms;
+    }
     target.request_start_timestamp =
         match (target.request_start_timestamp, row.request_start_timestamp) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -1324,6 +1375,7 @@ fn turn_summary(turn: TurnRow, occurrences: &mut HashMap<String, usize>) -> Requ
     } else {
         root_output
     };
+    aggregate.time_to_first_token_ms = turn.anchor.time_to_first_token_ms;
 
     let contributions = rows
         .into_iter()
@@ -1363,6 +1415,7 @@ fn request_summary_with_id(
         ended_at_ms: row.request_end_timestamp,
         duration_ms: row.duration_ms,
         model_duration_ms: row.model_duration_ms,
+        time_to_first_token_ms: row.time_to_first_token_ms,
         tokens: row.tokens,
         cost_usd: row.cost,
         cost_source: row.cost_source,
@@ -1521,6 +1574,8 @@ mod tests {
             service_tier: ServiceTier::Unknown,
             duration_ms: Some(2_000),
             model_duration_ms: Some(1_000),
+            time_to_first_token_ms: None,
+            source_turn_id: None,
             message_count: 1,
             agent: None,
             dedup_key: None,
@@ -1543,6 +1598,7 @@ mod tests {
         );
         first.content_preview = Some("First prompt".to_string());
         first.is_turn_start = true;
+        first.time_to_first_token_ms = Some(400);
         first.session_path = None;
 
         let mut tail = message(
@@ -1566,6 +1622,7 @@ mod tests {
         );
         second.content_preview = Some("Second prompt".to_string());
         second.is_turn_start = true;
+        second.time_to_first_token_ms = Some(600);
 
         let mut child = message(
             "2026-07-13",
@@ -1577,6 +1634,7 @@ mod tests {
         );
         child.agent = Some("Faraday".to_string());
         child.is_turn_start = true;
+        child.time_to_first_token_ms = Some(800);
 
         let snapshot = build_snapshot(
             vec![first, tail, second, child],
@@ -1590,6 +1648,8 @@ mod tests {
         assert_eq!(snapshot.today.session_count, 1);
         assert_eq!(snapshot.today.request_count, 2);
         assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.today.average_time_to_first_token_ms, Some(500.0));
+        assert_eq!(snapshot.today.first_token_sample_count, 2);
         assert_eq!(snapshot.sessions[0].id, "root-session");
         assert_eq!(
             snapshot.sessions[0].workspace_path.as_deref(),
@@ -1608,6 +1668,7 @@ mod tests {
         assert_eq!(merged.ended_at_ms, 610_000);
         assert_eq!(merged.duration_ms, Some(12_000));
         assert_eq!(merged.model_duration_ms, Some(1_000));
+        assert_eq!(merged.time_to_first_token_ms, Some(400));
         assert_eq!(merged.output_preview.as_deref(), Some("First answer"));
         assert_eq!(
             merged.session_path.as_deref(),
@@ -1621,6 +1682,7 @@ mod tests {
             .unwrap();
         assert_eq!(second_turn.tokens.input, 90);
         assert_eq!(second_turn.tokens.output, 15);
+        assert_eq!(second_turn.time_to_first_token_ms, Some(600));
         assert_eq!(second_turn.contributions.len(), 2);
 
         let child = second_turn
@@ -1631,6 +1693,7 @@ mod tests {
         assert!(child.is_subagent);
         assert_eq!(child.session_id, "root-session");
         assert_eq!(child.agent.as_deref(), Some("Faraday"));
+        assert_eq!(child.time_to_first_token_ms, Some(800));
         assert_eq!(child.session_path.as_deref(), Some("/tmp/child-a.jsonl"));
     }
 
@@ -2437,6 +2500,7 @@ mod tests {
         );
         first.tokens.reasoning = 20;
         first.model_duration_ms = Some(1_000);
+        first.time_to_first_token_ms = Some(1_000);
         first.token_costs = Some(TokenCostBreakdown {
             input: 0.1,
             output: 0.2,
@@ -2456,6 +2520,7 @@ mod tests {
         );
         second.tokens.reasoning = 30;
         second.model_duration_ms = Some(3_000);
+        second.time_to_first_token_ms = Some(3_000);
         second.token_costs = Some(TokenCostBreakdown {
             input: 0.2,
             output: 0.4,
@@ -2481,16 +2546,21 @@ mod tests {
         assert_eq!(totals.request_count, 2);
         assert_eq!(totals.session_count, 1);
         assert_eq!(totals.average_generation_tokens_per_second, Some(62.5));
+        assert_eq!(totals.average_time_to_first_token_ms, Some(2_000.0));
+        assert_eq!(totals.first_token_sample_count, 2);
         assert!((totals.token_costs.unwrap().total() - 4.5).abs() < 1e-12);
         assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(50.0));
+        assert_eq!(snapshot.today.average_time_to_first_token_ms, Some(3_000.0));
         assert_eq!(
             snapshot.days[0].average_generation_tokens_per_second,
             Some(100.0)
         );
+        assert_eq!(snapshot.days[0].average_time_to_first_token_ms, Some(1_000.0));
         assert_eq!(
             snapshot.days[1].average_generation_tokens_per_second,
             Some(50.0)
         );
+        assert_eq!(snapshot.days[1].average_time_to_first_token_ms, Some(3_000.0));
     }
 
     #[test]
@@ -2683,12 +2753,16 @@ mod tests {
         assert_eq!(value["schemaVersion"], SCHEMA_VERSION);
         assert_eq!(value["generatedAtMs"], 123);
         assert_eq!(value["today"]["requestCount"], 0);
+        assert_eq!(value["today"]["firstTokenSampleCount"], 0);
         assert_eq!(value["today"]["tokens"]["cacheRead"], 0);
         assert_eq!(value["rangeTotals"]["requestCount"], 0);
         assert_eq!(value["days"][0]["sessionCount"], 0);
         assert_eq!(value["days"][0]["models"], serde_json::json!([]));
         assert!(value["days"][0]
             .get("averageGenerationTokensPerSecond")
+            .is_none());
+        assert!(value["days"][0]
+            .get("averageTimeToFirstTokenMs")
             .is_none());
         assert!(value.get("schema_version").is_none());
     }

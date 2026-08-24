@@ -507,7 +507,12 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         guard Self.isNonnegativeFinite(totals.costUsd),
               totals.requestCount >= 0,
               totals.sessionCount >= 0,
-              totals.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true
+              totals.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              totals.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
+              totals.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
+              Self.hasConsistentFirstTokenAverage(
+                  totals.averageTimeToFirstTokenMs,
+                  sampleCount: totals.firstTokenSampleCount)
         else {
             throw ActivitySyncError.invalidResponse("\(label) contains invalid totals")
         }
@@ -538,6 +543,11 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         guard !day.date.isEmpty,
               Self.isNonnegativeFinite(day.costUsd),
               day.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              day.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
+              day.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
+              Self.hasConsistentFirstTokenAverage(
+                  day.averageTimeToFirstTokenMs,
+                  sampleCount: day.firstTokenSampleCount),
               day.requestCount >= 0,
               day.sessionCount >= 0
         else {
@@ -581,6 +591,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               request.endedAtMs >= request.startedAtMs,
               request.durationMs.map({ $0 >= 0 }) ?? true,
               request.modelDurationMs.map({ $0 >= 0 }) ?? true,
+              request.timeToFirstTokenMs.map({ $0 >= 0 }) ?? true,
               Self.isNonnegativeFinite(request.costUsd),
               request.promptPreview == nil,
               request.outputPreview == nil,
@@ -611,6 +622,16 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
 
     private static func isNonnegativeFinite(_ value: Double) -> Bool {
         value.isFinite && value >= 0
+    }
+
+    private static func hasConsistentFirstTokenAverage(
+        _ average: Double?,
+        sampleCount: Int?) -> Bool
+    {
+        if average == nil {
+            return sampleCount == nil || sampleCount == 0
+        }
+        return sampleCount.map { $0 > 0 } ?? false
     }
 }
 
@@ -976,6 +997,10 @@ public enum ActivitySnapshotMerger {
     {
         Dictionary(grouping: days.filter { allowedDates.contains($0.date) }, by: \.date)
             .map { date, values in
+                let firstToken = self.weightedAverageTimeToFirstToken(
+                    values,
+                    average: { $0.averageTimeToFirstTokenMs },
+                    sampleCount: { $0.firstTokenSampleCount })
                 let models = Dictionary(
                     grouping: values.flatMap(\.models),
                     by: {
@@ -1019,6 +1044,8 @@ public enum ActivitySnapshotMerger {
                         values,
                         tokens: { $0.tokens },
                         rate: { $0.averageGenerationTokensPerSecond }),
+                    averageTimeToFirstTokenMs: firstToken.average,
+                    firstTokenSampleCount: firstToken.sampleCount,
                     models: models)
             }
             .sorted { $0.date < $1.date }
@@ -1037,7 +1064,11 @@ public enum ActivitySnapshotMerger {
     }
 
     private static func totals(from days: [DailySummary]) -> ActivityTotals {
-        ActivityTotals(
+        let firstToken = self.weightedAverageTimeToFirstToken(
+            days,
+            average: { $0.averageTimeToFirstTokenMs },
+            sampleCount: { $0.firstTokenSampleCount })
+        return ActivityTotals(
             tokens: self.sumTokens(days.map(\.tokens)),
             costUsd: self.sumFinite(days.map(\.costUsd)),
             requestCount: days.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
@@ -1045,7 +1076,9 @@ public enum ActivitySnapshotMerger {
             averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
                 days,
                 tokens: { $0.tokens },
-                rate: { $0.averageGenerationTokensPerSecond }))
+                rate: { $0.averageGenerationTokensPerSecond }),
+            averageTimeToFirstTokenMs: firstToken.average,
+            firstTokenSampleCount: firstToken.sampleCount)
     }
 
     private static func sumTotals(_ totals: [ActivityTotals]) -> ActivityTotals {
@@ -1057,6 +1090,10 @@ public enum ActivitySnapshotMerger {
                 cacheWrite: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.cacheWrite)),
                 reasoning: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.reasoning)))
             : nil
+        let firstToken = self.weightedAverageTimeToFirstToken(
+            totals,
+            average: { $0.averageTimeToFirstTokenMs },
+            sampleCount: { $0.firstTokenSampleCount })
         return ActivityTotals(
             tokens: self.sumTokens(totals.map(\.tokens)),
             costUsd: self.sumFinite(totals.map(\.costUsd)),
@@ -1066,7 +1103,30 @@ public enum ActivitySnapshotMerger {
             averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
                 totals,
                 tokens: { $0.tokens },
-                rate: { $0.averageGenerationTokensPerSecond }))
+                rate: { $0.averageGenerationTokensPerSecond }),
+            averageTimeToFirstTokenMs: firstToken.average,
+            firstTokenSampleCount: firstToken.sampleCount)
+    }
+
+    private static func weightedAverageTimeToFirstToken<Value>(
+        _ values: [Value],
+        average: (Value) -> Double?,
+        sampleCount: (Value) -> Int?) -> (average: Double?, sampleCount: Int?)
+    {
+        var totalMs = 0.0
+        var totalSamples = 0
+        for value in values {
+            guard let average = average(value),
+                  let sampleCount = sampleCount(value),
+                  sampleCount > 0
+            else {
+                continue
+            }
+            totalMs = totalMs.saturatingAddForSync(average * Double(sampleCount))
+            totalSamples = totalSamples.saturatingAddForSync(sampleCount)
+        }
+        guard totalSamples > 0 else { return (nil, nil) }
+        return (totalMs / Double(totalSamples), totalSamples)
     }
 
     private static func weightedAverageGenerationTokensPerSecond<Value>(
@@ -1135,6 +1195,7 @@ public enum ActivitySnapshotMerger {
             endedAtMs: request.endedAtMs,
             durationMs: request.durationMs,
             modelDurationMs: request.modelDurationMs,
+            timeToFirstTokenMs: request.timeToFirstTokenMs,
             tokens: request.tokens,
             costUsd: request.costUsd,
             costSource: request.costSource,

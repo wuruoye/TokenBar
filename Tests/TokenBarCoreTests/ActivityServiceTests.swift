@@ -77,18 +77,23 @@ struct ActivityServiceTests {
         #expect(snapshot.today.tokenCosts?.displayedCache == 0.03)
         #expect(abs((snapshot.today.tokenCosts?.total ?? 0) - 0.25) < 0.000_000_001)
         #expect(snapshot.today.averageGenerationTokensPerSecond == 6)
+        #expect(snapshot.today.averageTimeToFirstTokenMs == 900)
+        #expect(snapshot.today.firstTokenSampleCount == 1)
         #expect(snapshot.rangeTotals?.tokens.total == 84)
         #expect(snapshot.rangeTotals?.averageGenerationTokensPerSecond == 7.5)
+        #expect(snapshot.rangeTotals?.averageTimeToFirstTokenMs == 1_200)
         #expect(snapshot.weeklySinceReset?.totals.tokens.total == 84)
         #expect(snapshot.weeklySinceReset?.totals.averageGenerationTokensPerSecond == 7.5)
         #expect(snapshot.sessions.first?.requests.first?.model == "gpt-test")
         #expect(snapshot.sessions.first?.requests.first?.promptPreview == "private prompt")
         #expect(snapshot.sessions.first?.requests.first?.sessionPath == "/tmp/private-session.jsonl")
         #expect(snapshot.sessions.first?.requests.first?.serviceTier == .fast)
+        #expect(snapshot.sessions.first?.requests.first?.timeToFirstTokenMs == 900)
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.physicalSessionId == "physical-1")
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.serviceTier == .fast)
         #expect(snapshot.days.first?.models.first?.model == "gpt-test")
         #expect(snapshot.days.first?.averageGenerationTokensPerSecond == 6)
+        #expect(snapshot.days.first?.averageTimeToFirstTokenMs == 900)
     }
 
     @Test("passes the exact weekly reset timestamp to the helper")
@@ -291,6 +296,7 @@ struct ActivityServiceTests {
         #expect(request.contributions == nil)
         #expect(request.serviceTier == nil)
         #expect(request.modelDurationMs == nil)
+        #expect(request.timeToFirstTokenMs == nil)
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
     }
 
@@ -305,6 +311,8 @@ struct ActivityServiceTests {
             "costUsd": 0.25,
             "tokenCosts": {"input": 0.05, "output": 0.10, "cacheRead": 0.03, "cacheWrite": 0.02, "reasoning": 0.05},
             "averageGenerationTokensPerSecond": 6.0,
+            "averageTimeToFirstTokenMs": 900.0,
+            "firstTokenSampleCount": 1,
             "requestCount": 1,
             "sessionCount": 1
           },
@@ -313,6 +321,8 @@ struct ActivityServiceTests {
             "costUsd": 1.0,
             "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
             "averageGenerationTokensPerSecond": 7.5,
+            "averageTimeToFirstTokenMs": 1200.0,
+            "firstTokenSampleCount": 4,
             "requestCount": 4,
             "sessionCount": 2
           },
@@ -323,6 +333,8 @@ struct ActivityServiceTests {
               "costUsd": 1.0,
               "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
               "averageGenerationTokensPerSecond": 7.5,
+              "averageTimeToFirstTokenMs": 1200.0,
+              "firstTokenSampleCount": 4,
               "requestCount": 4,
               "sessionCount": 2
             }
@@ -346,6 +358,7 @@ struct ActivityServiceTests {
               "startedAtMs": 1720000000000,
               "endedAtMs": 1720000001000,
               "durationMs": 1000,
+              "timeToFirstTokenMs": 900,
               "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
               "costUsd": 0.25,
               "costSource": "estimated",
@@ -364,6 +377,7 @@ struct ActivityServiceTests {
                 "startedAtMs": 1720000000000,
                 "endedAtMs": 1720000001000,
                 "durationMs": 1000,
+                "timeToFirstTokenMs": 900,
                 "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
                 "costUsd": 0.25,
                 "costSource": "estimated",
@@ -379,6 +393,8 @@ struct ActivityServiceTests {
             "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
             "costUsd": 0.25,
             "averageGenerationTokensPerSecond": 6.0,
+            "averageTimeToFirstTokenMs": 900.0,
+            "firstTokenSampleCount": 1,
             "requestCount": 1,
             "sessionCount": 1,
             "models": [{

@@ -23,7 +23,9 @@ struct SnapshotCacheTests {
             costUsd: 2.5,
             requestCount: 8,
             sessionCount: 3,
-            averageGenerationTokensPerSecond: 25)
+            averageGenerationTokensPerSecond: 25,
+            averageTimeToFirstTokenMs: 1_250,
+            firstTokenSampleCount: 8)
         let nestedRequest = RequestSummary(
             id: "child-request",
             sessionId: "session-1",
@@ -36,6 +38,7 @@ struct SnapshotCacheTests {
             endedAtMs: 1_720_000_000_900,
             durationMs: 800,
             modelDurationMs: 600,
+            timeToFirstTokenMs: 700,
             tokens: .zero,
             costUsd: 0.05,
             costSource: .estimated,
@@ -67,6 +70,7 @@ struct SnapshotCacheTests {
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.physicalSessionId == "child-session")
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.serviceTier == .fast)
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.modelDurationMs == 600)
+        #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.timeToFirstTokenMs == 700)
         #expect(loaded?.sessions.first?.title == nil)
         #expect(!raw.contains("prompt secret"))
         #expect(!raw.contains("output secret"))

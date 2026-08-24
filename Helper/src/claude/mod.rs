@@ -289,6 +289,13 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         let provider = canonical_provider(explicit_provider.as_deref(), &raw_model);
         let model = canonical_model(&raw_model);
         let timestamp = entry_timestamp_ms(&entry).unwrap_or(fallback_timestamp);
+        let request_id = entry.get("requestId").and_then(Value::as_str);
+        let message_id = message.get("id").and_then(Value::as_str);
+        let time_to_first_token_ms = request_started_at
+            .zip(message_id)
+            .and_then(|(request_started_at, message_id)| {
+                claude_time_to_first_token_ms(request_started_at, message_id)
+            });
         let tokens = TokenBreakdown {
             input: integer(usage.get("input_tokens")).max(0),
             output: integer(usage.get("output_tokens")).max(0),
@@ -301,16 +308,11 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        let dedup_key = message
-            .get("id")
-            .and_then(Value::as_str)
-            .map(|message_id| {
-                entry
-                    .get("requestId")
-                    .and_then(Value::as_str)
-                    .map(|request_id| format!("claude:{message_id}:{request_id}"))
-                    .unwrap_or_else(|| format!("claude:message:{message_id}"))
-            });
+        let dedup_key = message_id.map(|message_id| {
+            request_id
+                .map(|request_id| format!("claude:{message_id}:{request_id}"))
+                .unwrap_or_else(|| format!("claude:message:{message_id}"))
+        });
         if let Some(index) = dedup_key
             .as_ref()
             .and_then(|key| dedup_indices.get(key))
@@ -345,6 +347,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
         unified.model_duration_ms = unified.duration_ms;
+        unified.time_to_first_token_ms = time_to_first_token_ms;
         unified.is_turn_start = pending_turn_start;
         unified.set_content_preview(pending_prompt.take());
         unified.set_output_preview(
@@ -476,6 +479,33 @@ fn entry_timestamp_ms(entry: &Value) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|timestamp| timestamp.timestamp_millis())
+}
+
+fn claude_time_to_first_token_ms(request_started_at: i64, message_id: &str) -> Option<i64> {
+    let message_timestamp = prefixed_uuid_v7_timestamp_ms(message_id, "msg_01")?;
+    message_timestamp
+        .checked_sub(request_started_at)
+        .filter(|duration| *duration >= 0)
+}
+
+fn prefixed_uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<i64> {
+    const BASE58: &[u8; 58] =
+        b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    let encoded = id.strip_prefix(prefix)?;
+    if encoded.len() != 22 {
+        return None;
+    }
+    let value = encoded.bytes().try_fold(0_u128, |value, byte| {
+        let digit = BASE58.iter().position(|candidate| *candidate == byte)? as u128;
+        value.checked_mul(58)?.checked_add(digit)
+    })?;
+    let version = (value >> 76) & 0x0f;
+    let variant = (value >> 62) & 0x03;
+    if version != 7 || variant != 2 {
+        return None;
+    }
+    i64::try_from(value >> 80).ok()
 }
 
 fn integer(value: Option<&Value>) -> i64 {
@@ -633,12 +663,12 @@ mod tests {
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
         )
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"cache_read_input_tokens":45,"cache_creation_input_tokens":12,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":12}}}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"cache_read_input_tokens":45,"cache_creation_input_tokens":12,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":12}}}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
         )
         .unwrap();
 
@@ -660,6 +690,7 @@ mod tests {
         );
         assert_eq!(messages[0].duration_ms, Some(2_000));
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(800));
         assert_eq!(messages[0].content_preview.as_deref(), Some("Add Claude support"));
         assert_eq!(messages[0].output_preview.as_deref(), Some("Done"));
         assert!(messages[0].is_turn_start);
@@ -672,9 +703,9 @@ mod tests {
         fs::write(
             &path,
             r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"content":"Run the command"}}
-{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}
 {"type":"user","timestamp":"2026-07-24T10:01:02Z","message":{"content":[{"type":"tool_result","content":"done"}]}}
-{"type":"assistant","timestamp":"2026-07-24T10:01:05Z","requestId":"request-2","message":{"id":"message-2","model":"claude-sonnet-4-6","usage":{"input_tokens":110,"output_tokens":30}}}
+{"type":"assistant","timestamp":"2026-07-24T10:01:05Z","requestId":"req_011CdLguF4aY9EYRMx8QD3xC","message":{"id":"msg_011CdLguJGZSqsiQXNeEzVvp","model":"claude-sonnet-4-6","usage":{"input_tokens":110,"output_tokens":30}}}
 "#,
         )
         .unwrap();
@@ -685,8 +716,29 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
         assert_eq!(messages[1].model_duration_ms, Some(3_000));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(800));
+        assert_eq!(messages[1].time_to_first_token_ms, Some(950));
         assert!(messages[0].is_turn_start);
         assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn does_not_use_completed_assistant_block_timestamp_as_ttft() {
+        let path = temporary_path("completed-block.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"content":"Think carefully"}}
+{"type":"assistant","timestamp":"2026-07-24T10:01:14Z","requestId":"request-1","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20},"content":[{"type":"thinking","thinking":"Done thinking"}]}}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_claude_file(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, Some(74_000));
+        assert_eq!(messages[0].time_to_first_token_ms, None);
     }
 
     #[test]

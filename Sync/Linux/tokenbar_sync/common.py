@@ -485,6 +485,14 @@ def _validate_totals(value: Any, label: str) -> None:
     speed = totals.get("averageGenerationTokensPerSecond")
     if speed is not None:
         _require_nonnegative_number(speed, f"{label}.averageGenerationTokensPerSecond")
+    first_token = totals.get("averageTimeToFirstTokenMs")
+    sample_count = totals.get("firstTokenSampleCount")
+    if first_token is not None:
+        _require_nonnegative_number(first_token, f"{label}.averageTimeToFirstTokenMs")
+    if sample_count is not None:
+        _require_nonnegative_int(sample_count, f"{label}.firstTokenSampleCount")
+    if (first_token is None) != (sample_count in (None, 0)):
+        raise ValidationError(f"{label} has inconsistent first-token metrics")
 
 
 def _validate_range(value: Any, label: str, *, generated_at_ms: int) -> None:
@@ -517,6 +525,14 @@ def _validate_day(value: Any, label: str) -> str:
     _require_nonnegative_number(day.get("costUsd"), f"{label}.costUsd")
     _require_nonnegative_int(day.get("requestCount"), f"{label}.requestCount")
     _require_nonnegative_int(day.get("sessionCount"), f"{label}.sessionCount")
+    first_token = day.get("averageTimeToFirstTokenMs")
+    sample_count = day.get("firstTokenSampleCount")
+    if first_token is not None:
+        _require_nonnegative_number(first_token, f"{label}.averageTimeToFirstTokenMs")
+    if sample_count is not None:
+        _require_nonnegative_int(sample_count, f"{label}.firstTokenSampleCount")
+    if (first_token is None) != (sample_count in (None, 0)):
+        raise ValidationError(f"{label} has inconsistent first-token metrics")
     models = _require_array(day.get("models", []), f"{label}.models")
     for index, model in enumerate(models):
         _validate_daily_model(model, f"{label}.models[{index}]")
@@ -540,7 +556,7 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
     ended = _require_int64(request.get("endedAtMs"), f"{label}.endedAtMs", positive=True)
     if ended < started:
         raise ValidationError(f"{label}.endedAtMs must not precede startedAtMs")
-    for key in ("durationMs", "modelDurationMs"):
+    for key in ("durationMs", "modelDurationMs", "timeToFirstTokenMs"):
         duration = request.get(key)
         if duration is not None:
             _require_nonnegative_int(duration, f"{label}.{key}")

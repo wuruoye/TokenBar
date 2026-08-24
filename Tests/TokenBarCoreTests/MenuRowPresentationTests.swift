@@ -20,8 +20,8 @@ struct MenuRowPresentationTests {
             cacheWrite: 1_500,
             reasoning: 2_100)
 
-        #expect(tokens.sessionMenuDetail == "47K total · Cache 65.0%")
-        #expect(tokens.requestMenuDetail == "47K total · Cache 65.0%")
+        #expect(tokens.sessionMenuDetail == "47K · 65.0%")
+        #expect(tokens.requestMenuDetail == "47K · 65.0%")
         #expect(tokens.cachePercentageText == "65.0%")
     }
 
@@ -84,12 +84,21 @@ struct MenuRowPresentationTests {
         #expect(self.makeRequest(durationMs: 123_900).menuDurationText == "2m3s")
     }
 
+    @Test("First-token time is compact and displayed beside TPS")
+    func firstTokenFormatting() {
+        #expect(self.makeRequest(timeToFirstTokenMs: nil).menuTTFTText == nil)
+        #expect(self.makeRequest(timeToFirstTokenMs: 420).menuTTFTText == "420ms")
+        #expect(self.makeRequest(timeToFirstTokenMs: 4_918).menuTTFTText == "4.9s")
+        #expect(self.makeRequest(timeToFirstTokenMs: 14_358).menuTTFTText == "14.4s")
+    }
+
     @Test("Average TPS is weighted by active model request duration")
     func averageTPS() {
         let fast = self.makeRequest(
             id: "fast",
             durationMs: 60_000,
             modelDurationMs: 1_000,
+            timeToFirstTokenMs: 800,
             tokens: TokenBreakdown(
                 input: 10_000,
                 output: 80,
@@ -100,6 +109,7 @@ struct MenuRowPresentationTests {
             id: "slow",
             durationMs: 120_000,
             modelDurationMs: 3_000,
+            timeToFirstTokenMs: 2_200,
             tokens: TokenBreakdown(
                 input: 20_000,
                 output: 120,
@@ -117,6 +127,7 @@ struct MenuRowPresentationTests {
                 reasoning: 0))
         let turn = self.makeRequest(
             id: "turn",
+            timeToFirstTokenMs: 800,
             contributions: [fast, slow, missingDuration])
         let session = SessionSummary(
             id: "session",
@@ -144,23 +155,33 @@ struct MenuRowPresentationTests {
             costUsd: 0,
             requestCount: 2,
             sessionCount: 1,
-            averageGenerationTokensPerSecond: 62.5)
+            averageGenerationTokensPerSecond: 62.5,
+            averageTimeToFirstTokenMs: 1_500,
+            firstTokenSampleCount: 2)
         let day = DailySummary(
             date: "2026-08-17",
             tokens: session.tokens,
             costUsd: 0,
             requestCount: 2,
             sessionCount: 1,
-            averageGenerationTokensPerSecond: 62.5)
+            averageGenerationTokensPerSecond: 62.5,
+            averageTimeToFirstTokenMs: 1_500,
+            firstTokenSampleCount: 2)
 
         #expect(fast.averageGenerationTokensPerSecond == 100)
         #expect(turn.averageGenerationTokensPerSecond == 62.5)
-        #expect(turn.menuAverageTPSText == "Avg 62.5 tok/s")
-        #expect(turn.menuDetail.hasSuffix("Avg 62.5 tok/s"))
+        #expect(turn.menuAverageTPSText == "62.5 tok/s")
+        #expect(turn.menuPerformanceText == "800ms · 62.5 tok/s")
+        #expect(turn.menuDetail.hasSuffix("800ms · 62.5 tok/s"))
         #expect(session.averageGenerationTokensPerSecond == 62.5)
-        #expect(activity.menuAverageTPSText == "Avg 62.5 tok/s")
-        #expect(rangeTotals.menuAverageTPSText == "Avg 62.5 tok/s")
-        #expect(day.menuAverageTPSText == "Avg 62.5 tok/s")
+        #expect(session.averageTimeToFirstTokenMs == 800)
+        #expect(session.menuPerformanceText == "800ms · 62.5 tok/s")
+        #expect(activity.menuAverageTPSText == "62.5 tok/s")
+        #expect(activity.menuAverageTTFTText == "800ms")
+        #expect(rangeTotals.menuAverageTPSText == "62.5 tok/s")
+        #expect(rangeTotals.menuPerformanceText == "1.5s · 62.5 tok/s")
+        #expect(day.menuAverageTPSText == "62.5 tok/s")
+        #expect(day.menuPerformanceText == "1.5s · 62.5 tok/s")
         #expect(missingDuration.averageGenerationTokensPerSecond == nil)
     }
 
@@ -251,6 +272,7 @@ struct MenuRowPresentationTests {
         agent: String? = nil,
         durationMs: Int64? = nil,
         modelDurationMs: Int64? = nil,
+        timeToFirstTokenMs: Int64? = nil,
         tokens: TokenBreakdown = .zero,
         costUsd: Double = 0,
         costSource: ActivityCostSource = .unknown,
@@ -271,6 +293,7 @@ struct MenuRowPresentationTests {
             endedAtMs: 1_700_000_001_000,
             durationMs: durationMs,
             modelDurationMs: modelDurationMs,
+            timeToFirstTokenMs: timeToFirstTokenMs,
             tokens: tokens,
             costUsd: costUsd,
             costSource: costSource,

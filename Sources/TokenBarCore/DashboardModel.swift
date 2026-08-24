@@ -60,6 +60,7 @@ public final class DashboardModel {
     @ObservationIgnored private var statisticsTimeZone: TokenBarStatisticsTimeZone
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     @ObservationIgnored private let now: @Sendable () -> Date
+    @ObservationIgnored private let calendar: Calendar
     @ObservationIgnored private var quotaTimerTask: Task<Void, Never>?
     @ObservationIgnored private var refreshAllTask: Task<Void, Never>?
     @ObservationIgnored private var activityRefreshTask: Task<Void, Never>?
@@ -100,6 +101,7 @@ public final class DashboardModel {
             try await Task.sleep(for: duration)
         }
         self.now = Date.init
+        self.calendar = .current
     }
 
     init(
@@ -113,7 +115,8 @@ public final class DashboardModel {
         activityRefreshInterval: Duration,
         statisticsTimeZone: TokenBarStatisticsTimeZone = TokenBarSettings.defaultStatisticsTimeZone,
         sleep: @escaping @Sendable (Duration) async throws -> Void,
-        now: @escaping @Sendable () -> Date = Date.init)
+        now: @escaping @Sendable () -> Date = Date.init,
+        calendar: Calendar = .current)
     {
         var quotaServices: [TokenPlatform: any QuotaProviding] = [:]
         for service in [quotaService] + additionalQuotaServices {
@@ -133,6 +136,7 @@ public final class DashboardModel {
         self.statisticsTimeZone = statisticsTimeZone
         self.sleep = sleep
         self.now = now
+        self.calendar = calendar
     }
 
     public func start() async {
@@ -393,7 +397,9 @@ public final class DashboardModel {
         let snapshot = Self.mergingMissingResetDates(
             in: snapshot,
             from: previous,
-            now: self.now())
+            for: platform,
+            now: self.now(),
+            calendar: self.calendar)
         _ = self.recordWeeklyQuotaUsage(snapshot, for: platform)
         self.setQuotaState(DashboardSourceState(value: snapshot), for: platform)
         let events = self.quotaResetDetector.observe(snapshot, for: platform)
@@ -433,18 +439,38 @@ public final class DashboardModel {
     private static func mergingMissingResetDates(
         in snapshot: QuotaSnapshot,
         from previous: QuotaSnapshot?,
-        now: Date) -> QuotaSnapshot
+        for platform: TokenPlatform,
+        now: Date,
+        calendar: Calendar) -> QuotaSnapshot
     {
+        let previousSnapshotUpdatedAt = previous?.updatedAt ?? .distantPast
         func merge(
             _ window: QuotaWindowSnapshot?,
             previous: QuotaWindowSnapshot?) -> QuotaWindowSnapshot?
         {
             guard let window else { return nil }
+            let windowMinutes = window.windowMinutes ?? previous?.windowMinutes
+            let inferredReset: Date? = {
+                guard platform == .claude,
+                      window.resetsAt == nil,
+                      let previous,
+                      previous.usedPercent > QuotaResetDetector.resetUsageThreshold,
+                      window.usedPercent <= QuotaResetDetector.resetUsageThreshold,
+                      snapshot.updatedAt > previousSnapshotUpdatedAt,
+                      let windowMinutes,
+                      windowMinutes > 0
+                else {
+                    return nil
+                }
+                return snapshot.updatedAt.addingTimeInterval(
+                    TimeInterval(windowMinutes) * 60)
+            }()
             let inheritedReset: Date? = {
                 guard window.resetsAt == nil,
+                      inferredReset == nil,
                       let reset = previous?.resetsAt,
-                      reset > now,
-                      reset > snapshot.updatedAt
+                      let windowMinutes,
+                      windowMinutes > 0
                 else {
                     return nil
                 }
@@ -454,19 +480,37 @@ public final class DashboardModel {
                 {
                     return nil
                 }
-                guard let windowMinutes = window.windowMinutes ?? previous?.windowMinutes,
-                      windowMinutes > 0,
-                      reset.timeIntervalSince(snapshot.updatedAt)
-                      <= TimeInterval(windowMinutes * 60)
+                let duration = TimeInterval(windowMinutes) * 60
+                if reset > now,
+                   reset > snapshot.updatedAt,
+                   reset.timeIntervalSince(snapshot.updatedAt) <= duration
+                {
+                    return reset
+                }
+                guard platform == .claude else { return nil }
+                return Self.nextPeriodicReset(
+                    from: reset,
+                    every: duration,
+                    after: now)
+            }()
+            let scheduledWeeklyReset: Date? = {
+                guard platform == .claude,
+                      window.resetsAt == nil,
+                      inferredReset == nil,
+                      inheritedReset == nil,
+                      windowMinutes == 7 * 24 * 60
                 else {
                     return nil
                 }
-                return reset
+                return Self.nextSundayAtEightPM(after: now, calendar: calendar)
             }()
             return QuotaWindowSnapshot(
                 usedPercent: window.usedPercent,
-                windowMinutes: window.windowMinutes ?? previous?.windowMinutes,
-                resetsAt: window.resetsAt ?? inheritedReset)
+                windowMinutes: windowMinutes,
+                resetsAt: window.resetsAt
+                    ?? inferredReset
+                    ?? inheritedReset
+                    ?? scheduledWeeklyReset)
         }
         return QuotaSnapshot(
             session: merge(snapshot.session, previous: previous?.session),
@@ -474,6 +518,42 @@ public final class DashboardModel {
             resetCredits: snapshot.resetCredits,
             updatedAt: snapshot.updatedAt,
             origin: snapshot.origin)
+    }
+
+    private static func nextPeriodicReset(
+        from reset: Date,
+        every duration: TimeInterval,
+        after referenceDate: Date) -> Date?
+    {
+        guard reset.timeIntervalSinceReferenceDate.isFinite,
+              referenceDate.timeIntervalSinceReferenceDate.isFinite,
+              duration.isFinite,
+              duration > 0
+        else {
+            return nil
+        }
+        if reset > referenceDate { return reset }
+        let elapsed = referenceDate.timeIntervalSince(reset)
+        let intervals = floor(elapsed / duration) + 1
+        let candidate = reset.addingTimeInterval(intervals * duration)
+        return candidate.timeIntervalSinceReferenceDate.isFinite ? candidate : nil
+    }
+
+    private static func nextSundayAtEightPM(
+        after referenceDate: Date,
+        calendar: Calendar) -> Date?
+    {
+        var components = DateComponents()
+        components.weekday = 1
+        components.hour = 20
+        components.minute = 0
+        components.second = 0
+        return calendar.nextDate(
+            after: referenceDate,
+            matching: components,
+            matchingPolicy: .nextTime,
+            repeatedTimePolicy: .first,
+            direction: .forward)
     }
 
     public var isRefreshing: Bool {

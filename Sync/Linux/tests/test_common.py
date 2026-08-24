@@ -193,6 +193,18 @@ class CommonTests(unittest.TestCase):
 
     def test_validate_rejects_a_snapshot_the_mac_cannot_decode(self):
         value = envelope()
+        value["snapshot"]["today"].update({
+            "averageTimeToFirstTokenMs": 875.5,
+            "firstTokenSampleCount": 2,
+        })
+        self.assertIs(validate_envelope(value, path_device_id=DEVICE_ID), value)
+
+        value = envelope()
+        value["snapshot"]["today"]["averageTimeToFirstTokenMs"] = 875.5
+        with self.assertRaisesRegex(ValidationError, "inconsistent first-token metrics"):
+            validate_envelope(value, path_device_id=DEVICE_ID)
+
+        value = envelope()
         value["snapshot"]["today"] = {}
         with self.assertRaisesRegex(ValidationError, "snapshot.today.tokens"):
             validate_envelope(value, path_device_id=DEVICE_ID)

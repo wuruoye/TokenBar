@@ -53,7 +53,7 @@ struct ActivityDetailView: View {
             if let totals = self.rangeTotals {
                 ActivityTotalsBreakdown(
                     totals: totals,
-                    averageTPSText: totals.menuAverageTPSText,
+                    performanceText: totals.menuPerformanceText,
                     accentColor: self.accentColor)
             }
             Divider()
@@ -183,7 +183,7 @@ struct ActivityDetailView: View {
                             "\(day.sessionCount) sessions",
                             "\(day.requestCount) turns",
                             "Cache \(day.tokens.cachePercentageText)",
-                            day.menuAverageTPSText,
+                            day.menuPerformanceText,
                         ]
                         .compactMap(\.self)
                         .joined(separator: " · "))

@@ -83,7 +83,7 @@ In another shell, export the same token and helper path, then run:
 ./bin/tokenbar-sync-client download
 ```
 
-ActivitySnapshot versioning is independent of envelope `protocolVersion`. The collector requires a structurally decodable ActivitySnapshot with a positive integer `schemaVersion` and preserves it exactly; it does not hardcode v8, v9, or v10. This allows, for example, a Windows helper producing v8 and the current Mac helper producing v9 to share v2 transport or the protocol-v1 fallback.
+ActivitySnapshot versioning is independent of envelope `protocolVersion`. The collector requires a structurally decodable ActivitySnapshot with a positive integer `schemaVersion` and preserves it exactly; it does not hardcode v8, v9, v10, or v11. This allows helpers on different ActivitySnapshot revisions to share v2 transport or the protocol-v1 fallback.
 
 By default the client runs `tokenbar-helper --days 30 --statistics-timezone utc`. The explicit helper option changes the actual statistics calculation: message dates are normalized in the selected zone, the visible day window and `today` use that zone, weekly-reset timestamps are converted to scan dates in that zone, and `snapshot.timezone` is emitted consistently. Linux and Windows sync should use UTC. `--statistics-timezone local` (or `TOKENBAR_STATISTICS_TIMEZONE=local`) is available only for a deployment where all merging clients intentionally use local statistics.
 
