@@ -38,6 +38,7 @@ struct CodexPayload {
     forked_from_id: Option<String>,
     #[serde(rename = "type")]
     payload_type: Option<String>,
+    content: Option<Value>,
     model: Option<String>,
     model_name: Option<String>,
     model_info: Option<CodexModelInfo>,
@@ -207,6 +208,7 @@ struct CodexParseState {
     forked_child_inherited_baseline: Option<CodexTotals>,
     forked_child_inherited_reported_total: Option<i64>,
     pending_turn_start: bool,
+    accepts_response_item_user_messages: bool,
     pending_content_preview: Option<String>,
     pending_output_preview: Option<String>,
     forked_child_task_started_turn_ids: HashSet<String>,
@@ -376,6 +378,9 @@ fn parse_codex_reader<R: BufRead>(
                     && payload.payload_type.as_deref() == Some("task_started")
                 {
                     state.current_source_turn_id.clone_from(&payload.turn_id);
+                    state.pending_turn_start = true;
+                    state.accepts_response_item_user_messages = false;
+                    state.pending_content_preview = None;
                     handled = true;
                 }
 
@@ -386,6 +391,7 @@ fn parse_codex_reader<R: BufRead>(
                     state.current_model_first_response_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
+                    state.accepts_response_item_user_messages = true;
                     if let Some(model) = state.current_model.as_ref() {
                         flush_pending_model_messages(
                             &mut pending_model_messages,
@@ -400,16 +406,14 @@ fn parse_codex_reader<R: BufRead>(
                     && payload.payload_type.as_deref() == Some("user_message")
                 {
                     if codex_message_is_human_turn(payload.message.as_deref()) {
-                        state.pending_turn_start = true;
-                        state.current_model_request_start_ms =
-                            parsed_entry_timestamp.or(state.current_turn_start_ms);
-                        state.current_model_first_response_ms = None;
-                        state.current_model_response_end_ms = None;
-                        state.pending_next_model_request_start_ms = None;
-                        state.pending_content_preview = payload
-                            .message
-                            .as_deref()
-                            .and_then(content_preview_from_str);
+                        begin_human_turn(
+                            &mut state,
+                            parsed_entry_timestamp,
+                            payload
+                                .message
+                                .as_deref()
+                                .and_then(content_preview_from_str),
+                        );
                     }
                     handled = true;
                 }
@@ -442,11 +446,23 @@ fn parse_codex_reader<R: BufRead>(
                     }
                     if state.current_source_turn_id.as_deref() == payload.turn_id.as_deref() {
                         state.current_source_turn_id = None;
+                        state.accepts_response_item_user_messages = false;
                     }
                     handled = true;
                 }
 
                 if is_response_item {
+                    if state.accepts_response_item_user_messages {
+                        if let Some(preview) = codex_response_item_user_preview(&payload) {
+                            if codex_message_is_human_turn(Some(&preview)) {
+                                begin_human_turn(
+                                    &mut state,
+                                    parsed_entry_timestamp,
+                                    Some(preview),
+                                );
+                            }
+                        }
+                    }
                     if let Some(timestamp_ms) = parsed_entry_timestamp {
                         if response_item_is_tool_output || response_item_is_model_input {
                             state.pending_next_model_request_start_ms = Some(
@@ -712,6 +728,7 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.current_model_response_end_ms = None;
             state.pending_next_model_request_start_ms = None;
             state.current_source_turn_id = None;
+            state.accepts_response_item_user_messages = false;
         }
     }
     if let Some(provider) = payload.model_provider.as_ref() {
@@ -947,6 +964,32 @@ fn codex_response_item_is_model_input(payload: &CodexPayload) -> bool {
             .role
             .as_deref()
             .is_some_and(|role| role != "assistant")
+}
+
+fn codex_response_item_user_preview(payload: &CodexPayload) -> Option<String> {
+    (payload.payload_type.as_deref() == Some("message")
+        && payload.role.as_deref() == Some("user"))
+    .then(|| {
+        payload
+            .content
+            .as_ref()
+            .and_then(content_preview_from_value)
+    })
+    .flatten()
+}
+
+fn begin_human_turn(
+    state: &mut CodexParseState,
+    timestamp_ms: Option<i64>,
+    preview: Option<String>,
+) {
+    state.pending_turn_start = true;
+    state.current_turn_start_ms = timestamp_ms.or(state.current_turn_start_ms);
+    state.current_model_request_start_ms = state.current_turn_start_ms;
+    state.current_model_first_response_ms = None;
+    state.current_model_response_end_ms = None;
+    state.pending_next_model_request_start_ms = None;
+    state.pending_content_preview = preview;
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -1321,6 +1364,19 @@ mod tests {
         .to_string()
     }
 
+    fn response_user_message_line(timestamp: &str, text: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }
+        })
+        .to_string()
+    }
+
     #[test]
     fn homogeneous_fast_tier_backfills_usage_before_the_first_snapshot() {
         let lines = format!(
@@ -1472,6 +1528,52 @@ mod tests {
     }
 
     #[test]
+    fn response_item_user_messages_start_turns_after_context() {
+        let lines = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            response_user_message_line(
+                "2026-01-01T00:00:00.050Z",
+                "<recommended_plugins>injected</recommended_plugins>"
+            ),
+            r#"{"timestamp":"2026-01-01T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}"#,
+            response_user_message_line("2026-01-01T00:00:00.200Z", "First prompt"),
+            token_line("2026-01-01T00:00:01Z", (100, 20, 0, 5), (100, 20, 0, 5)),
+            response_user_message_line("2026-01-01T00:00:02Z", "Steer this turn"),
+            token_line("2026-01-01T00:00:03Z", (200, 40, 0, 10), (100, 20, 0, 5)),
+            r#"{"timestamp":"2026-01-01T00:00:03.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","time_to_first_token_ms":750}}"#,
+            r#"{"timestamp":"2026-01-01T01:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+            response_user_message_line(
+                "2026-01-01T01:00:00.050Z",
+                "# AGENTS.md instructions for /tmp/project"
+            ),
+            r#"{"timestamp":"2026-01-01T01:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.6-sol"}}"#,
+            response_user_message_line("2026-01-01T01:00:00.200Z", "Second task"),
+            token_line("2026-01-01T01:00:01Z", (300, 60, 0, 15), (100, 20, 0, 5))
+        );
+
+        let messages = parse(&lines);
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| message.is_turn_start));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content_preview.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("First prompt"), Some("Steer this turn"), Some("Second task")]
+        );
+        assert_eq!(messages[0].source_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(messages[1].source_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(messages[2].source_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(750));
+        assert_eq!(messages[1].time_to_first_token_ms, None);
+        assert_eq!(messages[0].duration_ms, Some(800));
+        assert_eq!(messages[1].duration_ms, Some(1_000));
+        assert_eq!(messages[2].duration_ms, Some(800));
+    }
+
+    #[test]
     fn cache_write_is_an_input_subcategory_without_double_counting() {
         let lines = format!(
             "{}\n{}\n{}\n",
@@ -1529,8 +1631,8 @@ mod tests {
         assert_eq!(messages[1].model_duration_ms, Some(2_490));
         assert_eq!(messages[0].time_to_first_token_ms, Some(500));
         assert_eq!(messages[1].time_to_first_token_ms, Some(990));
-        assert_eq!(messages[0].duration_ms, Some(53_010));
-        assert_eq!(messages[1].duration_ms, Some(115_510));
+        assert_eq!(messages[0].duration_ms, Some(52_010));
+        assert_eq!(messages[1].duration_ms, Some(114_510));
     }
 
     #[test]
@@ -1553,6 +1655,7 @@ mod tests {
         assert_eq!(messages[1].content_preview.as_deref(), Some("Steer"));
         assert!(messages[1].is_turn_start);
         assert_eq!(messages[1].model_duration_ms, Some(2_000));
+        assert_eq!(messages[1].duration_ms, Some(62_010));
     }
 
     #[test]
