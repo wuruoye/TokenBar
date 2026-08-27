@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 import TokenBarCore
 
 struct TokenBarSettingsView: View {
     @Bindable var settings: TokenBarSettings
+    @Bindable var loginItem: LoginItemController
     let memoryTelemetry: MemoryTelemetryController?
     let activitySync: ActivitySyncController?
     let syncNow: () -> Void
@@ -10,12 +12,14 @@ struct TokenBarSettingsView: View {
 
     init(
         settings: TokenBarSettings,
+        loginItem: LoginItemController = .shared,
         memoryTelemetry: MemoryTelemetryController? = nil,
         activitySync: ActivitySyncController? = nil,
         syncNow: @escaping () -> Void = {},
         testResetAnimation: @escaping () -> Void = {})
     {
         self.settings = settings
+        self.loginItem = loginItem
         self.memoryTelemetry = memoryTelemetry
         self.activitySync = activitySync
         self.syncNow = syncNow
@@ -36,6 +40,31 @@ struct TokenBarSettingsView: View {
                         }
                         .tag(theme)
                     }
+                }
+            }
+
+            Section("Startup") {
+                Toggle(
+                    "Launch TokenBar at login",
+                    isOn: Binding(
+                        get: { self.loginItem.isEnabled },
+                        set: { self.loginItem.setEnabled($0) }))
+                    .disabled(!self.loginItem.isAvailable)
+
+                Text(self.loginItem.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if self.loginItem.requiresApproval {
+                    Button("Open Login Items") {
+                        self.loginItem.openSystemSettings()
+                    }
+                }
+
+                if let errorMessage = self.loginItem.errorMessage {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
 
@@ -226,6 +255,7 @@ struct TokenBarSettingsView: View {
                 Spacer()
                 Button("Restore Defaults") {
                     self.settings.resetToDefaults()
+                    self.loginItem.setEnabled(false)
                 }
             }
         }
@@ -235,6 +265,14 @@ struct TokenBarSettingsView: View {
             height: self.activitySync == nil
                 ? (self.memoryTelemetry == nil ? 620 : 760)
                 : 820)
+        .onAppear {
+            self.loginItem.refresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification))
+        { _ in
+            self.loginItem.refresh()
+        }
     }
 
     private func syncStatusTitle(_ report: ActivitySyncReport) -> String {

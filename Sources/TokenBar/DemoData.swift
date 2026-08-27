@@ -859,8 +859,10 @@ enum DemoPreviewRenderer {
         let activitySync = ActivitySyncController(
             settings: .shared,
             credentials: DemoActivitySyncCredentialStore())
+        let loginItem = LoginItemController(service: DemoLoginItemService())
         let content = TokenBarSettingsView(
             settings: .shared,
+            loginItem: loginItem,
             activitySync: activitySync)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .light)
@@ -957,5 +959,20 @@ private extension Date {
         let components = Calendar.current.dateComponents([.hour, .minute], from: self)
         return String(format: "%02d:%02d", components.hour ?? 0, components.minute ?? 0)
     }
+}
+
+@MainActor
+private final class DemoLoginItemService: LoginItemServicing {
+    var status = LoginItemServiceStatus.notRegistered
+
+    func register() {
+        self.status = .enabled
+    }
+
+    func unregister() {
+        self.status = .notRegistered
+    }
+
+    func openSystemSettings() {}
 }
 #endif

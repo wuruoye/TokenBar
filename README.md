@@ -43,6 +43,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Optionally combine privacy-redacted activity snapshots from Windows, Linux, and other Macs through a self-hosted HTTPS sync service; remote sessions are labeled by device and stay read-only.
+- Optionally launch TokenBar automatically when you sign in to macOS, with approval handled through the system Login Items settings.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
 
 ## Screenshots

@@ -4,16 +4,21 @@ import TokenBarCore
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
+    private let loginItem: LoginItemController
+
     init(
         settings: TokenBarSettings = .shared,
+        loginItem: LoginItemController = .shared,
         memoryTelemetry: MemoryTelemetryController? = nil,
         activitySync: ActivitySyncController? = nil,
         syncNow: @escaping () -> Void = {},
         testResetAnimation: @escaping () -> Void = {})
     {
+        self.loginItem = loginItem
         let hostingController = NSHostingController(
             rootView: TokenBarSettingsView(
                 settings: settings,
+                loginItem: loginItem,
                 memoryTelemetry: memoryTelemetry,
                 activitySync: activitySync,
                 syncNow: syncNow,
@@ -33,6 +38,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func show() {
+        self.loginItem.refresh()
         if self.window?.isVisible != true {
             self.window?.center()
         }
