@@ -191,6 +191,7 @@ struct DashboardOverviewContentView: View {
             TodaySummarySection(
                 state: self.model.visibleActivity,
                 weeklyQuotaUsage: self.model.weeklyQuotaUsageToday(for: platform),
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
                 .frame(height: DashboardOverviewView.todayHeight)
             Divider().padding(.horizontal, 12)
@@ -641,6 +642,7 @@ private struct WeeklyResetActivitySection: View {
 private struct TodaySummarySection: View {
     let state: DashboardSourceState<ActivitySnapshot>
     let weeklyQuotaUsage: WeeklyQuotaDailyUsage?
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
@@ -650,10 +652,11 @@ private struct TodaySummarySection: View {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
                     if let weeklyQuotaUsage {
-                        Text("· Weekly quota \(weeklyQuotaUsage.menuValueText)")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .help(weeklyQuotaUsage.menuHelpText)
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor,
+                            leadingSeparator: true)
                     }
                     Spacer()
                     Text(totals.tokens.total.compactCount)
@@ -677,10 +680,11 @@ private struct TodaySummarySection: View {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
                     if let weeklyQuotaUsage {
-                        Text("· Weekly quota \(weeklyQuotaUsage.menuValueText)")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .help(weeklyQuotaUsage.menuHelpText)
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor,
+                            leadingSeparator: true)
                     }
                     Spacer()
                     InlinePlaceholder(text: self.state.isRefreshing ? "Scanning activity…" : "No activity today")
@@ -690,6 +694,51 @@ private struct TodaySummarySection: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+}
+
+struct WeeklyQuotaUsageLabel: View {
+    let usage: WeeklyQuotaDailyUsage
+    let usesWeekdayWeeklyPacing: Bool
+    let accentColor: Color
+    var leadingSeparator = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(self.leadingSeparator ? "· Weekly quota" : "Weekly quota")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Text(self.usage.menuValueText)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(self.tint)
+        }
+        .help(self.helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Weekly quota used today, \(self.usage.menuValueText) of the weekly allowance")
+    }
+
+    // 匀速消耗周额度时单日应占的百分点：按 5 个工作日或 7 天平摊
+    private var evenDailyShare: Double {
+        100 / (self.usesWeekdayWeeklyPacing ? 5.0 : 7.0)
+    }
+
+    private var tint: Color {
+        switch self.usage.usedPercentagePoints / self.evenDailyShare {
+        case ..<0.85: TokenBarPalette.mint
+        case ..<1.25: self.accentColor
+        case ..<2: Color.orange
+        default: Color.red
+        }
+    }
+
+    private var helpText: String {
+        let share = self.evenDailyShare.formatted(.number.precision(.fractionLength(0 ... 1)))
+        let pace = self.usesWeekdayWeeklyPacing
+            ? " An even pace is about \(share)pp per weekday."
+            : " An even pace is about \(share)pp per day."
+        return self.usage.menuHelpText + pace
     }
 }
 

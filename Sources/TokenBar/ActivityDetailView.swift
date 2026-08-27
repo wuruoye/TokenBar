@@ -7,6 +7,7 @@ struct ActivityDetailView: View {
     static let preferredHeight: CGFloat = 540
 
     @Bindable var model: DashboardModel
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     @State private var selectedDate: String?
@@ -201,10 +202,10 @@ struct ActivityDetailView: View {
                             .foregroundStyle(TokenBarVisualStyle.costAccentColor)
                     }
                     if let weeklyQuotaUsage {
-                        Text("Weekly quota \(weeklyQuotaUsage.menuValueText)")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .help(weeklyQuotaUsage.menuHelpText)
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor)
                     }
                 }
             }

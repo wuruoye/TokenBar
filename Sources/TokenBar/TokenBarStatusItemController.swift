@@ -648,7 +648,10 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         menu.delegate = self
         menu.persistentActionDelegate = self
 
-        let detail = ActivityDetailView(model: self.model, accentColor: accentColor)
+        let detail = ActivityDetailView(
+            model: self.model,
+            usesWeekdayWeeklyPacing: self.settings.usesWeekdayWeeklyPacing,
+            accentColor: accentColor)
             .frame(
                 width: ActivityDetailView.preferredWidth,
                 height: ActivityDetailView.preferredHeight,

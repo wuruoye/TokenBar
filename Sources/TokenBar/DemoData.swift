@@ -758,7 +758,10 @@ enum DemoPreviewRenderer {
     }
 
     static func renderActivityDetail(model: DashboardModel, path: String) throws {
-        let content = ActivityDetailView(model: model, accentColor: .purple)
+        let content = ActivityDetailView(
+            model: model,
+            usesWeekdayWeeklyPacing: false,
+            accentColor: .purple)
             .frame(
                 width: ActivityDetailView.preferredWidth,
                 height: ActivityDetailView.preferredHeight)
