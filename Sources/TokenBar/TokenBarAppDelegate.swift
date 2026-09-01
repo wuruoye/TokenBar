@@ -5,6 +5,7 @@ import TokenBarCore
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let memoryTelemetryController = MemoryTelemetryController()
     let activitySyncController = ActivitySyncController(settings: .shared)
+    private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
         #if DEBUG
@@ -23,6 +24,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                     settings?.monitorsCodexMemory == true ? memoryDatabaseURL : nil
                 }
             },
+            openAIPricingCatalog: self.openAIPricingCatalog,
             anthropicPricingCatalog: self.anthropicPricingCatalog)
         let synchronizedActivity = SynchronizedActivityService(
             local: localActivity,

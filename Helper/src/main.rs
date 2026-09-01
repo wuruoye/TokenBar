@@ -25,7 +25,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -35,6 +35,7 @@ struct SnapshotConfig {
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
     grok_weekly_reset_ms: Option<i64>,
+    openai_pricing_markdown: Option<PathBuf>,
     anthropic_pricing_markdown: Option<PathBuf>,
     memory_database: Option<PathBuf>,
 }
@@ -48,6 +49,7 @@ impl Default for SnapshotConfig {
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
             grok_weekly_reset_ms: None,
+            openai_pricing_markdown: None,
             anthropic_pricing_markdown: None,
             memory_database: None,
         }
@@ -144,7 +146,14 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let use_env_roots = home_dir.is_none();
 
-    let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config));
+    let fast_pricing_basis = codex_fast_pricing_basis(&config);
+    let pricing = config
+        .openai_pricing_markdown
+        .as_deref()
+        .and_then(|path| {
+            CodexPricing::from_official_markdown_file(path, fast_pricing_basis).ok()
+        })
+        .unwrap_or_else(|| CodexPricing::with_fast_pricing(fast_pricing_basis));
     let mut codex_messages = parse_local_codex_messages(
         LocalParseOptions {
             home_dir: home_dir.clone(),
@@ -361,6 +370,12 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                 let value = args.next().ok_or("--memory-database requires a path")?;
                 config.memory_database = Some(PathBuf::from(value));
             }
+            Some("--openai-pricing-markdown") => {
+                let value = args
+                    .next()
+                    .ok_or("--openai-pricing-markdown requires a path")?;
+                config.openai_pricing_markdown = Some(PathBuf::from(value));
+            }
             Some("--anthropic-pricing-markdown") => {
                 let value = args
                     .next()
@@ -522,6 +537,8 @@ mod tests {
             OsString::from("1799000000000"),
             OsString::from("--grok-weekly-reset-ms"),
             OsString::from("1798000000000"),
+            OsString::from("--openai-pricing-markdown"),
+            OsString::from("/tmp/openai-pricing.md"),
             OsString::from("--anthropic-pricing-markdown"),
             OsString::from("/tmp/anthropic-pricing.md"),
         ])
@@ -536,6 +553,7 @@ mod tests {
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
+                openai_pricing_markdown: Some(PathBuf::from("/tmp/openai-pricing.md")),
                 anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
                 memory_database: None,
             })

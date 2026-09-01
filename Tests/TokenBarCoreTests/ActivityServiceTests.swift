@@ -48,6 +48,18 @@ private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
     }
 }
 
+private actor StubOpenAIPricingCatalog: OpenAIPricingCatalogUpdating {
+    let fileURL: URL?
+
+    init(fileURL: URL?) {
+        self.fileURL = fileURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.fileURL
+    }
+}
+
 private actor MemoryDatabaseURLPreference {
     var value: URL?
 
@@ -214,6 +226,24 @@ struct ActivityServiceTests {
         #expect(await runner.arguments == [
             "--statistics-timezone", "utc",
             "--anthropic-pricing-markdown", "/tmp/anthropic-pricing.md",
+        ])
+    }
+
+    @Test("passes the refreshed OpenAI pricing catalog to the helper")
+    func passesOpenAIPricingCatalog() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let catalog = StubOpenAIPricingCatalog(
+            fileURL: URL(fileURLWithPath: "/tmp/openai-pricing.md"))
+        let service = ActivityService(
+            openAIPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+
+        #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
+            "--openai-pricing-markdown", "/tmp/openai-pricing.md",
         ])
     }
 

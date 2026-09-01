@@ -84,6 +84,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let environment: [String: String]
     private let timeout: TimeInterval
     private let memoryDatabaseURLProvider: @Sendable () async -> URL?
+    private let openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)?
     private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
     private let runner: any ActivityHelperRunning
@@ -93,6 +94,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
+        openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeout: TimeInterval = 120,
@@ -100,6 +102,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     {
         self.arguments = arguments
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
+        self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
@@ -113,6 +116,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
+        openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
         timeout: TimeInterval = 120,
@@ -121,6 +125,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     {
         self.arguments = arguments
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
+        self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.environment = environment
         self.timeout = timeout
@@ -145,13 +150,16 @@ public struct ActivityService: ActivityProviding, Sendable {
     {
         let helperURL = try self.resolveHelper()
         let memoryDatabaseURL = await self.memoryDatabaseURLProvider()
-        let anthropicPricingURL = await self.anthropicPricingCatalog?.refreshIfNeeded()
+        async let openAIPricingURL = self.openAIPricingCatalog?.refreshIfNeeded()
+        async let anthropicPricingURL = self.anthropicPricingCatalog?.refreshIfNeeded()
+        let pricingURLs = await (openAIPricingURL, anthropicPricingURL)
         let data = try await self.runner.run(
             executableURL: helperURL,
             arguments: self.helperArguments(
                 sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
                 memoryDatabaseURL: memoryDatabaseURL,
-                anthropicPricingURL: anthropicPricingURL,
+                openAIPricingURL: pricingURLs.0,
+                anthropicPricingURL: pricingURLs.1,
                 statisticsTimeZone: statisticsTimeZone),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
@@ -168,6 +176,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     private func helperArguments(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         memoryDatabaseURL: URL?,
+        openAIPricingURL: URL?,
         anthropicPricingURL: URL?,
         statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
@@ -184,6 +193,9 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
         if let memoryDatabaseURL {
             arguments += ["--memory-database", memoryDatabaseURL.path]
+        }
+        if let openAIPricingURL {
+            arguments += ["--openai-pricing-markdown", openAIPricingURL.path]
         }
         if let anthropicPricingURL {
             arguments += ["--anthropic-pricing-markdown", anthropicPricingURL.path]
