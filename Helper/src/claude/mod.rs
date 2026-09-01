@@ -227,11 +227,11 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         };
 
-        if entry
+        let is_sidechain = entry
             .get("isSidechain")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if is_sidechain {
             is_subagent = true;
             if let Some(parent) = entry
                 .get("sessionId")
@@ -243,6 +243,14 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             if agent.is_none() {
                 agent = resolve_agent_name(path, &entry);
             }
+        }
+        if !is_sidechain
+            && entry
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|session_id| session_id != physical_session_id)
+        {
+            continue;
         }
         if let Some(cwd) = entry
             .get("cwd")
@@ -695,6 +703,91 @@ mod tests {
         assert_eq!(messages[0].output_preview.as_deref(), Some("Done"));
         assert!(messages[0].is_turn_start);
         assert!(!messages[0].is_subagent);
+    }
+
+    #[test]
+    fn main_fork_skips_parent_replay() {
+        let directory = temporary_path("main-fork");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("child.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:00Z\",\"message\":{\"content\":\"Parent prompt\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:01Z\",\"requestId\":\"parent-request\",\"message\":{\"id\":\"parent-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"child\",\"timestamp\":\"2026-07-24T10:01:00Z\",\"message\":{\"content\":\"Child prompt\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"child\",\"timestamp\":\"2026-07-24T10:01:01Z\",\"requestId\":\"child-request\",\"message\":{\"id\":\"child-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_claude_file(&path);
+        fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "child");
+        assert_eq!(messages[0].physical_session_id.as_deref(), Some("child"));
+        assert_eq!(messages[0].tokens.input, 20);
+        assert_eq!(messages[0].content_preview.as_deref(), Some("Child prompt"));
+        assert!(!messages[0].is_subagent);
+    }
+
+    #[test]
+    fn multiple_forks_keep_only_their_own_usage() {
+        let home = temporary_path("fork-family");
+        let directory = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&directory).unwrap();
+        let parent_turn = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:00Z\",\"message\":{\"content\":\"Parent prompt\"}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:01Z\",\"requestId\":\"parent-request\",\"message\":{\"id\":\"parent-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n"
+        );
+        fs::write(directory.join("parent.jsonl"), parent_turn).unwrap();
+        fs::write(
+            directory.join("child-a.jsonl"),
+            format!(
+                "{parent_turn}{child_turn}",
+                child_turn = concat!(
+                    "{\"type\":\"user\",\"sessionId\":\"child-a\",\"timestamp\":\"2026-07-24T10:01:00Z\",\"message\":{\"content\":\"Child A prompt\"}}\n",
+                    "{\"type\":\"assistant\",\"sessionId\":\"child-a\",\"timestamp\":\"2026-07-24T10:01:01Z\",\"requestId\":\"child-a-request\",\"message\":{\"id\":\"child-a-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2}}}\n"
+                )
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("child-b.jsonl"),
+            format!(
+                "{parent_turn}{child_turn}",
+                child_turn = concat!(
+                    "{\"type\":\"user\",\"sessionId\":\"child-b\",\"timestamp\":\"2026-07-24T10:02:00Z\",\"message\":{\"content\":\"Child B prompt\"}}\n",
+                    "{\"type\":\"assistant\",\"sessionId\":\"child-b\",\"timestamp\":\"2026-07-24T10:02:01Z\",\"requestId\":\"child-b-request\",\"message\":{\"id\":\"child-b-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":30,\"output_tokens\":3}}}\n"
+                )
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_local_claude_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                ..Default::default()
+            },
+            &AnthropicPricing::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(home).unwrap();
+
+        assert_eq!(messages.len(), 3);
+        let inputs = messages
+            .iter()
+            .map(|message| (message.session_id.as_str(), message.tokens.input))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(inputs.get("parent"), Some(&10));
+        assert_eq!(inputs.get("child-a"), Some(&20));
+        assert_eq!(inputs.get("child-b"), Some(&30));
+        assert!(messages.iter().all(|message| {
+            message.physical_session_id.as_deref() == Some(message.session_id.as_str())
+                && !message.is_subagent
+        }));
     }
 
     #[test]
