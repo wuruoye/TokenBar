@@ -572,6 +572,15 @@ public final class DashboardModel {
         }
     }
 
+    public func sessions(on date: String) async throws -> [SessionSummary] {
+        if self.activitySnapshot?.days.map(\.date).max() == date {
+            return self.activitySnapshot?.sessions ?? []
+        }
+        return try await self.activityService.fetchSessions(
+            on: date,
+            statisticsTimeZone: self.statisticsTimeZone)
+    }
+
     public func refreshActivity() async {
         await self.startActivityRefresh(restarting: false)
     }

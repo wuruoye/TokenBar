@@ -9,8 +9,23 @@ struct ActivityDetailView: View {
     @Bindable var model: DashboardModel
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
+    let onSelectDate: (String) -> Void
 
     @State private var selectedDate: String?
+
+    init(
+        model: DashboardModel,
+        usesWeekdayWeeklyPacing: Bool,
+        accentColor: Color,
+        initialSelectedDate: String? = nil,
+        onSelectDate: @escaping (String) -> Void = { _ in })
+    {
+        self.model = model
+        self.usesWeekdayWeeklyPacing = usesWeekdayWeeklyPacing
+        self.accentColor = accentColor
+        self._selectedDate = State(initialValue: initialSelectedDate)
+        self.onSelectDate = onSelectDate
+    }
 
     private var days: [DailySummary] {
         Array((self.model.visibleActivitySnapshot?.days ?? []).sorted { $0.date < $1.date }.suffix(30))
@@ -73,6 +88,11 @@ struct ActivityDetailView: View {
             height: Self.preferredHeight,
             alignment: .topLeading)
         .background(Color.clear)
+        .onChange(of: self.selectedDay?.date, initial: true) { _, date in
+            if let date {
+                self.onSelectDate(date)
+            }
+        }
     }
 
     private var header: some View {

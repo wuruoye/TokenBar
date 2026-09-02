@@ -710,6 +710,15 @@ public struct SynchronizedActivityService: ActivityProviding, Sendable {
         return await self.synchronize(local)
     }
 
+    public func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        try await self.local.fetchSessions(
+            on: date,
+            statisticsTimeZone: statisticsTimeZone)
+    }
+
     private func synchronize(_ local: ActivitySnapshot) async -> ActivitySnapshot {
         guard let configuration = await self.configuration() else {
             return local

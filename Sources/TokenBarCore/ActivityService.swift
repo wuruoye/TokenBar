@@ -8,6 +8,10 @@ public protocol ActivityProviding: Sendable {
     func fetchActivity(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+
+    func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
 }
 
 public extension ActivityProviding {
@@ -30,6 +34,17 @@ public extension ActivityProviding {
         try await self.fetchActivity(
             sinceWeeklyResetAt: sinceWeeklyResetAtByPlatform[.codex],
             statisticsTimeZone: statisticsTimeZone)
+    }
+
+    func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        let snapshot = try await self.fetchActivity(
+            sinceWeeklyResetAtByPlatform: [:],
+            statisticsTimeZone: statisticsTimeZone)
+        guard snapshot.days.map(\.date).max() == date else { return [] }
+        return snapshot.sessions
     }
 }
 
@@ -173,14 +188,45 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
     }
 
+    public func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        let helperURL = try self.resolveHelper()
+        async let openAIPricingURL = self.openAIPricingCatalog?.refreshIfNeeded()
+        async let anthropicPricingURL = self.anthropicPricingCatalog?.refreshIfNeeded()
+        let pricingURLs = await (openAIPricingURL, anthropicPricingURL)
+        let data = try await self.runner.run(
+            executableURL: helperURL,
+            arguments: self.helperArguments(
+                sinceWeeklyResetAtByPlatform: [:],
+                memoryDatabaseURL: nil,
+                openAIPricingURL: pricingURLs.0,
+                anthropicPricingURL: pricingURLs.1,
+                snapshotArguments: ["--days", "1", "--end-date", date],
+                statisticsTimeZone: statisticsTimeZone),
+            environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
+            timeout: self.timeout)
+        guard !data.isEmpty else {
+            throw ActivityServiceError.emptyOutput
+        }
+        do {
+            return try JSONDecoder().decode(ActivitySnapshot.self, from: data).sessions
+        } catch {
+            throw ActivityServiceError.invalidOutput(error.localizedDescription)
+        }
+    }
+
     private func helperArguments(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         memoryDatabaseURL: URL?,
         openAIPricingURL: URL?,
         anthropicPricingURL: URL?,
+        snapshotArguments: [String] = [],
         statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
         var arguments = self.arguments
+        arguments += snapshotArguments
         arguments += ["--statistics-timezone", statisticsTimeZone.rawValue]
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.codex]) {
             arguments += ["--weekly-reset-ms", String(value)]

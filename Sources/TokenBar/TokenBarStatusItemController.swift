@@ -13,6 +13,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let collapsedLimit: Int
     }
 
+    private struct SessionHistoryKey: Hashable {
+        let date: String
+        let statisticsTimeZone: String
+    }
+
     private struct SyncSettingsSignature: Equatable {
         let enabled: Bool
         let serverURL: String
@@ -45,7 +50,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var renderedSessionProjection: RenderedSessionProjection?
     private var renderedSessions: [SessionSummary] = []
     private var renderedMenuScope: DashboardScope?
-    private var submenuSessionIDs: [ObjectIdentifier: String] = [:]
+    private var submenuSessions: [ObjectIdentifier: SessionSummary] = [:]
     private var requestDetailMenus: [ObjectIdentifier: RequestDetailMenuContext] = [:]
     private var requestDetailTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var requestDetailCache: [String: RequestDetail] = [:]
@@ -53,10 +58,24 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var sessionExpansionItem: NSMenuItem?
     private var sessionExpansionView: PersistentMenuActionRowView?
     private var sessionEmptyItem: NSMenuItem?
+    private var activityDetailItem: NSMenuItem?
+    private var activitySessionMenu: TokenBarMenu?
+    private var activitySessionItems: [NSMenuItem] = []
+    private var renderedActivitySessionProjection: RenderedSessionProjection?
+    private var renderedActivitySessions: [SessionSummary] = []
+    private var activitySessionExpansionItem: NSMenuItem?
+    private var activitySessionExpansionView: PersistentMenuActionRowView?
+    private var activitySessionEmptyItem: NSMenuItem?
+    private var selectedSessionDate: String?
+    private var sessionHistory: [SessionHistoryKey: [SessionSummary]] = [:]
+    private var sessionHistoryErrors: [SessionHistoryKey: String] = [:]
+    private var loadingSessionHistoryKey: SessionHistoryKey?
+    private var sessionHistoryTask: Task<Void, Never>?
     private var memoryItem: NSMenuItem?
     private var overviewHost: FixedMenuHostingView?
     private var highlightedRows: [ObjectIdentifier: any TokenMenuHighlighting] = [:]
     private var showsAllSessions = false
+    private var showsAllActivitySessions = false
     private var isRootMenuOpen = false
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
@@ -122,6 +141,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     func tearDown() {
         self.startupTask?.cancel()
         self.startupTask = nil
+        self.sessionHistoryTask?.cancel()
+        self.sessionHistoryTask = nil
         self.removeShortcutMonitor()
         self.discardRequestDetailMenus(in: self.rootMenu)
         self.rootMenu.delegate = nil
@@ -150,8 +171,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             return
         }
 
-        guard let sessionID = self.submenuSessionIDs[menuID] else { return }
-        self.rebuildRequestMenu(menu, sessionScopedID: sessionID)
+        guard let session = self.submenuSessions[menuID] else { return }
+        self.rebuildRequestMenu(menu, session: session)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -195,7 +216,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     nonisolated func performPersistentRefresh() {
         Task { @MainActor [weak self] in
-            await self?.model.refreshAll()
+            await self?.refreshAllIncludingSelectedSessions()
         }
     }
 
@@ -381,6 +402,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 }
                 self.model.updateBackgroundRefreshInterval(self.settings.backgroundRefreshDuration)
                 if self.model.updateStatisticsTimeZone(self.settings.statisticsTimeZone) {
+                    self.resetSessionHistory()
                     Task { @MainActor [weak self] in
                         await self?.model.refreshActivity()
                     }
@@ -435,6 +457,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
             self.updateMemoryVisibility(scope: scope)
             self.updateSessionProjectionAndVisibility(scope: scope)
+            self.updateActivitySessionProjectionAndVisibility(scope: scope)
             self.model.scope = scope
             window?.layoutIfNeeded()
         }
@@ -454,9 +477,17 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.sessionExpansionItem = nil
         self.sessionExpansionView = nil
         self.sessionEmptyItem = nil
+        self.activityDetailItem = nil
+        self.activitySessionMenu = nil
+        self.activitySessionItems.removeAll()
+        self.renderedActivitySessionProjection = nil
+        self.renderedActivitySessions.removeAll()
+        self.activitySessionExpansionItem = nil
+        self.activitySessionExpansionView = nil
+        self.activitySessionEmptyItem = nil
         self.memoryItem = nil
         self.overviewHost = nil
-        self.submenuSessionIDs.removeAll()
+        self.submenuSessions.removeAll()
 
         let accentColor = self.settings.theme.color
         let headerHeight = DashboardOverviewView.headerHeight(
@@ -642,6 +673,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func makeActivityDetailMenu(accentColor: Color) -> TokenBarMenu {
+        self.normalizeSelectedSessionDate()
         let menu = TokenBarMenu(title: "Activity Detail")
         menu.autoenablesItems = false
         menu.minimumWidth = ActivityDetailView.preferredWidth
@@ -651,7 +683,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let detail = ActivityDetailView(
             model: self.model,
             usesWeekdayWeeklyPacing: self.settings.usesWeekdayWeeklyPacing,
-            accentColor: accentColor)
+            accentColor: accentColor,
+            initialSelectedDate: self.selectedSessionDate,
+            onSelectDate: { [weak self] date in
+                self?.selectActivityDate(date)
+            })
             .frame(
                 width: ActivityDetailView.preferredWidth,
                 height: ActivityDetailView.preferredHeight,
@@ -667,8 +703,83 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         item.target = self
         item.isEnabled = true
         item.view = host
+
+        let sessionMenu = TokenBarMenu(title: self.activitySessionHeaderTitle)
+        sessionMenu.autoenablesItems = false
+        sessionMenu.minimumWidth = Self.menuWidth
+        sessionMenu.delegate = self
+        sessionMenu.persistentActionDelegate = self
+        item.submenu = sessionMenu
+        self.activityDetailItem = item
+        self.activitySessionMenu = sessionMenu
         menu.addItem(item)
+        self.addActivitySessionItems(to: sessionMenu)
         return menu
+    }
+
+    private func addActivitySessionItems(to menu: TokenBarMenu) {
+        let empty = NSMenuItem(title: "No sessions", action: nil, keyEquivalent: "")
+        empty.isEnabled = false
+        self.activitySessionEmptyItem = empty
+        menu.addItem(empty)
+
+        let maximumDailySessionCount = self.model.activitySnapshot?
+            .sourceSnapshots
+            .flatMap(\.days)
+            .map(\.sessionCount)
+            .max()
+            ?? self.model.activitySnapshot?.days.map(\.sessionCount).max()
+            ?? 0
+        let slotCount = max(self.settings.recentSessionLimit, maximumDailySessionCount)
+        for _ in 0 ..< slotCount {
+            let item = self.makeSessionItem()
+            item.isHidden = true
+            self.activitySessionItems.append(item)
+            menu.addItem(item)
+        }
+
+        let expansion = PersistentMenuActionRowView(
+            width: Self.menuWidth,
+            title: "Show More…",
+            systemImageName: "chevron.down",
+            accessibilityHelp: "Expand or collapse sessions for the selected Activity date without closing the menu.")
+        expansion.onActivate = { [weak self] in
+            self?.toggleActivitySessionExpansion()
+        }
+        let expansionItem = NSMenuItem(title: "Show More…", action: nil, keyEquivalent: "")
+        expansionItem.isEnabled = true
+        expansionItem.isHidden = true
+        expansionItem.view = expansion
+        self.activitySessionExpansionItem = expansionItem
+        self.activitySessionExpansionView = expansion
+        menu.addItem(expansionItem)
+
+        self.updateActivitySessionProjectionAndVisibility()
+        self.loadSessionHistoryIfNeeded()
+    }
+
+    private func toggleActivitySessionExpansion() {
+        guard let projection = self.renderedActivitySessionProjection else { return }
+        self.showsAllActivitySessions.toggle()
+        for (index, item) in self.activitySessionItems.enumerated() {
+            item.isHidden = index >= projection.ids.count
+                || (!self.showsAllActivitySessions && index >= projection.collapsedLimit)
+        }
+        let title = self.activitySessionExpansionTitle(projection: projection)
+        self.activitySessionExpansionItem?.title = title
+        self.activitySessionExpansionView?.configure(
+            title: title,
+            systemImageName: self.showsAllActivitySessions ? "chevron.up" : "chevron.down",
+            accessibilityHelp: "Expand or collapse sessions for the selected Activity date without closing the menu.")
+    }
+
+    private func activitySessionExpansionTitle(
+        projection: RenderedSessionProjection) -> String
+    {
+        if self.showsAllActivitySessions {
+            return "Show First \(projection.collapsedLimit)"
+        }
+        return "Show \(max(0, projection.ids.count - projection.collapsedLimit)) More…"
     }
 
     private func makeMemoryDetailMenu(accentColor: Color) -> TokenBarMenu {
@@ -735,11 +846,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         var submenu = item.submenu
         if let current = submenu {
             let menuID = ObjectIdentifier(current)
-            if let previousSessionID = self.submenuSessionIDs[menuID],
-               previousSessionID != sessionID
+            if let previousSession = self.submenuSessions[menuID],
+               previousSession.platformScopedID != sessionID
             {
                 self.discardRequestDetailMenus(in: current)
-                self.submenuSessionIDs.removeValue(forKey: menuID)
+                self.submenuSessions.removeValue(forKey: menuID)
                 self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
                 current.delegate = nil
                 (current as? TokenBarMenu)?.persistentActionDelegate = nil
@@ -754,14 +865,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
         guard let submenu else { return }
         submenu.title = session.menuDisplayTitle
-        self.submenuSessionIDs[ObjectIdentifier(submenu)] = sessionID
+        self.submenuSessions[ObjectIdentifier(submenu)] = session
     }
 
     private func unbindSessionSubmenu(_ item: NSMenuItem) {
         guard let submenu = item.submenu else { return }
         self.discardRequestDetailMenus(in: submenu)
         let menuID = ObjectIdentifier(submenu)
-        self.submenuSessionIDs.removeValue(forKey: menuID)
+        self.submenuSessions.removeValue(forKey: menuID)
         self.highlightedRows.removeValue(forKey: menuID)?.setMenuHighlighted(false)
         submenu.delegate = nil
         (submenu as? TokenBarMenu)?.persistentActionDelegate = nil
@@ -799,6 +910,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func updateVisibleSessionItems() {
         self.updateSessionProjectionAndVisibility()
+        self.updateActivitySessionProjectionAndVisibility()
+        self.loadSessionHistoryIfNeeded()
     }
 
     private func updateSessionProjectionAndVisibility(scope: DashboardScope? = nil) {
@@ -807,6 +920,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let visibleSessions = self.model.activitySnapshot?
             .scoped(to: scope.platform)
             .sessionMenu(limit: nil).visibleSessions ?? []
+        self.ensureSessionItemCapacity(visibleSessions.count)
         let projection = RenderedSessionProjection(
             ids: visibleSessions.map(\.platformScopedID),
             collapsedLimit: self.settings.recentSessionLimit)
@@ -835,6 +949,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         if self.sessionEmptyItem?.title != emptyTitle {
             self.sessionEmptyItem?.title = emptyTitle
         }
+        self.sessionEmptyItem?.toolTip = nil
         if self.sessionEmptyItem?.isHidden != hasSessions {
             self.sessionEmptyItem?.isHidden = hasSessions
         }
@@ -853,6 +968,242 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             accessibilityHelp: "Expand or collapse recent sessions without closing the menu.")
     }
 
+    private var availableSessionDates: [String] {
+        Array(Set(self.model.activitySnapshot?.days.map(\.date) ?? [])).sorted()
+    }
+
+    private var latestSessionDate: String? {
+        self.availableSessionDates.last
+    }
+
+    private var selectedSessionHistoryKey: SessionHistoryKey? {
+        guard let selectedSessionDate else { return nil }
+        return SessionHistoryKey(
+            date: selectedSessionDate,
+            statisticsTimeZone: self.settings.statisticsTimeZone.rawValue)
+    }
+
+    private var selectedSessionHistoryError: String? {
+        guard let key = self.selectedSessionHistoryKey else { return nil }
+        return self.sessionHistoryErrors[key]
+    }
+
+    private func normalizeSelectedSessionDate() {
+        let dates = self.availableSessionDates
+        guard !dates.isEmpty else {
+            self.selectedSessionDate = nil
+            return
+        }
+        if let selectedSessionDate, dates.contains(selectedSessionDate) {
+            return
+        }
+        self.selectedSessionDate = dates.last
+    }
+
+    private func activitySessionsForSelectedDate(scope: DashboardScope) -> [SessionSummary] {
+        guard let selectedSessionDate else { return [] }
+        let sessions: [SessionSummary]
+        if selectedSessionDate == self.latestSessionDate {
+            sessions = self.model.activitySnapshot?.sessions ?? []
+        } else if let key = self.selectedSessionHistoryKey {
+            sessions = self.sessionHistory[key] ?? []
+        } else {
+            sessions = []
+        }
+        return sessions
+            .filter { $0.platformID == scope.platform }
+            .sorted {
+                if $0.endedAtMs != $1.endedAtMs {
+                    return $0.endedAtMs > $1.endedAtMs
+                }
+                return $0.platformScopedID < $1.platformScopedID
+            }
+    }
+
+    private var activitySessionHeaderTitle: String {
+        guard let selectedSessionDate else { return "Sessions" }
+        if selectedSessionDate == self.latestSessionDate {
+            return "Sessions · Today"
+        }
+        return "Sessions · \(selectedSessionDate)"
+    }
+
+    private func activitySessionEmptyTitle(scope: DashboardScope) -> String {
+        guard let selectedSessionDate else {
+            return "No \(scope.displayName) session dates available"
+        }
+        if self.loadingSessionHistoryKey == self.selectedSessionHistoryKey {
+            return "Loading \(scope.displayName) sessions for \(selectedSessionDate)…"
+        }
+        if self.selectedSessionHistoryError != nil {
+            return "Couldn’t load \(scope.displayName) sessions for \(selectedSessionDate)"
+        }
+        if selectedSessionDate == self.latestSessionDate {
+            return "No \(scope.displayName) sessions today"
+        }
+        return "No \(scope.displayName) sessions on \(selectedSessionDate)"
+    }
+
+    private func updateActivitySessionProjectionAndVisibility(
+        scope: DashboardScope? = nil)
+    {
+        guard self.activitySessionMenu != nil else { return }
+        let scope = scope ?? self.model.scope
+        self.normalizeSelectedSessionDate()
+        let visibleSessions = self.activitySessionsForSelectedDate(scope: scope)
+        self.ensureActivitySessionItemCapacity(visibleSessions.count)
+        let projection = RenderedSessionProjection(
+            ids: visibleSessions.map(\.platformScopedID),
+            collapsedLimit: self.settings.recentSessionLimit)
+        self.renderedActivitySessionProjection = projection
+        let sessionsChanged = self.renderedActivitySessions != visibleSessions
+
+        for (index, item) in self.activitySessionItems.enumerated() {
+            if sessionsChanged, index < visibleSessions.count {
+                let session = visibleSessions[index]
+                self.configureSessionItem(item, session: session)
+                self.bindSessionSubmenu(item, to: session)
+            } else if sessionsChanged {
+                item.representedObject = nil
+                self.unbindSessionSubmenu(item)
+            }
+            let isHidden = index >= visibleSessions.count
+                || (!self.showsAllActivitySessions && index >= projection.collapsedLimit)
+            if item.isHidden != isHidden {
+                item.isHidden = isHidden
+            }
+        }
+        self.renderedActivitySessions = visibleSessions
+
+        self.activitySessionMenu?.title = self.activitySessionHeaderTitle
+        let hasSessions = !projection.ids.isEmpty
+        let emptyTitle = self.activitySessionEmptyTitle(scope: scope)
+        if self.activitySessionEmptyItem?.title != emptyTitle {
+            self.activitySessionEmptyItem?.title = emptyTitle
+        }
+        self.activitySessionEmptyItem?.toolTip = self.selectedSessionHistoryError
+        if self.activitySessionEmptyItem?.isHidden != hasSessions {
+            self.activitySessionEmptyItem?.isHidden = hasSessions
+        }
+
+        let canExpand = projection.ids.count > projection.collapsedLimit
+            && self.activitySessionItems.count > projection.collapsedLimit
+        if self.activitySessionExpansionItem?.isHidden != !canExpand {
+            self.activitySessionExpansionItem?.isHidden = !canExpand
+        }
+        guard canExpand else { return }
+        let title = self.activitySessionExpansionTitle(projection: projection)
+        self.activitySessionExpansionItem?.title = title
+        self.activitySessionExpansionView?.configure(
+            title: title,
+            systemImageName: self.showsAllActivitySessions ? "chevron.up" : "chevron.down",
+            accessibilityHelp: "Expand or collapse sessions for the selected Activity date without closing the menu.")
+    }
+
+    private func ensureSessionItemCapacity(_ count: Int) {
+        guard self.sessionItems.count < count else { return }
+        let insertionIndex = self.sessionExpansionItem
+            .flatMap { self.rootMenu.items.firstIndex(of: $0) }
+            ?? self.rootMenu.items.count
+        for offset in 0 ..< (count - self.sessionItems.count) {
+            let item = self.makeSessionItem()
+            item.isHidden = true
+            self.sessionItems.append(item)
+            self.rootMenu.insertItem(item, at: insertionIndex + offset)
+        }
+    }
+
+    private func ensureActivitySessionItemCapacity(_ count: Int) {
+        guard self.activitySessionItems.count < count,
+              let menu = self.activitySessionMenu
+        else {
+            return
+        }
+        let insertionIndex = self.activitySessionExpansionItem
+            .flatMap { menu.items.firstIndex(of: $0) }
+            ?? menu.items.count
+        for offset in 0 ..< (count - self.activitySessionItems.count) {
+            let item = self.makeSessionItem()
+            item.isHidden = true
+            self.activitySessionItems.append(item)
+            menu.insertItem(item, at: insertionIndex + offset)
+        }
+    }
+
+    private func selectActivityDate(_ date: String) {
+        guard self.availableSessionDates.contains(date) else { return }
+        let didChange = self.selectedSessionDate != date
+        if didChange {
+            self.sessionHistoryTask?.cancel()
+            self.sessionHistoryTask = nil
+            self.loadingSessionHistoryKey = nil
+            self.selectedSessionDate = date
+            self.showsAllActivitySessions = false
+        }
+        self.updateActivitySessionProjectionAndVisibility()
+        self.loadSessionHistoryIfNeeded(debounce: didChange)
+    }
+
+    private func loadSessionHistoryIfNeeded(
+        force: Bool = false,
+        debounce: Bool = false)
+    {
+        self.normalizeSelectedSessionDate()
+        guard let selectedSessionDate,
+              selectedSessionDate != self.latestSessionDate,
+              let key = self.selectedSessionHistoryKey
+        else {
+            self.sessionHistoryTask?.cancel()
+            self.sessionHistoryTask = nil
+            self.loadingSessionHistoryKey = nil
+            self.updateActivitySessionProjectionAndVisibility()
+            return
+        }
+        if force {
+            self.sessionHistoryTask?.cancel()
+            self.sessionHistoryTask = nil
+            self.loadingSessionHistoryKey = nil
+            self.sessionHistory.removeValue(forKey: key)
+        } else if self.sessionHistory[key] != nil {
+            return
+        }
+        guard self.loadingSessionHistoryKey != key else { return }
+
+        self.sessionHistoryTask?.cancel()
+        self.sessionHistoryErrors.removeValue(forKey: key)
+        self.loadingSessionHistoryKey = key
+        self.updateActivitySessionProjectionAndVisibility()
+        self.sessionHistoryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if debounce {
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+                let sessions = try await self.model.sessions(on: selectedSessionDate)
+                try Task.checkCancellation()
+                guard self.loadingSessionHistoryKey == key else { return }
+                self.sessionHistory[key] = sessions
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.loadingSessionHistoryKey == key else { return }
+                self.sessionHistoryErrors[key] = error.localizedDescription
+            }
+            guard self.loadingSessionHistoryKey == key else { return }
+            self.loadingSessionHistoryKey = nil
+            self.sessionHistoryTask = nil
+            self.updateActivitySessionProjectionAndVisibility()
+        }
+    }
+
+    private func resetSessionHistory() {
+        self.sessionHistoryTask?.cancel()
+        self.sessionHistoryTask = nil
+        self.loadingSessionHistoryKey = nil
+        self.sessionHistory.removeAll()
+        self.sessionHistoryErrors.removeAll()
+    }
+
     #if DEBUG
     func selectScopeForTesting(_ scope: DashboardScope) {
         self.selectScope(scope)
@@ -861,19 +1212,45 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     func firstSessionSubmenuForTesting() -> NSMenu? {
         self.sessionItems.first?.submenu
     }
+
+    func selectActivityDateForTesting(_ date: String) {
+        self.selectActivityDate(date)
+    }
+
+    func selectedSessionDateForTesting() -> String? {
+        self.selectedSessionDate
+    }
+
+    func renderedActivitySessionIDsForTesting() -> [String] {
+        self.renderedActivitySessions.map(\.platformScopedID)
+    }
+
+    func activitySessionMenuForTesting() -> NSMenu? {
+        self.activitySessionMenu
+    }
+
+    func activityDetailDirectSessionCountForTesting() -> Int {
+        self.activityDetailItem?.menu?.items.compactMap {
+            $0.representedObject as? SessionSummary
+        }.count ?? 0
+    }
+
+    func activityDetailShowsSessionMenuOnHoverForTesting() -> Bool {
+        self.activityDetailItem?.submenu === self.activitySessionMenu
+    }
+
+    func firstActivitySessionSubmenuForTesting() -> NSMenu? {
+        self.activitySessionItems.first?.submenu
+    }
+
+    func isLoadingSessionHistoryForTesting() -> Bool {
+        self.loadingSessionHistoryKey != nil
+    }
     #endif
 
-    private func rebuildRequestMenu(_ menu: NSMenu, sessionScopedID: String) {
+    private func rebuildRequestMenu(_ menu: NSMenu, session: SessionSummary) {
         self.discardRequestDetailMenus(in: menu)
         menu.removeAllItems()
-        guard let session = self.model.activitySnapshot?.sessions
-            .first(where: { $0.platformScopedID == sessionScopedID })
-        else {
-            let unavailable = NSMenuItem(title: "Session is no longer available", action: nil, keyEquivalent: "")
-            unavailable.isEnabled = false
-            menu.addItem(unavailable)
-            return
-        }
 
         menu.title = session.menuDisplayTitle
         menu.minimumWidth = Self.menuWidth
@@ -1125,8 +1502,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     @objc private func refreshNow() {
         Task { @MainActor [weak self] in
-            await self?.model.refreshAll()
+            await self?.refreshAllIncludingSelectedSessions()
         }
+    }
+
+    private func refreshAllIncludingSelectedSessions() async {
+        await self.model.refreshAll()
+        guard self.selectedSessionDate != self.latestSessionDate else { return }
+        self.loadSessionHistoryIfNeeded(force: true)
     }
 
     @objc private func copySession(_ sender: NSMenuItem) {

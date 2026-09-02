@@ -37,7 +37,7 @@ TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and 
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
 - Optionally track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output on the **Codex** tab only.
-- Browse the selected platform's recent sessions, using provider-generated titles when available. Codex and Claude sessions open in their desktop apps; Grok sessions resume in Terminal from their original workspace.
+- Browse today's recent sessions in the main menu, or select any date in Activity Detail to load that day's sessions from this Mac's local logs. Provider-generated titles, session opening, and turn/request drill-down remain available for historical dates.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
@@ -102,9 +102,9 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 1. Launch `TokenBar.app`. TokenBar appears only in the menu bar; it has no Dock icon.
 2. Click a provider's `T/W` section to open its matching tab. Opening the menu refreshes local activity and any quota data older than one minute.
 3. Use the three tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
-4. Hover **Activity** for the daily chart and per-model breakdowns.
+4. Hover **Activity** and move across the daily chart; the selected date's session submenu opens directly and updates with the highlighted bar.
 5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings. Turn off **Monitor Codex Memory usage** in Settings to hide this section and stop its local receiver.
-6. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
+6. Click a recent or Activity Detail session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
 7. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
 8. Use **Copy Session** or click a request row to copy its stable locator.
 

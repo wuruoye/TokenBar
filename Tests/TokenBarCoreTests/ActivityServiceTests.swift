@@ -174,6 +174,29 @@ struct ActivityServiceTests {
         #expect(await runner.arguments == ["--statistics-timezone", "local"])
     }
 
+    @Test("loads one historical session date without the memory snapshot")
+    func loadsHistoricalSessions() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let service = ActivityService(
+            arguments: ["--days", "30"],
+            memoryDatabaseURL: URL(fileURLWithPath: "/tmp/tokenbar-memory.sqlite"),
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let sessions = try await service.fetchSessions(
+            on: "2026-08-31",
+            statisticsTimeZone: .local)
+
+        #expect(sessions.map(\.id) == ["session-1"])
+        #expect(await runner.arguments == [
+            "--days", "30",
+            "--days", "1",
+            "--end-date", "2026-08-31",
+            "--statistics-timezone", "local",
+        ])
+        #expect(await runner.environments.last?["TZ"] == TimeZone.autoupdatingCurrent.identifier)
+    }
+
     @Test("passes the TokenBar memory database to the activity snapshot helper")
     func passesMemoryDatabase() async throws {
         let runner = RecordingActivityHelperRunner(output: Self.fixtureData)

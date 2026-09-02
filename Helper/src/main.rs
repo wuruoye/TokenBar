@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use chrono::{Days, Utc};
+use chrono::{Days, NaiveDate, Utc};
 use tokenbar_helper::claude::{
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
@@ -25,11 +25,12 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
     days: usize,
+    end_date: Option<NaiveDate>,
     home_dir: Option<PathBuf>,
     statistics_time_zone: StatisticsTimeZone,
     weekly_reset_ms: Option<i64>,
@@ -44,6 +45,7 @@ impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             days: DEFAULT_DAYS,
+            end_date: None,
             home_dir: None,
             statistics_time_zone: StatisticsTimeZone::default(),
             weekly_reset_ms: None,
@@ -111,10 +113,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let generated_at_ms = Utc::now().timestamp_millis();
-    let today = config
+    let current_day = config
         .statistics_time_zone
         .date_at_ms(generated_at_ms)
         .ok_or("the current time is outside the supported range")?;
+    let today = config.end_date.unwrap_or(current_day);
+    if today > current_day {
+        return Err("end date must not be in the future".into());
+    }
     let first_day = today
         .checked_sub_days(Days::new((config.days - 1) as u64))
         .ok_or("day range is too large")?;
@@ -313,6 +319,14 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                 if config.days == 0 {
                     return Err("--days must be a positive integer".to_string());
                 }
+            }
+            Some("--end-date") => {
+                let value = args.next().ok_or("--end-date requires a value")?;
+                let value = value.to_str().ok_or("--end-date must be valid UTF-8")?;
+                config.end_date = Some(
+                    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                        .map_err(|_| "--end-date must use YYYY-MM-DD")?,
+                );
             }
             Some("--home-dir") => {
                 let value = args.next().ok_or("--home-dir requires a path")?;
@@ -548,6 +562,7 @@ mod tests {
             config,
             Command::Snapshot(SnapshotConfig {
                 days: 7,
+                end_date: None,
                 home_dir: Some(PathBuf::from("/tmp/home")),
                 statistics_time_zone: StatisticsTimeZone::Utc,
                 weekly_reset_ms: Some(1_800_000_000_000),
@@ -582,6 +597,34 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "--statistics-timezone must be utc or local");
+    }
+
+    #[test]
+    fn accepts_a_historical_snapshot_end_date() {
+        let command = parse_args([
+            OsString::from("--days"),
+            OsString::from("1"),
+            OsString::from("--end-date"),
+            OsString::from("2026-08-31"),
+        ])
+        .unwrap();
+
+        let Command::Snapshot(config) = command else {
+            panic!("expected snapshot command");
+        };
+        assert_eq!(config.days, 1);
+        assert_eq!(config.end_date, NaiveDate::from_ymd_opt(2026, 8, 31));
+    }
+
+    #[test]
+    fn rejects_an_invalid_snapshot_end_date() {
+        let error = parse_args([
+            OsString::from("--end-date"),
+            OsString::from("2026-02-30"),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error, "--end-date must use YYYY-MM-DD");
     }
 
     #[test]
