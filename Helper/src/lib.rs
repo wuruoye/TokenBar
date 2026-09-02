@@ -19,7 +19,7 @@ pub mod usage;
 
 pub use usage::StatisticsTimeZone;
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -169,6 +169,12 @@ pub struct ActivityTotals {
     pub token_costs: Option<TokenCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_generation_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_generated_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_model_duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_request_count: Option<usize>,
     pub request_count: usize,
     pub session_count: usize,
 }
@@ -200,6 +206,12 @@ pub struct DailySummary {
     pub cost_usd: f64,
     pub request_count: usize,
     pub session_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_generated_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_model_duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_request_count: Option<usize>,
     #[serde(default)]
     pub models: Vec<DailyModelSummary>,
 }
@@ -304,9 +316,41 @@ struct DailyAccumulator {
     tokens: TokenBreakdown,
     cost: f64,
     token_costs: OptionalTokenCostAccumulator,
+    timing: ModelTimingAccumulator,
     turn_ids: HashSet<String>,
     session_ids: HashSet<(String, String)>,
     models: BTreeMap<(String, String, String), DailyModelAccumulator>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModelTimingAccumulator {
+    generated_tokens: i64,
+    duration_ms: i64,
+    request_count: usize,
+}
+
+impl ModelTimingAccumulator {
+    fn record(&mut self, request: &RequestRow) {
+        let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) else {
+            return;
+        };
+        let generated_tokens = request
+            .tokens
+            .output
+            .max(0)
+            .saturating_add(request.tokens.reasoning.max(0));
+        if generated_tokens <= 0 {
+            return;
+        }
+        self.generated_tokens = self.generated_tokens.saturating_add(generated_tokens);
+        self.duration_ms = self.duration_ms.saturating_add(duration_ms);
+        self.request_count = self.request_count.saturating_add(1);
+    }
+
+    fn average_tokens_per_second(self) -> Option<f64> {
+        (self.generated_tokens > 0 && self.duration_ms > 0)
+            .then_some(self.generated_tokens as f64 * 1_000.0 / self.duration_ms as f64)
+    }
 }
 
 #[derive(Default)]
@@ -786,6 +830,7 @@ fn build_snapshot_core(
             entry.tokens.add_assign(&request.tokens);
             entry.cost = add_cost(entry.cost, request.cost);
             entry.token_costs.add(request.token_costs.as_ref());
+            entry.timing.record(request);
             entry.turn_ids.insert(turn.id.clone());
             entry
                 .session_ids
@@ -851,6 +896,15 @@ fn build_snapshot_core(
             cost_usd: entry.map(|value| value.cost).unwrap_or(0.0),
             request_count: entry.map(|value| value.turn_ids.len()).unwrap_or(0),
             session_count: entry.map(|value| value.session_ids.len()).unwrap_or(0),
+            timed_generated_tokens: Some(
+                entry.map(|value| value.timing.generated_tokens).unwrap_or(0),
+            ),
+            total_model_duration_ms: Some(
+                entry.map(|value| value.timing.duration_ms).unwrap_or(0),
+            ),
+            timed_request_count: Some(
+                entry.map(|value| value.timing.request_count).unwrap_or(0),
+            ),
             models,
         });
     }
@@ -877,8 +931,7 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
     let mut token_costs = OptionalTokenCostAccumulator::default();
     let mut session_ids = HashSet::new();
     let mut turn_count = 0_usize;
-    let mut generated_tokens = 0.0;
-    let mut model_duration_ms = 0.0;
+    let mut timing = ModelTimingAccumulator::default();
     for turn in turns {
         let mut included_turn = false;
         for request in turn.contributions.iter().filter(|request| include(request)) {
@@ -886,14 +939,7 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
             cost_usd = add_cost(cost_usd, request.cost);
             token_costs.add(request.token_costs.as_ref());
             session_ids.insert((request.source.clone(), request.session_id.clone()));
-            if let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) {
-                let request_generated_tokens =
-                    request.tokens.output.max(0).saturating_add(request.tokens.reasoning.max(0));
-                if request_generated_tokens > 0 {
-                    generated_tokens += request_generated_tokens as f64;
-                    model_duration_ms += duration_ms as f64;
-                }
-            }
+            timing.record(request);
             included_turn = true;
         }
         if included_turn {
@@ -904,11 +950,10 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
         tokens,
         cost_usd,
         token_costs: token_costs.complete_costs(),
-        average_generation_tokens_per_second: (generated_tokens.is_finite()
-            && model_duration_ms.is_finite()
-            && generated_tokens > 0.0
-            && model_duration_ms > 0.0)
-            .then_some(generated_tokens * 1_000.0 / model_duration_ms),
+        average_generation_tokens_per_second: timing.average_tokens_per_second(),
+        timed_generated_tokens: Some(timing.generated_tokens),
+        total_model_duration_ms: Some(timing.duration_ms),
+        timed_request_count: Some(timing.request_count),
         request_count: turn_count,
         session_count: session_ids.len(),
     }
@@ -2462,8 +2507,54 @@ mod tests {
         assert_eq!(totals.request_count, 2);
         assert_eq!(totals.session_count, 1);
         assert_eq!(totals.average_generation_tokens_per_second, Some(62.5));
+        assert_eq!(totals.timed_generated_tokens, Some(250));
+        assert_eq!(totals.total_model_duration_ms, Some(4_000));
+        assert_eq!(totals.timed_request_count, Some(2));
         assert!((totals.token_costs.unwrap().total() - 4.5).abs() < 1e-12);
         assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(50.0));
+        assert_eq!(snapshot.days[1].timed_generated_tokens, Some(150));
+        assert_eq!(snapshot.days[1].total_model_duration_ms, Some(3_000));
+        assert_eq!(snapshot.days[1].timed_request_count, Some(1));
+    }
+
+    #[test]
+    fn timing_totals_exclude_requests_without_duration() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let timed = message(
+            "2026-07-13",
+            1_000,
+            "timed-session",
+            "/tmp/timed.jsonl",
+            100,
+            100,
+        );
+        let mut untimed = message(
+            "2026-07-13",
+            2_000,
+            "untimed-session",
+            "/tmp/untimed.jsonl",
+            100,
+            900,
+        );
+        untimed.model_duration_ms = None;
+
+        let snapshot = build_snapshot(
+            vec![timed, untimed],
+            today,
+            3_000,
+            "UTC".to_string(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.today.tokens.output, 1_000);
+        assert_eq!(snapshot.today.timed_generated_tokens, Some(100));
+        assert_eq!(snapshot.today.total_model_duration_ms, Some(1_000));
+        assert_eq!(snapshot.today.timed_request_count, Some(1));
+        assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(100.0));
+        assert_eq!(snapshot.days[0].timed_generated_tokens, Some(100));
+        assert_eq!(snapshot.days[0].total_model_duration_ms, Some(1_000));
+        assert_eq!(snapshot.days[0].timed_request_count, Some(1));
     }
 
     #[test]
@@ -2656,8 +2747,14 @@ mod tests {
         assert_eq!(value["generatedAtMs"], 123);
         assert_eq!(value["today"]["requestCount"], 0);
         assert_eq!(value["today"]["tokens"]["cacheRead"], 0);
+        assert_eq!(value["today"]["timedGeneratedTokens"], 0);
+        assert_eq!(value["today"]["totalModelDurationMs"], 0);
+        assert_eq!(value["today"]["timedRequestCount"], 0);
         assert_eq!(value["rangeTotals"]["requestCount"], 0);
         assert_eq!(value["days"][0]["sessionCount"], 0);
+        assert_eq!(value["days"][0]["timedGeneratedTokens"], 0);
+        assert_eq!(value["days"][0]["totalModelDurationMs"], 0);
+        assert_eq!(value["days"][0]["timedRequestCount"], 0);
         assert_eq!(value["days"][0]["models"], serde_json::json!([]));
         assert!(value.get("schema_version").is_none());
     }

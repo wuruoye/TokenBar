@@ -455,9 +455,28 @@ def _validate_token_costs(value: Any, label: str) -> None:
         _require_nonnegative_number(costs.get(key), f"{label}.{key}")
 
 
+def _validate_timing_summary(value: dict[str, Any], label: str) -> tuple[int, int, int] | None:
+    keys = ("timedGeneratedTokens", "totalModelDurationMs", "timedRequestCount")
+    present = [value.get(key) is not None for key in keys]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValidationError(f"{label} must contain all timing summary fields")
+    generated = _require_nonnegative_int(value[keys[0]], f"{label}.{keys[0]}")
+    duration = _require_nonnegative_int(value[keys[1]], f"{label}.{keys[1]}")
+    requests = _require_nonnegative_int(value[keys[2]], f"{label}.{keys[2]}")
+    if requests == 0:
+        if generated != 0 or duration != 0:
+            raise ValidationError(f"{label} with no timed requests must have zero totals")
+    elif generated == 0 or duration == 0:
+        raise ValidationError(f"{label} timed requests require positive token and duration totals")
+    return generated, duration, requests
+
+
 def _validate_totals(value: Any, label: str) -> None:
     totals = _require_object(value, label)
-    _validate_tokens(totals.get("tokens"), f"{label}.tokens")
+    tokens = _require_object(totals.get("tokens"), f"{label}.tokens")
+    _validate_tokens(tokens, f"{label}.tokens")
     _require_nonnegative_number(totals.get("costUsd"), f"{label}.costUsd")
     _require_nonnegative_int(totals.get("requestCount"), f"{label}.requestCount")
     _require_nonnegative_int(totals.get("sessionCount"), f"{label}.sessionCount")
@@ -467,6 +486,24 @@ def _validate_totals(value: Any, label: str) -> None:
     speed = totals.get("averageGenerationTokensPerSecond")
     if speed is not None:
         _require_nonnegative_number(speed, f"{label}.averageGenerationTokensPerSecond")
+    timing = _validate_timing_summary(totals, f"{label}.timing")
+    if timing is not None:
+        generated, duration, _ = timing
+        available_generated = min(
+            MAX_INT64,
+            int(tokens["output"]) + int(tokens["reasoning"]),
+        )
+        if generated > available_generated:
+            raise ValidationError(f"{label} times more tokens than it contains")
+        if generated == 0:
+            if speed is not None:
+                raise ValidationError(f"{label} contains speed without timed tokens")
+        else:
+            if speed is None:
+                raise ValidationError(f"{label} is missing speed for timed tokens")
+            expected = generated * 1000.0 / duration
+            if not math.isclose(float(speed), expected, rel_tol=1e-9, abs_tol=1e-9):
+                raise ValidationError(f"{label} contains inconsistent timing totals")
 
 
 def _validate_range(value: Any, label: str, *, generated_at_ms: int) -> None:
@@ -495,10 +532,20 @@ def _validate_daily_model(value: Any, label: str) -> None:
 def _validate_day(value: Any, label: str) -> str:
     day = _require_object(value, label)
     date = _require_string(day.get("date"), f"{label}.date")
-    _validate_tokens(day.get("tokens"), f"{label}.tokens")
+    tokens = _require_object(day.get("tokens"), f"{label}.tokens")
+    _validate_tokens(tokens, f"{label}.tokens")
     _require_nonnegative_number(day.get("costUsd"), f"{label}.costUsd")
     _require_nonnegative_int(day.get("requestCount"), f"{label}.requestCount")
     _require_nonnegative_int(day.get("sessionCount"), f"{label}.sessionCount")
+    timing = _validate_timing_summary(day, f"{label}.timing")
+    if timing is not None:
+        generated, _, _ = timing
+        available_generated = min(
+            MAX_INT64,
+            int(tokens["output"]) + int(tokens["reasoning"]),
+        )
+        if generated > available_generated:
+            raise ValidationError(f"{label} times more tokens than it contains")
     models = _require_array(day.get("models", []), f"{label}.models")
     for index, model in enumerate(models):
         _validate_daily_model(model, f"{label}.models[{index}]")

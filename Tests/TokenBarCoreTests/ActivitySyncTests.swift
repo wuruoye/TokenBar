@@ -465,6 +465,46 @@ struct ActivitySyncTests {
         }
     }
 
+    @Test("remote client rejects inconsistent exact timing totals")
+    func rejectsInconsistentTimingTotals() async throws {
+        let base = TestFixtures.activity().redactedForSync()
+        let invalid = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: ActivityTotals(
+                tokens: base.today.tokens,
+                costUsd: base.today.costUsd,
+                requestCount: base.today.requestCount,
+                sessionCount: base.today.sessionCount,
+                tokenCosts: base.today.tokenCosts,
+                averageGenerationTokensPerSecond: 5,
+                timedGeneratedTokens: 6,
+                totalModelDurationMs: 1_000,
+                timedRequestCount: 1),
+            sessions: base.sessions,
+            days: base.days)
+        let responseData = try JSONEncoder().encode(ActivitySyncDownloadResponse(snapshots: [
+            ActivitySyncStoredSnapshot(
+                device: self.remoteDevice,
+                generatedAtMs: invalid.generatedAtMs,
+                receivedAtMs: invalid.generatedAtMs + 1,
+                snapshot: invalid),
+        ]))
+        let client = ActivitySyncRemoteClient(
+            transport: RecordingHTTPTransport(responses: [
+                TokenBarHTTPResponse(data: responseData, statusCode: 200),
+            ]))
+        let configuration = try ActivitySyncConfiguration.parse(
+            serverURL: "https://sync.example.com",
+            token: self.sharedToken,
+            device: self.localDevice)
+
+        await #expect(throws: ActivitySyncError.self) {
+            _ = try await client.download(configuration: configuration)
+        }
+    }
+
     @Test("remote client uploads and downloads partition deltas with a private cache")
     func incrementalRoundTrip() async throws {
         let directory = FileManager.default.temporaryDirectory
@@ -821,6 +861,151 @@ struct ActivitySyncTests {
         #expect(merged.rangeTotals?.sessionCount == 2)
         #expect(merged.rangeTotals?.tokenCosts?.input == (range.tokenCosts?.input ?? 0) * 2)
         #expect(merged.rangeTotals?.averageGenerationTokensPerSecond == 6)
+    }
+
+    @Test("merger weights exact timing independently from untimed tokens")
+    func weightsExactTimingTotals() throws {
+        let base = TestFixtures.activity()
+        let localTotals = ActivityTotals(
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 1_000,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0),
+            costUsd: 0,
+            requestCount: 1,
+            sessionCount: 1,
+            averageGenerationTokensPerSecond: 10,
+            timedGeneratedTokens: 100,
+            totalModelDurationMs: 10_000,
+            timedRequestCount: 1)
+        let remoteTotals = ActivityTotals(
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 100,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0),
+            costUsd: 0,
+            requestCount: 1,
+            sessionCount: 1,
+            averageGenerationTokensPerSecond: 100,
+            timedGeneratedTokens: 100,
+            totalModelDurationMs: 1_000,
+            timedRequestCount: 1)
+        let local = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: localTotals,
+            sessions: [],
+            days: base.days,
+            rangeTotals: localTotals)
+        let remote = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: remoteTotals,
+            sessions: [],
+            days: base.days,
+            rangeTotals: remoteTotals)
+
+        let merged = ActivitySnapshotMerger.merge(
+            local: local,
+            localDevice: self.localDevice,
+            remote: [ActivitySyncStoredSnapshot(
+                device: self.remoteDevice,
+                generatedAtMs: remote.generatedAtMs,
+                receivedAtMs: remote.generatedAtMs + 1,
+                snapshot: remote)])
+
+        #expect(merged.today.tokens.output == 1_100)
+        #expect(merged.today.timedGeneratedTokens == 200)
+        #expect(merged.today.totalModelDurationMs == 11_000)
+        #expect(merged.today.timedRequestCount == 2)
+        let rate = try #require(merged.today.averageGenerationTokensPerSecond)
+        #expect(abs(rate - (200_000.0 / 11_000.0)) < 1e-12)
+        #expect(merged.rangeTotals?.timedGeneratedTokens == 200)
+        #expect(merged.rangeTotals?.totalModelDurationMs == 11_000)
+    }
+
+    @Test("date-window fallback rebuilds exact timing from daily summaries")
+    func rebuildsExactTimingFromDays() throws {
+        let base = TestFixtures.activity()
+        let localDay = DailySummary(
+            date: "2024-07-03",
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 50,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0),
+            costUsd: 0,
+            requestCount: 1,
+            sessionCount: 1,
+            timedGeneratedTokens: 50,
+            totalModelDurationMs: 1_000,
+            timedRequestCount: 1)
+        let remoteDay = DailySummary(
+            date: "2024-07-03",
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 50,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0),
+            costUsd: 0,
+            requestCount: 1,
+            sessionCount: 1,
+            timedGeneratedTokens: 50,
+            totalModelDurationMs: 2_000,
+            timedRequestCount: 1)
+        let remoteOldDay = DailySummary(
+            date: "2024-07-02",
+            tokens: TokenBreakdown(
+                input: 0,
+                output: 900,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0),
+            costUsd: 0,
+            requestCount: 1,
+            sessionCount: 1,
+            timedGeneratedTokens: 900,
+            totalModelDurationMs: 1_000,
+            timedRequestCount: 1)
+        let local = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: .zero,
+            sessions: [],
+            days: [localDay])
+        let remote = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: .zero,
+            sessions: [],
+            days: [remoteOldDay, remoteDay])
+
+        let merged = ActivitySnapshotMerger.merge(
+            local: local,
+            localDevice: self.localDevice,
+            remote: [ActivitySyncStoredSnapshot(
+                device: self.remoteDevice,
+                generatedAtMs: remote.generatedAtMs,
+                receivedAtMs: remote.generatedAtMs + 1,
+                snapshot: remote)])
+
+        let totals = try #require(merged.rangeTotals)
+        #expect(totals.tokens.output == 100)
+        #expect(totals.timedGeneratedTokens == 100)
+        #expect(totals.totalModelDurationMs == 3_000)
+        #expect(totals.timedRequestCount == 2)
+        let rate = try #require(totals.averageGenerationTokensPerSecond)
+        #expect(abs(rate - (100_000.0 / 3_000.0)) < 1e-12)
     }
 
     @Test("synchronized provider uploads redacted data and returns the merged snapshot")

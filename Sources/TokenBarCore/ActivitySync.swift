@@ -517,6 +517,31 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
                 throw ActivitySyncError.invalidResponse("\(label) contains invalid token costs")
             }
         }
+        if let timing = try Self.validateTiming(
+            generatedTokens: totals.timedGeneratedTokens,
+            durationMs: totals.totalModelDurationMs,
+            requestCount: totals.timedRequestCount,
+            label: "\(label).timing")
+        {
+            let availableGeneratedTokens = totals.tokens.output.saturatingAddForSync(
+                totals.tokens.reasoning)
+            guard timing.generatedTokens <= availableGeneratedTokens else {
+                throw ActivitySyncError.invalidResponse("\(label) times more tokens than it contains")
+            }
+            if timing.generatedTokens == 0 {
+                guard totals.averageGenerationTokensPerSecond == nil else {
+                    throw ActivitySyncError.invalidResponse("\(label) contains speed without timed tokens")
+                }
+            } else {
+                let expected = Double(timing.generatedTokens) * 1_000 / Double(timing.durationMs)
+                guard let actual = totals.averageGenerationTokensPerSecond,
+                      Self.isNonnegativeFinite(actual),
+                      abs(actual - expected) <= max(1e-9, abs(expected) * 1e-9)
+                else {
+                    throw ActivitySyncError.invalidResponse("\(label) contains inconsistent timing totals")
+                }
+            }
+        }
     }
 
     private static func validate(tokens: TokenBreakdown, label: String) throws {
@@ -543,6 +568,18 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
             throw ActivitySyncError.invalidResponse("snapshot day is invalid")
         }
         try Self.validate(tokens: day.tokens, label: "snapshot day tokens")
+        let timing = try Self.validateTiming(
+            generatedTokens: day.timedGeneratedTokens,
+            durationMs: day.totalModelDurationMs,
+            requestCount: day.timedRequestCount,
+            label: "snapshot day timing")
+        if let timing {
+            let availableGeneratedTokens = day.tokens.output.saturatingAddForSync(
+                day.tokens.reasoning)
+            guard timing.generatedTokens <= availableGeneratedTokens else {
+                throw ActivitySyncError.invalidResponse("snapshot day times more tokens than it contains")
+            }
+        }
         for model in day.models {
             guard Self.isNonnegativeFinite(model.costUsd),
                   model.requestCount >= 0,
@@ -591,6 +628,30 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         for contribution in request.contributions ?? [] {
             try Self.validate(request: contribution, depth: depth + 1)
         }
+    }
+
+    private static func validateTiming(
+        generatedTokens: Int64?,
+        durationMs: Int64?,
+        requestCount: Int?,
+        label: String) throws -> (generatedTokens: Int64, durationMs: Int64, requestCount: Int)?
+    {
+        if generatedTokens == nil, durationMs == nil, requestCount == nil {
+            return nil
+        }
+        guard let generatedTokens,
+              let durationMs,
+              let requestCount,
+              generatedTokens >= 0,
+              durationMs >= 0,
+              requestCount >= 0,
+              (requestCount == 0
+                  ? generatedTokens == 0 && durationMs == 0
+                  : generatedTokens > 0 && durationMs > 0)
+        else {
+            throw ActivitySyncError.invalidResponse("\(label) is incomplete or invalid")
+        }
+        return (generatedTokens, durationMs, requestCount)
     }
 
     private static func validate(memory: MemoryUsageTotals) throws {
@@ -969,12 +1030,32 @@ public enum ActivitySnapshotMerger {
         let provider: String
     }
 
+    private struct TimingSummary {
+        var generatedTokens: Int64
+        var durationMs: Int64
+        var requestCount: Int
+
+        static let zero = TimingSummary(generatedTokens: 0, durationMs: 0, requestCount: 0)
+
+        var averageTokensPerSecond: Double? {
+            guard self.generatedTokens > 0, self.durationMs > 0 else { return nil }
+            return Double(self.generatedTokens) * 1_000 / Double(self.durationMs)
+        }
+
+        mutating func add(_ other: TimingSummary) {
+            self.generatedTokens = self.generatedTokens.saturatingAddForSync(other.generatedTokens)
+            self.durationMs = self.durationMs.saturatingAddForSync(other.durationMs)
+            self.requestCount = self.requestCount.saturatingAddForSync(other.requestCount)
+        }
+    }
+
     private static func mergeDays(
         _ days: [DailySummary],
         allowedDates: Set<String>) -> [DailySummary]
     {
         Dictionary(grouping: days.filter { allowedDates.contains($0.date) }, by: \.date)
             .map { date, values in
+                let timing = self.sumTiming(values.map { self.timingSummary($0) })
                 let models = Dictionary(
                     grouping: values.flatMap(\.models),
                     by: {
@@ -1014,6 +1095,9 @@ public enum ActivitySnapshotMerger {
                     sessionCount: values.reduce(0) {
                         $0.saturatingAddForSync($1.sessionCount)
                     },
+                    timedGeneratedTokens: timing?.generatedTokens,
+                    totalModelDurationMs: timing?.durationMs,
+                    timedRequestCount: timing?.requestCount,
                     models: models)
             }
             .sorted { $0.date < $1.date }
@@ -1032,11 +1116,16 @@ public enum ActivitySnapshotMerger {
     }
 
     private static func totals(from days: [DailySummary]) -> ActivityTotals {
-        ActivityTotals(
+        let timing = self.sumTiming(days.map { self.timingSummary($0) })
+        return ActivityTotals(
             tokens: self.sumTokens(days.map(\.tokens)),
             costUsd: self.sumFinite(days.map(\.costUsd)),
             requestCount: days.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
-            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) })
+            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
+            averageGenerationTokensPerSecond: timing?.averageTokensPerSecond,
+            timedGeneratedTokens: timing?.generatedTokens,
+            totalModelDurationMs: timing?.durationMs,
+            timedRequestCount: timing?.requestCount)
     }
 
     private static func sumTotals(_ totals: [ActivityTotals]) -> ActivityTotals {
@@ -1048,13 +1137,33 @@ public enum ActivitySnapshotMerger {
                 cacheWrite: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.cacheWrite)),
                 reasoning: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.reasoning)))
             : nil
+        let exactTiming = self.sumTiming(totals.map { self.timingSummary($0) })
         var generatedTokens = 0.0
-        var modeledSeconds = 0.0
+        var modeledMilliseconds = 0.0
         for total in totals {
+            if let timing = self.timingSummary(total) {
+                if timing.generatedTokens > 0, timing.durationMs > 0 {
+                    generatedTokens = generatedTokens.saturatingAddForSync(
+                        Double(timing.generatedTokens))
+                    modeledMilliseconds = modeledMilliseconds.saturatingAddForSync(
+                        Double(timing.durationMs))
+                }
+                continue
+            }
             guard let rate = total.averageGenerationTokensPerSecond, rate > 0 else { continue }
-            let tokens = Double(total.tokens.output.saturatingAddForSync(total.tokens.reasoning))
-            generatedTokens = generatedTokens.saturatingAddForSync(tokens)
-            modeledSeconds = modeledSeconds.saturatingAddForSync(tokens / rate)
+            let legacyTokens = Double(
+                total.tokens.output.saturatingAddForSync(total.tokens.reasoning))
+            generatedTokens = generatedTokens.saturatingAddForSync(legacyTokens)
+            modeledMilliseconds = modeledMilliseconds.saturatingAddForSync(
+                legacyTokens * 1_000 / rate)
+        }
+        let averageGenerationTokensPerSecond: Double?
+        if let exactTiming {
+            averageGenerationTokensPerSecond = exactTiming.averageTokensPerSecond
+        } else if modeledMilliseconds > 0 {
+            averageGenerationTokensPerSecond = generatedTokens * 1_000 / modeledMilliseconds
+        } else {
+            averageGenerationTokensPerSecond = nil
         }
         return ActivityTotals(
             tokens: self.sumTokens(totals.map(\.tokens)),
@@ -1062,7 +1171,45 @@ public enum ActivitySnapshotMerger {
             requestCount: totals.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
             sessionCount: totals.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
             tokenCosts: tokenCosts,
-            averageGenerationTokensPerSecond: modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil)
+            averageGenerationTokensPerSecond: averageGenerationTokensPerSecond,
+            timedGeneratedTokens: exactTiming?.generatedTokens,
+            totalModelDurationMs: exactTiming?.durationMs,
+            timedRequestCount: exactTiming?.requestCount)
+    }
+
+    private static func timingSummary(_ totals: ActivityTotals) -> TimingSummary? {
+        guard let generatedTokens = totals.timedGeneratedTokens,
+              let durationMs = totals.totalModelDurationMs,
+              let requestCount = totals.timedRequestCount
+        else {
+            return nil
+        }
+        return TimingSummary(
+            generatedTokens: generatedTokens,
+            durationMs: durationMs,
+            requestCount: requestCount)
+    }
+
+    private static func timingSummary(_ day: DailySummary) -> TimingSummary? {
+        guard let generatedTokens = day.timedGeneratedTokens,
+              let durationMs = day.totalModelDurationMs,
+              let requestCount = day.timedRequestCount
+        else {
+            return nil
+        }
+        return TimingSummary(
+            generatedTokens: generatedTokens,
+            durationMs: durationMs,
+            requestCount: requestCount)
+    }
+
+    private static func sumTiming(_ values: [TimingSummary?]) -> TimingSummary? {
+        var result = TimingSummary.zero
+        for value in values {
+            guard let value else { return nil }
+            result.add(value)
+        }
+        return result
     }
 
     private static func sumTokens(_ values: [TokenBreakdown]) -> TokenBreakdown {

@@ -24,12 +24,15 @@ Example download response:
       "generatedAtMs": 123,
       "receivedAtMs": 456,
       "snapshot": {
-        "schemaVersion": 9,
+        "schemaVersion": 10,
         "generatedAtMs": 123,
         "timezone": "UTC",
         "today": {
           "tokens": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0},
           "costUsd": 0,
+          "timedGeneratedTokens": 0,
+          "totalModelDurationMs": 0,
+          "timedRequestCount": 0,
           "requestCount": 0,
           "sessionCount": 0
         },

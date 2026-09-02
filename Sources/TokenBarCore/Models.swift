@@ -444,6 +444,9 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
     public let costUsd: Double
     public let tokenCosts: TokenCostBreakdown?
     public let averageGenerationTokensPerSecond: Double?
+    public let timedGeneratedTokens: Int64?
+    public let totalModelDurationMs: Int64?
+    public let timedRequestCount: Int?
     public let requestCount: Int
     public let sessionCount: Int
 
@@ -453,12 +456,18 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
         requestCount: Int,
         sessionCount: Int,
         tokenCosts: TokenCostBreakdown? = nil,
-        averageGenerationTokensPerSecond: Double? = nil)
+        averageGenerationTokensPerSecond: Double? = nil,
+        timedGeneratedTokens: Int64? = nil,
+        totalModelDurationMs: Int64? = nil,
+        timedRequestCount: Int? = nil)
     {
         self.tokens = tokens
         self.costUsd = costUsd
         self.tokenCosts = tokenCosts
         self.averageGenerationTokensPerSecond = averageGenerationTokensPerSecond
+        self.timedGeneratedTokens = timedGeneratedTokens
+        self.totalModelDurationMs = totalModelDurationMs
+        self.timedRequestCount = timedRequestCount
         self.requestCount = requestCount
         self.sessionCount = sessionCount
     }
@@ -467,7 +476,10 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
         tokens: .zero,
         costUsd: 0,
         requestCount: 0,
-        sessionCount: 0)
+        sessionCount: 0,
+        timedGeneratedTokens: 0,
+        totalModelDurationMs: 0,
+        timedRequestCount: 0)
 }
 
 public struct ActivityRangeSummary: Codable, Equatable, Sendable {
@@ -520,6 +532,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
     public let costUsd: Double
     public let requestCount: Int
     public let sessionCount: Int
+    public let timedGeneratedTokens: Int64?
+    public let totalModelDurationMs: Int64?
+    public let timedRequestCount: Int?
     public let models: [DailyModelSummary]
 
     public init(
@@ -528,6 +543,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         costUsd: Double,
         requestCount: Int,
         sessionCount: Int,
+        timedGeneratedTokens: Int64? = nil,
+        totalModelDurationMs: Int64? = nil,
+        timedRequestCount: Int? = nil,
         models: [DailyModelSummary] = [])
     {
         self.date = date
@@ -535,6 +553,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         self.costUsd = costUsd
         self.requestCount = requestCount
         self.sessionCount = sessionCount
+        self.timedGeneratedTokens = timedGeneratedTokens
+        self.totalModelDurationMs = totalModelDurationMs
+        self.timedRequestCount = timedRequestCount
         self.models = models
     }
 
@@ -544,6 +565,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         case costUsd
         case requestCount
         case sessionCount
+        case timedGeneratedTokens
+        case totalModelDurationMs
+        case timedRequestCount
         case models
     }
 
@@ -554,6 +578,15 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         self.costUsd = try container.decode(Double.self, forKey: .costUsd)
         self.requestCount = try container.decode(Int.self, forKey: .requestCount)
         self.sessionCount = try container.decode(Int.self, forKey: .sessionCount)
+        self.timedGeneratedTokens = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .timedGeneratedTokens)
+        self.totalModelDurationMs = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .totalModelDurationMs)
+        self.timedRequestCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .timedRequestCount)
         self.models = try container.decodeIfPresent([DailyModelSummary].self, forKey: .models) ?? []
     }
 }

@@ -260,6 +260,58 @@ class CommonTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     validate_envelope(invalid, path_device_id=DEVICE_ID)
 
+    def test_validate_timing_summary_contract(self):
+        valid = envelope()
+        valid["snapshot"]["today"].update({
+            "tokens": {**zero_tokens(), "output": 100},
+            "averageGenerationTokensPerSecond": 50.0,
+            "timedGeneratedTokens": 100,
+            "totalModelDurationMs": 2_000,
+            "timedRequestCount": 1,
+        })
+        self.assertIs(validate_envelope(valid, path_device_id=DEVICE_ID), valid)
+
+        partial = envelope()
+        partial["snapshot"]["today"]["timedGeneratedTokens"] = 100
+        with self.assertRaisesRegex(ValidationError, "all timing summary fields"):
+            validate_envelope(partial, path_device_id=DEVICE_ID)
+
+        inconsistent = envelope()
+        inconsistent["snapshot"]["today"].update({
+            "tokens": {**zero_tokens(), "output": 100},
+            "averageGenerationTokensPerSecond": 10.0,
+            "timedGeneratedTokens": 100,
+            "totalModelDurationMs": 2_000,
+            "timedRequestCount": 1,
+        })
+        with self.assertRaisesRegex(ValidationError, "inconsistent timing totals"):
+            validate_envelope(inconsistent, path_device_id=DEVICE_ID)
+
+        invalid_day = envelope()
+        invalid_day["snapshot"]["days"] = [{
+            "date": "2026-08-11",
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "requestCount": 1,
+            "sessionCount": 1,
+            "timedGeneratedTokens": 100,
+            "totalModelDurationMs": 0,
+            "timedRequestCount": 1,
+            "models": [],
+        }]
+        with self.assertRaisesRegex(ValidationError, "positive token and duration totals"):
+            validate_envelope(invalid_day, path_device_id=DEVICE_ID)
+
+        excessive = envelope()
+        excessive["snapshot"]["today"].update({
+            "averageGenerationTokensPerSecond": 50.0,
+            "timedGeneratedTokens": 100,
+            "totalModelDurationMs": 2_000,
+            "timedRequestCount": 1,
+        })
+        with self.assertRaisesRegex(ValidationError, "more tokens than it contains"):
+            validate_envelope(excessive, path_device_id=DEVICE_ID)
+
 
 if __name__ == "__main__":
     unittest.main()
