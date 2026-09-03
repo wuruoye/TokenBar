@@ -32,7 +32,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -46,6 +46,7 @@ struct SnapshotConfig {
     antigravity_weekly_reset_ms: Option<i64>,
     openai_pricing_markdown: Option<PathBuf>,
     anthropic_pricing_markdown: Option<PathBuf>,
+    openrouter_pricing_json: Option<PathBuf>,
     memory_database: Option<PathBuf>,
 }
 
@@ -62,6 +63,7 @@ impl Default for SnapshotConfig {
             antigravity_weekly_reset_ms: None,
             openai_pricing_markdown: None,
             anthropic_pricing_markdown: None,
+            openrouter_pricing_json: None,
             memory_database: None,
         }
     }
@@ -228,10 +230,15 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         since: Some(parse_first_day.format("%Y-%m-%d").to_string()),
         until: Some(parse_last_day.format("%Y-%m-%d").to_string()),
     };
+    let google_pricing = config
+        .openrouter_pricing_json
+        .as_deref()
+        .and_then(|path| GooglePricing::from_openrouter_catalog_file(path, today).ok())
+        .unwrap_or_else(|| GooglePricing::bundled_for_date(today));
     let antigravity_messages = parse_local_antigravity_messages(
         antigravity_options.clone(),
         &anthropic_pricing,
-        &GooglePricing::bundled(),
+        &google_pricing,
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_antigravity_session_titles(&antigravity_options));
@@ -412,6 +419,12 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .parse::<i64>()
                         .map_err(|_| "--grok-weekly-reset-ms must be an integer")?,
                 );
+            }
+            Some("--openrouter-pricing-json") => {
+                let value = args
+                    .next()
+                    .ok_or("--openrouter-pricing-json requires a path")?;
+                config.openrouter_pricing_json = Some(PathBuf::from(value));
             }
             Some("--antigravity-weekly-reset-ms") => {
                 let value = args
@@ -605,6 +618,8 @@ mod tests {
             OsString::from("/tmp/openai-pricing.md"),
             OsString::from("--anthropic-pricing-markdown"),
             OsString::from("/tmp/anthropic-pricing.md"),
+            OsString::from("--openrouter-pricing-json"),
+            OsString::from("/tmp/openrouter-models.json"),
         ])
         .unwrap();
 
@@ -621,6 +636,7 @@ mod tests {
                 antigravity_weekly_reset_ms: Some(1_797_000_000_000),
                 openai_pricing_markdown: Some(PathBuf::from("/tmp/openai-pricing.md")),
                 anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
+                openrouter_pricing_json: Some(PathBuf::from("/tmp/openrouter-models.json")),
                 memory_database: None,
             })
         );

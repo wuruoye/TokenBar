@@ -7,12 +7,17 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let activitySyncController = ActivitySyncController(settings: .shared)
     private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
+    private let openRouterPricingCatalog = OpenRouterPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
         #if DEBUG
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MODE"] == "1" {
             return DashboardModel(
                 quotaService: DemoQuotaProvider(),
-                additionalQuotaServices: [DemoClaudeQuotaProvider(), DemoGrokQuotaProvider()],
+                additionalQuotaServices: [
+                    DemoClaudeQuotaProvider(),
+                    DemoGrokQuotaProvider(),
+                    DemoAntigravityQuotaProvider(),
+                ],
                 activityService: DemoActivityProvider(),
                 cache: nil)
         }
@@ -25,7 +30,8 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                 }
             },
             openAIPricingCatalog: self.openAIPricingCatalog,
-            anthropicPricingCatalog: self.anthropicPricingCatalog)
+            anthropicPricingCatalog: self.anthropicPricingCatalog,
+            openRouterPricingCatalog: self.openRouterPricingCatalog)
         let synchronizedActivity = SynchronizedActivityService(
             local: localActivity,
             configuration: { [weak activitySyncController = self.activitySyncController] in
@@ -36,7 +42,11 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             })
         return DashboardModel(
             quotaService: CodexQuotaService(),
-            additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
+            additionalQuotaServices: [
+                ClaudeQuotaService(),
+                GrokQuotaService(),
+                AntigravityQuotaService(),
+            ],
             activityService: synchronizedActivity,
             quotaCache: QuotaSnapshotCache(),
             weeklyQuotaUsageCache: WeeklyQuotaUsageCache())

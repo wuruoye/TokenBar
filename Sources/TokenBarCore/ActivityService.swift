@@ -101,6 +101,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let memoryDatabaseURLProvider: @Sendable () async -> URL?
     private let openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)?
     private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
+    private let openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
     private let runner: any ActivityHelperRunning
 
@@ -111,6 +112,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
+        openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeout: TimeInterval = 120,
         runner: any ActivityHelperRunning = SubprocessActivityHelperRunner())
@@ -119,6 +121,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
+        self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.runner = runner
@@ -133,6 +136,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
+        openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
         timeout: TimeInterval = 120,
         resolveHelper: @escaping @Sendable () throws -> URL,
@@ -142,6 +146,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
+        self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.resolveHelper = resolveHelper
@@ -196,13 +201,15 @@ public struct ActivityService: ActivityProviding, Sendable {
     {
         async let openAIPricingURL = self.openAIPricingCatalog?.refreshIfNeeded()
         async let anthropicPricingURL = self.anthropicPricingCatalog?.refreshIfNeeded()
-        let pricingURLs = await (openAIPricingURL, anthropicPricingURL)
+        async let openRouterPricingURL = self.openRouterPricingCatalog?.refreshIfNeeded()
+        let pricingURLs = await (openAIPricingURL, anthropicPricingURL, openRouterPricingURL)
         let initial = try await self.runSnapshot(
             helperURL: helperURL,
             sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
             memoryDatabaseURL: memoryDatabaseURL,
             openAIPricingURL: pricingURLs.0,
             anthropicPricingURL: pricingURLs.1,
+            openRouterPricingURL: pricingURLs.2,
             snapshotArguments: snapshotArguments,
             statisticsTimeZone: statisticsTimeZone)
 
@@ -214,10 +221,17 @@ public struct ActivityService: ActivityProviding, Sendable {
         async let refreshedAnthropicPricingURL: URL? = unpricedPlatforms.contains(.claude)
             ? self.anthropicPricingCatalog?.refreshNowIfAllowed()
             : nil
+        async let refreshedGooglePricingURL: URL? = unpricedPlatforms.contains(.antigravity)
+            ? self.openRouterPricingCatalog?.refreshNowIfAllowed()
+            : nil
         let refreshedURLs = await (
             refreshedOpenAIPricingURL,
-            refreshedAnthropicPricingURL)
-        guard refreshedURLs.0 != nil || refreshedURLs.1 != nil else { return initial }
+            refreshedAnthropicPricingURL,
+            refreshedGooglePricingURL)
+        guard refreshedURLs.0 != nil || refreshedURLs.1 != nil || refreshedURLs.2 != nil
+        else {
+            return initial
+        }
 
         return (try? await self.runSnapshot(
             helperURL: helperURL,
@@ -225,6 +239,7 @@ public struct ActivityService: ActivityProviding, Sendable {
             memoryDatabaseURL: memoryDatabaseURL,
             openAIPricingURL: refreshedURLs.0 ?? pricingURLs.0,
             anthropicPricingURL: refreshedURLs.1 ?? pricingURLs.1,
+            openRouterPricingURL: refreshedURLs.2 ?? pricingURLs.2,
             snapshotArguments: snapshotArguments,
             statisticsTimeZone: statisticsTimeZone)) ?? initial
     }
@@ -235,6 +250,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURL: URL?,
         openAIPricingURL: URL?,
         anthropicPricingURL: URL?,
+        openRouterPricingURL: URL?,
         snapshotArguments: [String],
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
@@ -245,6 +261,7 @@ public struct ActivityService: ActivityProviding, Sendable {
                 memoryDatabaseURL: memoryDatabaseURL,
                 openAIPricingURL: openAIPricingURL,
                 anthropicPricingURL: anthropicPricingURL,
+                openRouterPricingURL: openRouterPricingURL,
                 snapshotArguments: snapshotArguments,
                 statisticsTimeZone: statisticsTimeZone),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
@@ -266,7 +283,7 @@ public struct ActivityService: ActivityProviding, Sendable {
                 where request.costSource == .unknown && request.tokens.total > 0
             {
                 let platform = request.platform ?? session.platform ?? .codex
-                if platform == .codex || platform == .claude {
+                if platform == .codex || platform == .claude || platform == .antigravity {
                     platforms.insert(platform)
                 }
             }
@@ -279,6 +296,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURL: URL?,
         openAIPricingURL: URL?,
         anthropicPricingURL: URL?,
+        openRouterPricingURL: URL?,
         snapshotArguments: [String],
         statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
@@ -305,6 +323,9 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
         if let anthropicPricingURL {
             arguments += ["--anthropic-pricing-markdown", anthropicPricingURL.path]
+        }
+        if let openRouterPricingURL {
+            arguments += ["--openrouter-pricing-json", openRouterPricingURL.path]
         }
         return arguments
     }

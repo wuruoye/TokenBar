@@ -115,6 +115,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.model.updateStatisticsTimeZone(settings.statisticsTimeZone)
         self.model.updateQuotaRefreshEnabled(settings.showsClaude, for: .claude)
         self.model.updateQuotaRefreshEnabled(settings.showsGrok, for: .grok)
+        self.model.updateQuotaRefreshEnabled(
+            settings.showsAntigravity,
+            for: .antigravity)
         self.rebuildRootMenu()
         self.observeModel()
         self.observeScope()
@@ -434,6 +437,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 if grokQuotaSettingChanged, self.settings.showsGrok {
                     Task { @MainActor [weak self] in
                         await self?.model.refreshQuota(for: .grok)
+                    }
+                }
+                let antigravityQuotaSettingChanged = self.model.updateQuotaRefreshEnabled(
+                    self.settings.showsAntigravity,
+                    for: .antigravity)
+                if antigravityQuotaSettingChanged, self.settings.showsAntigravity {
+                    Task { @MainActor [weak self] in
+                        await self?.model.refreshQuota(for: .antigravity)
                     }
                 }
                 if !self.visibleScopes.contains(self.model.scope) {

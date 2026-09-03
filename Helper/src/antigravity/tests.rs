@@ -187,7 +187,9 @@ fn splits_generation_usage_into_disjoint_buckets() {
         &AnthropicPricing::bundled_for_date(
             NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
         ),
-        &GooglePricing::bundled(),
+        &GooglePricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        ),
     )
     .unwrap();
 
@@ -221,7 +223,9 @@ fn starts_the_turn_on_the_model_response_instead_of_the_title_request() {
         &AnthropicPricing::bundled_for_date(
             NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
         ),
-        &GooglePricing::bundled(),
+        &GooglePricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        ),
     )
     .unwrap();
 
@@ -275,7 +279,9 @@ fn prices_claude_and_gemini_models_from_their_own_catalogs() {
         &AnthropicPricing::bundled_for_date(
             NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
         ),
-        &GooglePricing::bundled(),
+        &GooglePricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        ),
     )
     .unwrap();
 
@@ -304,7 +310,9 @@ fn prices_claude_and_gemini_models_from_their_own_catalogs() {
 
 #[test]
 fn charges_gemini_pro_the_long_context_rate_above_two_hundred_thousand_tokens() {
-    let pricing = GooglePricing::bundled();
+    let pricing = GooglePricing::bundled_for_date(
+        NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+    );
     let short = pricing
         .calculate_token_costs(
             "gemini-2.5-pro",
@@ -349,7 +357,9 @@ fn falls_back_to_the_only_model_for_unattributed_summary_requests() {
         &AnthropicPricing::bundled_for_date(
             NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
         ),
-        &GooglePricing::bundled(),
+        &GooglePricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        ),
     )
     .unwrap();
 

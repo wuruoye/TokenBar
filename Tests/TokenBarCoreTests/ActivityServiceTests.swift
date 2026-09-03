@@ -88,6 +88,26 @@ private actor RefreshingAnthropicPricingCatalog: AnthropicPricingCatalogUpdating
     }
 }
 
+private actor RefreshingOpenRouterPricingCatalog: OpenRouterPricingCatalogUpdating {
+    let cachedURL: URL
+    let refreshedURL: URL
+    private(set) var forcedRefreshCount = 0
+
+    init(cachedURL: URL, refreshedURL: URL) {
+        self.cachedURL = cachedURL
+        self.refreshedURL = refreshedURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.cachedURL
+    }
+
+    func refreshNowIfAllowed() -> URL? {
+        self.forcedRefreshCount += 1
+        return self.refreshedURL
+    }
+}
+
 private actor StubOpenAIPricingCatalog: OpenAIPricingCatalogUpdating {
     let fileURL: URL?
 
@@ -343,6 +363,44 @@ struct ActivityServiceTests {
         ])
     }
 
+    @Test("refreshes the OpenRouter catalog for an unpriced Antigravity model")
+    func refreshesUnpricedAntigravityModel() async throws {
+        let runner = SequencedActivityHelperRunner(outputs: [
+            Self.pricingSnapshot(
+                costSource: "unknown",
+                costUsd: 0,
+                platform: "antigravity",
+                model: "gemini-3.8-flash"),
+            Self.pricingSnapshot(
+                costSource: "estimated",
+                costUsd: 4.25,
+                platform: "antigravity",
+                model: "gemini-3.8-flash"),
+        ])
+        let catalog = RefreshingOpenRouterPricingCatalog(
+            cachedURL: URL(fileURLWithPath: "/tmp/openrouter-models-old.json"),
+            refreshedURL: URL(fileURLWithPath: "/tmp/openrouter-models-new.json"))
+        let service = ActivityService(
+            openRouterPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let snapshot = try await service.fetchActivity()
+
+        #expect(snapshot.sessions[0].requests[0].costUsd == 4.25)
+        #expect(await catalog.forcedRefreshCount == 1)
+        #expect(await runner.argumentHistory == [
+            [
+                "--statistics-timezone", "utc",
+                "--openrouter-pricing-json", "/tmp/openrouter-models-old.json",
+            ],
+            [
+                "--statistics-timezone", "utc",
+                "--openrouter-pricing-json", "/tmp/openrouter-models-new.json",
+            ],
+        ])
+    }
+
     @Test("rejects malformed helper JSON")
     func rejectsMalformedJSON() async {
         let service = ActivityService(
@@ -426,7 +484,12 @@ struct ActivityServiceTests {
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
     }
 
-    private static func pricingSnapshot(costSource: String, costUsd: Double) -> Data {
+    private static func pricingSnapshot(
+        costSource: String,
+        costUsd: Double,
+        platform: String = "claude",
+        model: String = "claude-fable-5-1") -> Data
+    {
         Data(
             """
             {
@@ -441,19 +504,19 @@ struct ActivityServiceTests {
               },
               "sessions": [{
                 "id": "session-fable",
-                "platform": "claude",
+                "platform": "\(platform)",
                 "startedAtMs": 1788300000000,
                 "endedAtMs": 1788300001000,
                 "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
                 "costUsd": \(costUsd),
-                "models": ["claude-fable-5-1"],
+                "models": ["\(model)"],
                 "requests": [{
                   "id": "request-fable",
-                  "platform": "claude",
+                  "platform": "\(platform)",
                   "sessionId": "session-fable",
                   "physicalSessionId": "session-fable",
                   "isSubagent": false,
-                  "model": "claude-fable-5-1",
+                  "model": "\(model)",
                   "provider": "anthropic",
                   "startedAtMs": 1788300000000,
                   "endedAtMs": 1788300001000,

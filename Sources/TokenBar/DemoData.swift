@@ -73,6 +73,30 @@ struct DemoGrokQuotaProvider: QuotaProviding {
     }
 }
 
+struct DemoAntigravityQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.antigravity
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        let now = Date()
+        let object: [String: Any] = [
+            "session": [
+                "usedPercent": 39,
+                "windowMinutes": 300,
+                "resetsAt": now.addingTimeInterval(3.2 * 3_600).timeIntervalSinceReferenceDate,
+            ],
+            "weekly": [
+                "usedPercent": 17,
+                "windowMinutes": 10_080,
+                "resetsAt": now.addingTimeInterval(1.5 * 86_400).timeIntervalSinceReferenceDate,
+            ],
+            "updatedAt": now.timeIntervalSinceReferenceDate,
+        ]
+        return try JSONDecoder().decode(
+            QuotaSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object))
+    }
+}
+
 struct DemoActivityProvider: ActivityProviding {
     func fetchActivity(
         sinceWeeklyResetAt: Date?,

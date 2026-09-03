@@ -992,15 +992,29 @@ fn is_snapshot_of(model_id: &str, base: &str) -> bool {
 
 /// Google Gemini pricing used for Antigravity estimates.
 ///
-/// Rates are the standard paid-tier text prices in USD per million tokens as
-/// published on <https://ai.google.dev/gemini-api/docs/pricing>, captured
-/// 2026-09-03. Google lists these as current through 2026-12-31 and has
-/// scheduled increases for 2027-01-01, so the table needs a review then.
-/// Cached input uses the context-caching rate; Gemini bills thinking tokens at
-/// the output rate. Unknown or future model versions stay unpriced instead of
-/// inheriting a nearby model's rate.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GooglePricing;
+/// Google publishes no machine-readable rate table, so TokenBar reads
+/// OpenRouter's public model catalog, which lists the same per-token Gemini
+/// rates as structured JSON including the long-context override. A reviewed
+/// fallback table covers the catalog being unavailable or changing shape.
+/// Rates are standard paid-tier text prices in USD per million tokens. Gemini
+/// bills thinking tokens at the output rate and cached input at the
+/// context-caching rate. Unknown or future model versions stay unpriced instead
+/// of inheriting a nearby model's rate.
+///
+/// Sources:
+/// - https://openrouter.ai/api/v1/models
+/// - https://ai.google.dev/gemini-api/docs/pricing
+#[derive(Debug, Clone)]
+pub struct GooglePricing {
+    effective_date: NaiveDate,
+    catalog_rates: HashMap<String, GoogleRateRow>,
+}
+
+impl Default for GooglePricing {
+    fn default() -> Self {
+        Self::bundled_for_date(Local::now().date_naive())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GoogleModelRate {
@@ -1009,9 +1023,50 @@ struct GoogleModelRate {
     output_per_million: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GoogleRateRow {
+    standard: GoogleModelRate,
+    long_context: Option<GoogleModelRate>,
+    long_context_min_prompt_tokens: i64,
+}
+
+/// Gemini Pro switches to a long-context rate above this prompt size. The
+/// catalog carries its own threshold; this is the reviewed fallback.
+const GOOGLE_LONG_CONTEXT_THRESHOLD: i64 = 200_000;
+
+/// Minimum number of priced Gemini models before the catalog is trusted.
+const GOOGLE_MINIMUM_CATALOG_MODELS: usize = 8;
+
 impl GooglePricing {
-    pub fn bundled() -> Self {
-        Self
+    pub fn bundled_for_date(effective_date: NaiveDate) -> Self {
+        Self {
+            effective_date,
+            catalog_rates: HashMap::new(),
+        }
+    }
+
+    pub fn from_openrouter_catalog(
+        json: &str,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            effective_date,
+            catalog_rates: parse_openrouter_gemini_rates(json)?,
+        })
+    }
+
+    pub fn from_openrouter_catalog_file(
+        path: &Path,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("could not inspect OpenRouter catalog: {error}"))?;
+        if metadata.len() < 4_096 || metadata.len() > 16_000_000 {
+            return Err("OpenRouter catalog has an invalid size".to_string());
+        }
+        let json = fs::read_to_string(path)
+            .map_err(|error| format!("could not read OpenRouter catalog: {error}"))?;
+        Self::from_openrouter_catalog(&json, effective_date)
     }
 
     pub fn calculate_token_costs(
@@ -1024,7 +1079,11 @@ impl GooglePricing {
             .max(0)
             .saturating_add(usage.cache_read.max(0))
             .saturating_add(usage.cache_write.max(0));
-        let rate = bundled_google_rate(&normalize_google_model_id(model_id), prompt_tokens)?;
+        let row = self.row_for_model(model_id)?;
+        let rate = match row.long_context {
+            Some(long) if prompt_tokens > row.long_context_min_prompt_tokens => long,
+            _ => row.standard,
+        };
         let costs = TokenCostBreakdown {
             input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
             output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
@@ -1037,33 +1096,52 @@ impl GooglePricing {
         };
         costs.total().is_finite().then_some(costs)
     }
+
+    fn row_for_model(&self, model_id: &str) -> Option<GoogleRateRow> {
+        let normalized = normalize_google_model_id(model_id);
+        self.catalog_rates
+            .get(&normalized)
+            .copied()
+            .or_else(|| bundled_google_row(&normalized, self.effective_date))
+    }
 }
 
-/// Gemini Pro switches to a long-context rate above this prompt size.
-const GOOGLE_LONG_CONTEXT_THRESHOLD: i64 = 200_000;
-
-fn bundled_google_rate(
+/// Reviewed fallback rates, last checked 2026-09-03 against Google's pricing
+/// page. Google publishes the scheduled 2027-01-01 increase alongside the
+/// current price, so both are recorded here and selected by `effective_date`.
+fn bundled_google_row(
     normalized_model_id: &str,
-    prompt_tokens: i64,
-) -> Option<GoogleModelRate> {
-    let long_context = prompt_tokens > GOOGLE_LONG_CONTEXT_THRESHOLD;
-    let (input, cached_input, output) = match normalized_model_id {
-        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => (0.75, 0.075, 3.75),
-        "gemini-3.5-flash" => (1.5, 0.15, 9.0),
-        "gemini-3.5-flash-lite" => (0.3, 0.03, 2.5),
-        "gemini-3.1-flash-lite" => (0.25, 0.025, 1.5),
-        "gemini-3.1-pro" if long_context => (4.0, 0.4, 18.0),
-        "gemini-3.1-pro" => (2.0, 0.2, 12.0),
-        "gemini-2.5-pro" if long_context => (2.5, 0.25, 15.0),
-        "gemini-2.5-pro" => (1.25, 0.125, 10.0),
-        "gemini-2.5-flash" => (0.3, 0.03, 2.5),
-        "gemini-2.5-flash-lite" => (0.1, 0.01, 0.4),
-        _ => return None,
-    };
-    Some(GoogleModelRate {
+    effective_date: NaiveDate,
+) -> Option<GoogleRateRow> {
+    let raised = effective_date >= NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+    let rate = |input: f64, cached_input: f64, output: f64| GoogleModelRate {
         input_per_million: input,
         cached_input_per_million: cached_input,
         output_per_million: output,
+    };
+    let flat = |input: f64, cached_input: f64, output: f64| GoogleRateRow {
+        standard: rate(input, cached_input, output),
+        long_context: None,
+        long_context_min_prompt_tokens: GOOGLE_LONG_CONTEXT_THRESHOLD,
+    };
+    let tiered = |standard: (f64, f64, f64), long: (f64, f64, f64)| GoogleRateRow {
+        standard: rate(standard.0, standard.1, standard.2),
+        long_context: Some(rate(long.0, long.1, long.2)),
+        long_context_min_prompt_tokens: GOOGLE_LONG_CONTEXT_THRESHOLD,
+    };
+    Some(match normalized_model_id {
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" if raised => {
+            flat(1.5, 0.15, 7.5)
+        }
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => flat(0.75, 0.075, 3.75),
+        "gemini-3.5-flash" => flat(1.5, 0.15, 9.0),
+        "gemini-3.5-flash-lite" => flat(0.3, 0.03, 2.5),
+        "gemini-3.1-flash-lite" => flat(0.25, 0.025, 1.5),
+        "gemini-3.1-pro" => tiered((2.0, 0.2, 12.0), (4.0, 0.4, 18.0)),
+        "gemini-2.5-pro" => tiered((1.25, 0.125, 10.0), (2.5, 0.25, 15.0)),
+        "gemini-2.5-flash" => flat(0.3, 0.03, 2.5),
+        "gemini-2.5-flash-lite" => flat(0.1, 0.01, 0.4),
+        _ => return None,
     })
 }
 
@@ -1075,15 +1153,119 @@ fn normalize_google_model_id(model_id: &str) -> String {
             break;
         }
     }
-    for suffix in ["-preview", "-latest", "-thinking", "-exp"] {
+    if let Some(index) = normalized.find("-preview") {
+        normalized.truncate(index);
+    }
+    for suffix in ["-latest", "-thinking", "-exp"] {
         if let Some(model) = normalized.strip_suffix(suffix) {
             normalized = model.to_string();
         }
     }
-    if let Some(index) = normalized.find("-preview-") {
-        normalized.truncate(index);
-    }
     normalized
+}
+
+/// Reads the Gemini rows of OpenRouter's model catalog.
+///
+/// Prices are USD per token, and an `overrides` entry carries the long-context
+/// tier. Discounted variants such as `:batch` are ignored so a Gemini request
+/// never inherits a cheaper delivery mode.
+fn parse_openrouter_gemini_rates(
+    json: &str,
+) -> Result<HashMap<String, GoogleRateRow>, String> {
+    let catalog: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("OpenRouter catalog is not valid JSON: {error}"))?;
+    let models = catalog
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("OpenRouter catalog has no model list")?;
+
+    let mut rates: HashMap<String, (usize, GoogleRateRow)> = HashMap::new();
+    for model in models {
+        let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !id.starts_with("google/gemini") || id.contains(':') {
+            continue;
+        }
+        let Some(pricing) = model.get("pricing") else {
+            continue;
+        };
+        let Some(standard) = openrouter_rate(pricing) else {
+            continue;
+        };
+        let override_entry = pricing
+            .get("overrides")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry
+                        .get("min_prompt_tokens")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|threshold| threshold > 0)
+                })
+            });
+        let long_context_min_prompt_tokens = override_entry
+            .and_then(|entry| entry.get("min_prompt_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(GOOGLE_LONG_CONTEXT_THRESHOLD);
+        let long_context = override_entry.and_then(|entry| {
+            Some(GoogleModelRate {
+                input_per_million: openrouter_price(entry.get("prompt"))
+                    .unwrap_or(standard.input_per_million),
+                cached_input_per_million: openrouter_price(entry.get("input_cache_read"))
+                    .unwrap_or(standard.cached_input_per_million),
+                output_per_million: openrouter_price(entry.get("completion"))?,
+            })
+        });
+
+        let key = normalize_google_model_id(id);
+        let row = GoogleRateRow {
+            standard,
+            long_context,
+            long_context_min_prompt_tokens,
+        };
+        // Several catalog ids normalize to one model; keep the plainest one.
+        match rates.get(&key) {
+            Some((length, _)) if *length <= id.len() => {}
+            _ => {
+                rates.insert(key, (id.len(), row));
+            }
+        }
+    }
+
+    if rates.len() < GOOGLE_MINIMUM_CATALOG_MODELS {
+        return Err(format!(
+            "OpenRouter catalog listed only {} priced Gemini models",
+            rates.len()
+        ));
+    }
+    Ok(rates.into_iter().map(|(key, (_, row))| (key, row)).collect())
+}
+
+fn openrouter_rate(pricing: &serde_json::Value) -> Option<GoogleModelRate> {
+    let input = openrouter_price(pricing.get("prompt"))?;
+    let output = openrouter_price(pricing.get("completion"))?;
+    if output <= 0.0 {
+        return None;
+    }
+    Some(GoogleModelRate {
+        input_per_million: input,
+        cached_input_per_million: openrouter_price(pricing.get("input_cache_read"))
+            .unwrap_or(input),
+        output_per_million: output,
+    })
+}
+
+/// OpenRouter quotes USD per token, usually as a string.
+fn openrouter_price(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    let per_token = match value {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+        serde_json::Value::Number(number) => number.as_f64()?,
+        _ => return None,
+    };
+    let per_million = per_token * TOKENS_PER_MILLION;
+    (per_million.is_finite() && per_million >= 0.0).then_some(per_million)
 }
 
 #[cfg(test)]
@@ -1651,5 +1833,130 @@ mod tests {
 | gpt-5.2 | $3.50 | $0.35 | - | $28.00 | - | - | - | - |
 | gpt-5.1 | $2.50 | $0.25 | - | $20.00 | - | - | - | - |
 "#
+    }
+
+    fn openrouter_catalog() -> String {
+        r#"{"data":[
+          {"id":"google/gemini-3.8-flash","pricing":{
+            "prompt":"0.00000075","completion":"0.00000375","input_cache_read":"0.000000075"}},
+          {"id":"google/gemini-3.8-flash:batch","pricing":{
+            "prompt":"0.000000375","completion":"0.000001875"}},
+          {"id":"google/gemini-3.7-flash","pricing":{
+            "prompt":"0.00000075","completion":"0.00000375","input_cache_read":"0.000000075"}},
+          {"id":"google/gemini-3.5-flash","pricing":{
+            "prompt":"0.0000015","completion":"0.000009","input_cache_read":"0.00000015"}},
+          {"id":"google/gemini-3.5-flash-lite","pricing":{
+            "prompt":"0.0000003","completion":"0.0000025","input_cache_read":"0.00000003"}},
+          {"id":"google/gemini-3.1-flash-lite","pricing":{
+            "prompt":"0.00000025","completion":"0.0000015","input_cache_read":"0.000000025"}},
+          {"id":"google/gemini-2.5-flash","pricing":{
+            "prompt":"0.0000003","completion":"0.0000025","input_cache_read":"0.00000003"}},
+          {"id":"google/gemini-2.5-flash-lite","pricing":{
+            "prompt":"0.0000001","completion":"0.0000004","input_cache_read":"0.00000001"}},
+          {"id":"google/gemini-2.5-pro-preview-05-06","pricing":{
+            "prompt":"0.0000099","completion":"0.0000099"}},
+          {"id":"google/gemini-2.5-pro","pricing":{
+            "prompt":"0.00000125","completion":"0.00001","input_cache_read":"0.000000125",
+            "overrides":[{"min_prompt_tokens":200000,"prompt":"0.0000025",
+              "completion":"0.000015","input_cache_read":"0.00000025"}]}},
+          {"id":"anthropic/claude-opus-4.6","pricing":{
+            "prompt":"0.000005","completion":"0.000025"}}
+        ]}"#
+        .to_string()
+    }
+
+    fn million(input: i64, output: i64, cache_read: i64) -> TokenBreakdown {
+        TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write: 0,
+            reasoning: 0,
+        }
+    }
+
+    fn catalog_pricing() -> GooglePricing {
+        GooglePricing::from_openrouter_catalog(
+            &openrouter_catalog(),
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn openrouter_catalog_converts_per_token_rates_to_per_million() {
+        let costs = catalog_pricing()
+            .calculate_token_costs("gemini-3.8-flash", &million(1_000_000, 1_000_000, 1_000_000))
+            .unwrap();
+
+        assert_eq!(costs.input, 0.75);
+        assert_eq!(costs.output, 3.75);
+        assert_eq!(costs.cache_read, 0.075);
+    }
+
+    #[test]
+    fn openrouter_catalog_applies_the_long_context_override() {
+        let pricing = catalog_pricing();
+        let short = pricing
+            .calculate_token_costs("gemini-2.5-pro", &million(200_000, 0, 0))
+            .unwrap();
+        let long = pricing
+            .calculate_token_costs("gemini-2.5-pro", &million(200_001, 0, 0))
+            .unwrap();
+
+        assert!((short.input - 0.25).abs() < 1e-12);
+        assert!((long.input - 0.5000025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn openrouter_catalog_ignores_batch_variants_and_other_providers() {
+        let pricing = catalog_pricing();
+        // The `:batch` row is half price; the standard row must win.
+        assert_eq!(
+            pricing
+                .calculate_token_costs("gemini-3.8-flash", &million(1_000_000, 0, 0))
+                .unwrap()
+                .input,
+            0.75
+        );
+        // Claude models stay with the Anthropic catalog.
+        assert!(pricing
+            .calculate_token_costs("claude-opus-4-6", &million(1_000_000, 0, 0))
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_an_openrouter_catalog_without_gemini_prices() {
+        let thin = r#"{"data":[{"id":"google/gemini-3.8-flash","pricing":{"prompt":"0.00000075"}}]}"#;
+        assert!(GooglePricing::from_openrouter_catalog(
+            thin,
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap()
+        )
+        .is_err());
+        assert!(GooglePricing::from_openrouter_catalog(
+            "not json",
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bundled_google_rates_cover_the_scheduled_increase() {
+        let usage = million(1_000_000, 1_000_000, 0);
+        let current =
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap())
+                .calculate_token_costs("gemini-3.8-flash", &usage)
+                .unwrap();
+        let raised =
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap())
+                .calculate_token_costs("gemini-3.8-flash", &usage)
+                .unwrap();
+        assert_eq!(current.input, 0.75);
+        assert_eq!(raised.input, 1.5);
+        assert!(
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap())
+                .calculate_token_costs("gemini-9.9-flash", &usage)
+                .is_none()
+        );
     }
 }
