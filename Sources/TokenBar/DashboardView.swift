@@ -6,18 +6,23 @@ struct DashboardSummaryView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
+        providesQuota: Bool = true,
         showsClaude: Bool,
-        showsGrok: Bool) -> CGFloat
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
     {
         DashboardOverviewView.preferredHeight(
             quota: quota,
+            providesQuota: providesQuota,
             showsClaude: showsClaude,
-            showsGrok: showsGrok)
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
             + ActivitySummarySection.preferredHeight
             + 1
     }
@@ -28,6 +33,7 @@ struct DashboardSummaryView: View {
                 model: self.model,
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
+                showsAntigravity: self.showsAntigravity,
                 usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
             Divider().padding(.horizontal, 12)
@@ -54,28 +60,42 @@ struct DashboardOverviewView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
+        providesQuota: Bool = true,
         showsClaude: Bool,
-        showsGrok: Bool) -> CGFloat
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
     {
-        self.headerHeight(showsClaude: showsClaude, showsGrok: showsGrok)
-            + self.contentHeight(quota: quota)
+        self.headerHeight(
+            showsClaude: showsClaude,
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
+            + self.contentHeight(quota: quota, providesQuota: providesQuota)
     }
 
-    static func headerHeight(showsClaude: Bool, showsGrok: Bool) -> CGFloat {
+    static func headerHeight(
+        showsClaude: Bool,
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
+    {
         DashboardScope.visibleScopes(
             showsClaude: showsClaude,
-            showsGrok: showsGrok).count > 1
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity).count > 1
             ? self.headerHeight
             : self.compactHeaderHeight
     }
 
-    static func contentHeight(quota: QuotaSnapshot?) -> CGFloat {
-        self.quotaHeight(quota: quota)
+    static func contentHeight(
+        quota: QuotaSnapshot?,
+        providesQuota: Bool = true) -> CGFloat
+    {
+        (providesQuota ? self.quotaHeight(quota: quota) : 0)
             + self.todayHeight
             + self.weeklyResetActivityHeight
             + 2
@@ -104,11 +124,13 @@ struct DashboardOverviewView: View {
                 model: self.model,
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
+                showsAntigravity: self.showsAntigravity,
                 accentColor: self.accentColor,
                 onSelectScope: nil)
                 .frame(height: Self.headerHeight(
                     showsClaude: self.showsClaude,
-                    showsGrok: self.showsGrok))
+                    showsGrok: self.showsGrok,
+                    showsAntigravity: self.showsAntigravity))
             DashboardOverviewContentView(
                 model: self.model,
                 usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
@@ -122,13 +144,15 @@ struct DashboardHeaderView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
     let accentColor: Color
     let onSelectScope: ((DashboardScope) -> Void)?
 
     var body: some View {
         let scopes = DashboardScope.visibleScopes(
             showsClaude: self.showsClaude,
-            showsGrok: self.showsGrok)
+            showsGrok: self.showsGrok,
+            showsAntigravity: self.showsAntigravity)
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Text("TokenBar")
@@ -179,14 +203,16 @@ struct DashboardOverviewContentView: View {
         let platform = self.model.scope.platform
         let quotaState = self.model.quotaState(for: platform)
         VStack(spacing: 0) {
-            Divider().padding(.horizontal, 12)
-            QuotaSummarySection(
-                state: quotaState,
-                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                accentColor: self.accentColor)
-                .frame(
-                    height: DashboardOverviewView.quotaHeight(quota: quotaState.value),
-                    alignment: .top)
+            if self.model.providesQuota(for: platform) {
+                Divider().padding(.horizontal, 12)
+                QuotaSummarySection(
+                    state: quotaState,
+                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                    accentColor: self.accentColor)
+                    .frame(
+                        height: DashboardOverviewView.quotaHeight(quota: quotaState.value),
+                        alignment: .top)
+            }
             Divider().padding(.horizontal, 12)
             TodaySummarySection(
                 state: self.model.visibleActivity,

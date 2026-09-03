@@ -34,13 +34,28 @@ struct DashboardLayoutTests {
     @Test("single-platform header omits the selector height")
     func compactSinglePlatformHeader() {
         #expect(
-            DashboardOverviewView.headerHeight(showsClaude: false, showsGrok: false)
+            DashboardOverviewView.headerHeight(
+                showsClaude: false,
+                showsGrok: false,
+                showsAntigravity: false)
                 == DashboardOverviewView.compactHeaderHeight)
         #expect(
-            DashboardOverviewView.headerHeight(showsClaude: false, showsGrok: false)
-                < DashboardOverviewView.headerHeight(showsClaude: true, showsGrok: false))
+            DashboardOverviewView.headerHeight(
+                showsClaude: false,
+                showsGrok: false,
+                showsAntigravity: false)
+                < DashboardOverviewView.headerHeight(
+                    showsClaude: true,
+                    showsGrok: false,
+                    showsAntigravity: false))
         #expect(
-            DashboardOverviewView.headerHeight(showsClaude: false, showsGrok: false)
-                < DashboardOverviewView.headerHeight(showsClaude: false, showsGrok: true))
+            DashboardOverviewView.headerHeight(
+                showsClaude: false,
+                showsGrok: false,
+                showsAntigravity: false)
+                < DashboardOverviewView.headerHeight(
+                    showsClaude: false,
+                    showsGrok: false,
+                    showsAntigravity: true))
     }
 }

@@ -23,6 +23,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .codex: "Codex"
         case .claude: "Claude"
         case .grok: "Grok"
+        case .antigravity: "Antigravity"
         default: self.rawValue.capitalized
         }
     }
@@ -32,6 +33,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .codex: "C"
         case .claude: "A"
         case .grok: "G"
+        case .antigravity: "AG"
         default: String(self.displayName.prefix(1))
         }
     }
@@ -39,12 +41,14 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
     public static let codex = TokenPlatform(rawValue: "codex")
     public static let claude = TokenPlatform(rawValue: "claude")
     public static let grok = TokenPlatform(rawValue: "grok")
+    public static let antigravity = TokenPlatform(rawValue: "antigravity")
 }
 
 public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
     case codex
     case claude
     case grok
+    case antigravity
 
     public var id: String { self.rawValue }
 
@@ -53,6 +57,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .codex: TokenPlatform.codex.displayName
         case .claude: TokenPlatform.claude.displayName
         case .grok: TokenPlatform.grok.displayName
+        case .antigravity: TokenPlatform.antigravity.displayName
         }
     }
 
@@ -61,6 +66,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .codex: .codex
         case .claude: .claude
         case .grok: .grok
+        case .antigravity: .antigravity
         }
     }
 
@@ -68,12 +74,17 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         self == .codex
     }
 
-    public static func visibleScopes(showsClaude: Bool, showsGrok: Bool) -> [Self] {
+    public static func visibleScopes(
+        showsClaude: Bool,
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> [Self]
+    {
         Self.allCases.filter { scope in
             switch scope {
             case .codex: true
             case .claude: showsClaude
             case .grok: showsGrok
+            case .antigravity: showsAntigravity
             }
         }
     }

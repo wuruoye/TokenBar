@@ -355,6 +355,12 @@ public final class DashboardModel {
         self.quotas[platform] ?? DashboardSourceState()
     }
 
+    /// Antigravity publishes no local quota window, so its tab drops the quota
+    /// card instead of showing a row that can never fill in.
+    public func providesQuota(for platform: TokenPlatform) -> Bool {
+        self.quotaServices[platform] != nil
+    }
+
     public func weeklyQuotaUsage(for platform: TokenPlatform) -> WeeklyQuotaUsageHistory? {
         self.weeklyQuotaUsageHistories[platform]
     }

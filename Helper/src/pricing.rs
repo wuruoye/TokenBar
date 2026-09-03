@@ -990,6 +990,102 @@ fn is_snapshot_of(model_id: &str, base: &str) -> bool {
     compact.len() == 8 && compact.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Google Gemini pricing used for Antigravity estimates.
+///
+/// Rates are the standard paid-tier text prices in USD per million tokens as
+/// published on <https://ai.google.dev/gemini-api/docs/pricing>, captured
+/// 2026-09-03. Google lists these as current through 2026-12-31 and has
+/// scheduled increases for 2027-01-01, so the table needs a review then.
+/// Cached input uses the context-caching rate; Gemini bills thinking tokens at
+/// the output rate. Unknown or future model versions stay unpriced instead of
+/// inheriting a nearby model's rate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GooglePricing;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GoogleModelRate {
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+}
+
+impl GooglePricing {
+    pub fn bundled() -> Self {
+        Self
+    }
+
+    pub fn calculate_token_costs(
+        &self,
+        model_id: &str,
+        usage: &TokenBreakdown,
+    ) -> Option<TokenCostBreakdown> {
+        let prompt_tokens = usage
+            .input
+            .max(0)
+            .saturating_add(usage.cache_read.max(0))
+            .saturating_add(usage.cache_write.max(0));
+        let rate = bundled_google_rate(&normalize_google_model_id(model_id), prompt_tokens)?;
+        let costs = TokenCostBreakdown {
+            input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
+            output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
+                / TOKENS_PER_MILLION,
+            cache_write: usage.cache_write.max(0) as f64 * rate.input_per_million
+                / TOKENS_PER_MILLION,
+            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                / TOKENS_PER_MILLION,
+        };
+        costs.total().is_finite().then_some(costs)
+    }
+}
+
+/// Gemini Pro switches to a long-context rate above this prompt size.
+const GOOGLE_LONG_CONTEXT_THRESHOLD: i64 = 200_000;
+
+fn bundled_google_rate(
+    normalized_model_id: &str,
+    prompt_tokens: i64,
+) -> Option<GoogleModelRate> {
+    let long_context = prompt_tokens > GOOGLE_LONG_CONTEXT_THRESHOLD;
+    let (input, cached_input, output) = match normalized_model_id {
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => (0.75, 0.075, 3.75),
+        "gemini-3.5-flash" => (1.5, 0.15, 9.0),
+        "gemini-3.5-flash-lite" => (0.3, 0.03, 2.5),
+        "gemini-3.1-flash-lite" => (0.25, 0.025, 1.5),
+        "gemini-3.1-pro" if long_context => (4.0, 0.4, 18.0),
+        "gemini-3.1-pro" => (2.0, 0.2, 12.0),
+        "gemini-2.5-pro" if long_context => (2.5, 0.25, 15.0),
+        "gemini-2.5-pro" => (1.25, 0.125, 10.0),
+        "gemini-2.5-flash" => (0.3, 0.03, 2.5),
+        "gemini-2.5-flash-lite" => (0.1, 0.01, 0.4),
+        _ => return None,
+    };
+    Some(GoogleModelRate {
+        input_per_million: input,
+        cached_input_per_million: cached_input,
+        output_per_million: output,
+    })
+}
+
+fn normalize_google_model_id(model_id: &str) -> String {
+    let mut normalized = model_id.trim().to_ascii_lowercase();
+    for prefix in ["models/", "google/", "gemini/", "vertex_ai/", "vertex/"] {
+        if let Some(model) = normalized.strip_prefix(prefix) {
+            normalized = model.to_string();
+            break;
+        }
+    }
+    for suffix in ["-preview", "-latest", "-thinking", "-exp"] {
+        if let Some(model) = normalized.strip_suffix(suffix) {
+            normalized = model.to_string();
+        }
+    }
+    if let Some(index) = normalized.find("-preview-") {
+        normalized.truncate(index);
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

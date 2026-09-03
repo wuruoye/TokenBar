@@ -10,6 +10,7 @@ use crate::usage::{
     normalize_model_for_grouping, CostSource, ServiceTier, TokenCostBreakdown, UnifiedMessage,
 };
 
+pub mod antigravity;
 pub mod codex;
 pub mod claude;
 pub mod grok;
@@ -698,17 +699,15 @@ pub fn build_snapshot_with_platform_resets(
         .iter()
         .map(|message| message.client.clone())
         .collect::<BTreeSet<_>>();
-    let mut platforms = vec![
-        "codex".to_string(),
-        "claude".to_string(),
-        "grok".to_string(),
-    ];
+    let known_platforms = ["codex", "claude", "grok", "antigravity"];
+    let mut platforms = known_platforms
+        .iter()
+        .map(|platform| (*platform).to_string())
+        .collect::<Vec<_>>();
     platforms.extend(
         discovered_platforms
             .into_iter()
-            .filter(|platform| {
-                platform != "codex" && platform != "claude" && platform != "grok"
-            }),
+            .filter(|platform| !known_platforms.contains(&platform.as_str())),
     );
 
     let mut snapshot = build_snapshot_core(
@@ -2708,7 +2707,7 @@ mod tests {
             Some("Claude title")
         );
         assert_eq!(snapshot.today.session_count, 2);
-        assert_eq!(snapshot.sources.len(), 3);
+        assert_eq!(snapshot.sources.len(), 4);
         assert_eq!(
             snapshot
                 .sources

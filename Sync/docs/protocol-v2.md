@@ -49,7 +49,7 @@ GET /v2/reset-metadata
 Authorization: Bearer ...
 ```
 
-This returns only the newest valid `codex`, `claude`, and `grok` weekly reset timestamps. Windows and Linux use it before local collection instead of downloading every device snapshot.
+This returns only the newest valid `codex`, `claude`, `grok`, and `antigravity` weekly reset timestamps. Windows and Linux use it before local collection instead of downloading every device snapshot.
 
 ## Compatibility and limits
 

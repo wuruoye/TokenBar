@@ -294,6 +294,9 @@ public struct ActivityService: ActivityProviding, Sendable {
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.grok]) {
             arguments += ["--grok-weekly-reset-ms", String(value)]
         }
+        if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.antigravity]) {
+            arguments += ["--antigravity-weekly-reset-ms", String(value)]
+        }
         if let memoryDatabaseURL {
             arguments += ["--memory-database", memoryDatabaseURL.path]
         }

@@ -180,6 +180,7 @@ struct ActivityServiceTests {
                 .codex: Date(timeIntervalSince1970: 1_720_000_000.125),
                 .claude: Date(timeIntervalSince1970: 1_730_000_000.5),
                 .grok: Date(timeIntervalSince1970: 1_740_000_000.75),
+                .antigravity: Date(timeIntervalSince1970: 1_750_000_000.25),
             ],
             statisticsTimeZone: .utc)
 
@@ -189,6 +190,7 @@ struct ActivityServiceTests {
             "--weekly-reset-ms", "1720000000125",
             "--claude-weekly-reset-ms", "1730000000500",
             "--grok-weekly-reset-ms", "1740000000750",
+            "--antigravity-weekly-reset-ms", "1750000000250",
         ])
     }
 

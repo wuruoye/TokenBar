@@ -10,6 +10,11 @@ use tokenbar_helper::claude::{
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
 };
+use tokenbar_helper::antigravity::{
+    extract_request_detail as extract_antigravity_request_detail,
+    load_antigravity_session_titles, parse_local_antigravity_messages,
+    LocalParseOptions as AntigravityParseOptions,
+};
 use tokenbar_helper::codex::{parse_local_codex_messages, LocalParseOptions};
 use tokenbar_helper::grok::{
     extract_request_detail as extract_grok_request_detail, load_grok_session_titles,
@@ -17,7 +22,9 @@ use tokenbar_helper::grok::{
 };
 use serde::Deserialize;
 use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
-use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
+use tokenbar_helper::pricing::{
+    AnthropicPricing, CodexPricing, FastPricingBasis, GooglePricing,
+};
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
@@ -25,7 +32,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -36,6 +43,7 @@ struct SnapshotConfig {
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
     grok_weekly_reset_ms: Option<i64>,
+    antigravity_weekly_reset_ms: Option<i64>,
     openai_pricing_markdown: Option<PathBuf>,
     anthropic_pricing_markdown: Option<PathBuf>,
     memory_database: Option<PathBuf>,
@@ -51,6 +59,7 @@ impl Default for SnapshotConfig {
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
             grok_weekly_reset_ms: None,
+            antigravity_weekly_reset_ms: None,
             openai_pricing_markdown: None,
             anthropic_pricing_markdown: None,
             memory_database: None,
@@ -102,6 +111,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     config.start_ms,
                     config.end_ms,
                 ),
+                "antigravity" => extract_antigravity_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
                 platform => Err(format!("unsupported request-detail platform: {platform}")),
             }
             .map_err(io::Error::other)?;
@@ -128,6 +142,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         config.weekly_reset_ms,
         config.claude_weekly_reset_ms,
         config.grok_weekly_reset_ms,
+        config.antigravity_weekly_reset_ms,
     ]
         .into_iter()
         .flatten()
@@ -198,6 +213,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_claude_session_titles(&claude_messages));
+    let antigravity_home_dir = home_dir.clone();
     let grok_messages = parse_local_grok_messages(GrokParseOptions {
         home_dir,
         use_env_roots,
@@ -206,9 +222,23 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     })
     .map_err(io::Error::other)?;
     session_titles.extend(load_grok_session_titles(&grok_messages));
+    let antigravity_options = AntigravityParseOptions {
+        home_dir: antigravity_home_dir,
+        use_env_roots,
+        since: Some(parse_first_day.format("%Y-%m-%d").to_string()),
+        until: Some(parse_last_day.format("%Y-%m-%d").to_string()),
+    };
+    let antigravity_messages = parse_local_antigravity_messages(
+        antigravity_options.clone(),
+        &anthropic_pricing,
+        &GooglePricing::bundled(),
+    )
+    .map_err(io::Error::other)?;
+    session_titles.extend(load_antigravity_session_titles(&antigravity_options));
     let mut messages = codex_messages;
     messages.extend(claude_messages);
     messages.extend(grok_messages);
+    messages.extend(antigravity_messages);
     config
         .statistics_time_zone
         .normalize_message_dates(&mut messages);
@@ -223,6 +253,9 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     }
     if let Some(timestamp) = config.grok_weekly_reset_ms {
         weekly_resets.insert("grok".to_string(), timestamp);
+    }
+    if let Some(timestamp) = config.antigravity_weekly_reset_ms {
+        weekly_resets.insert("antigravity".to_string(), timestamp);
     }
     let mut snapshot = build_snapshot_with_platform_resets(
         messages,
@@ -380,6 +413,19 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .map_err(|_| "--grok-weekly-reset-ms must be an integer")?,
                 );
             }
+            Some("--antigravity-weekly-reset-ms") => {
+                let value = args
+                    .next()
+                    .ok_or("--antigravity-weekly-reset-ms requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--antigravity-weekly-reset-ms must be valid UTF-8")?;
+                config.antigravity_weekly_reset_ms = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| "--antigravity-weekly-reset-ms must be an integer")?,
+                );
+            }
             Some("--memory-database") => {
                 let value = args.next().ok_or("--memory-database requires a path")?;
                 config.memory_database = Some(PathBuf::from(value));
@@ -478,8 +524,10 @@ fn parse_request_detail_args(
             Some("--platform") => {
                 let value = args.next().ok_or("--platform requires a value")?;
                 let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
-                if !matches!(value, "codex" | "claude" | "grok") {
-                    return Err("--platform must be codex, claude, or grok".to_string());
+                if !matches!(value, "codex" | "claude" | "grok" | "antigravity") {
+                    return Err(
+                        "--platform must be codex, claude, grok, or antigravity".to_string()
+                    );
                 }
                 platform = value.to_string();
             }
@@ -551,6 +599,8 @@ mod tests {
             OsString::from("1799000000000"),
             OsString::from("--grok-weekly-reset-ms"),
             OsString::from("1798000000000"),
+            OsString::from("--antigravity-weekly-reset-ms"),
+            OsString::from("1797000000000"),
             OsString::from("--openai-pricing-markdown"),
             OsString::from("/tmp/openai-pricing.md"),
             OsString::from("--anthropic-pricing-markdown"),
@@ -568,6 +618,7 @@ mod tests {
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
+                antigravity_weekly_reset_ms: Some(1_797_000_000_000),
                 openai_pricing_markdown: Some(PathBuf::from("/tmp/openai-pricing.md")),
                 anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
                 memory_database: None,

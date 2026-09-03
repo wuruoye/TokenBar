@@ -245,7 +245,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var visibleScopes: [DashboardScope] {
         DashboardScope.visibleScopes(
             showsClaude: self.settings.showsClaude,
-            showsGrok: self.settings.showsGrok)
+            showsGrok: self.settings.showsGrok,
+            showsAntigravity: self.settings.showsAntigravity)
     }
 
     private func updateStatusButton() {
@@ -253,13 +254,18 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let codex = self.statusValues(for: .codex)
         let claude = self.settings.showsClaude ? self.statusValues(for: .claude) : nil
         let grok = self.settings.showsGrok ? self.statusValues(for: .grok) : nil
+        let antigravity = self.settings.showsAntigravity
+            ? self.statusValues(for: .antigravity)
+            : nil
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
             claudeToday: claude?.today,
             claudeWeekly: claude?.weekly,
             grokToday: grok?.today,
-            grokWeekly: grok?.weekly)
+            grokWeekly: grok?.weekly,
+            antigravityToday: antigravity?.today,
+            antigravityWeekly: antigravity?.weekly)
         self.statusLabelLayout = layout
         button.image = layout.image
 
@@ -280,6 +286,12 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 "Grok Build · Today: \(grok.today) tokens · Weekly: \(grok.weekly) left")
             accessibilityLabels.append(
                 "Grok Build. Today, \(grok.today) tokens. Weekly quota, \(grok.weekly) remaining.")
+        }
+        if let antigravity {
+            toolTips.append(
+                "Antigravity · Today: \(antigravity.today) tokens · Weekly: \(antigravity.weekly) left")
+            accessibilityLabels.append(
+                "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.")
         }
         button.toolTip = toolTips.joined(separator: "\n")
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
@@ -368,6 +380,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.statisticsTimeZone
             _ = self.settings.showsClaude
             _ = self.settings.showsGrok
+            _ = self.settings.showsAntigravity
             _ = self.settings.usesWeekdayWeeklyPacing
             _ = self.settings.showsFullRequestContentOnHover
             _ = self.settings.monitorsCodexMemory
@@ -442,8 +455,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     private func updateOverviewHeight() {
-        let quota = self.model.quotaState(for: self.model.scope.platform).value
-        self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
+        self.overviewHost?.updateHeight(self.overviewHeight(for: self.model.scope))
+    }
+
+    private func overviewHeight(for scope: DashboardScope) -> CGFloat {
+        DashboardOverviewView.contentHeight(
+            quota: self.model.quotaState(for: scope.platform).value,
+            providesQuota: self.model.providesQuota(for: scope.platform))
     }
 
     private func selectScope(_ scope: DashboardScope) {
@@ -453,8 +471,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0
             context.allowsImplicitAnimation = false
-            let quota = self.model.quotaState(for: scope.platform).value
-            self.overviewHost?.updateHeight(DashboardOverviewView.contentHeight(quota: quota))
+            self.overviewHost?.updateHeight(self.overviewHeight(for: scope))
             self.updateMemoryVisibility(scope: scope)
             self.updateSessionProjectionAndVisibility(scope: scope)
             self.updateActivitySessionProjectionAndVisibility(scope: scope)
@@ -492,11 +509,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let accentColor = self.settings.theme.color
         let headerHeight = DashboardOverviewView.headerHeight(
             showsClaude: self.settings.showsClaude,
-            showsGrok: self.settings.showsGrok)
+            showsGrok: self.settings.showsGrok,
+            showsAntigravity: self.settings.showsAntigravity)
         let header = DashboardHeaderView(
             model: self.model,
             showsClaude: self.settings.showsClaude,
             showsGrok: self.settings.showsGrok,
+            showsAntigravity: self.settings.showsAntigravity,
             accentColor: accentColor,
             onSelectScope: { [weak self] scope in
                 self?.selectScope(scope)
@@ -514,8 +533,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         headerItem.isEnabled = true
         self.rootMenu.addItem(headerItem)
 
-        let quota = self.model.quotaState(for: self.model.scope.platform).value
-        let overviewHeight = DashboardOverviewView.contentHeight(quota: quota)
+        let overviewHeight = self.overviewHeight(for: self.model.scope)
         let overview = DashboardOverviewContentView(
             model: self.model,
             usesWeekdayWeeklyPacing: self.settings.usesWeekdayWeeklyPacing,
@@ -1663,7 +1681,9 @@ enum StatusLabelRenderer {
         claudeToday: String? = nil,
         claudeWeekly: String? = nil,
         grokToday: String? = nil,
-        grokWeekly: String? = nil) -> StatusLabelLayout
+        grokWeekly: String? = nil,
+        antigravityToday: String? = nil,
+        antigravityWeekly: String? = nil) -> StatusLabelLayout
     {
         var values: [(scope: DashboardScope, today: String, weekly: String)] = [
             (.codex, codexToday, codexWeekly),
@@ -1673,6 +1693,9 @@ enum StatusLabelRenderer {
         }
         if let grokToday, let grokWeekly {
             values.append((.grok, grokToday, grokWeekly))
+        }
+        if let antigravityToday, let antigravityWeekly {
+            values.append((.antigravity, antigravityToday, antigravityWeekly))
         }
         let images = values.map { value in
             self.image(
@@ -1789,10 +1812,10 @@ enum PlatformStatusIcon {
         if let cached = self.cache[platform] {
             return cached
         }
-        if platform == .grok,
+        if let symbolName = self.symbolName(for: platform),
            let symbol = NSImage(
-               systemSymbolName: "xmark",
-               accessibilityDescription: "Grok")?
+               systemSymbolName: symbolName,
+               accessibilityDescription: platform.displayName)?
                .withSymbolConfiguration(.init(pointSize: 14, weight: .bold))
         {
             symbol.size = self.size
@@ -1814,10 +1837,18 @@ enum PlatformStatusIcon {
         return image
     }
 
+    private static func symbolName(for platform: TokenPlatform) -> String? {
+        switch platform {
+        case .grok: "xmark"
+        default: nil
+        }
+    }
+
     private static func resourceName(for platform: TokenPlatform) -> String? {
         switch platform {
         case .codex: "ProviderIcon-codex"
         case .claude: "ProviderIcon-claude"
+        case .antigravity: "ProviderIcon-antigravity"
         default: nil
         }
     }
