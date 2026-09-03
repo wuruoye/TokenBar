@@ -66,6 +66,32 @@ struct OpenAIPricingCatalogTests {
         #expect(try Data(contentsOf: fileURL) == stale)
     }
 
+    @Test("forces a fresh catalog once and throttles repeated unknown-model refreshes")
+    func forcesFreshCatalogOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let fileURL = directory.appendingPathComponent("openai-pricing.md")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Self.validMarkdown.write(to: fileURL)
+        let now = Date(timeIntervalSince1970: 1_788_300_000)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: fileURL.path)
+        let recorder = OpenAIPricingFetchRecorder(data: Self.validMarkdown)
+        let updater = OpenAIPricingCatalogUpdater(
+            fileURL: fileURL,
+            now: { now },
+            fetch: { url in await recorder.fetch(url) })
+
+        let cached = await updater.refreshIfNeeded()
+        let refreshed = await updater.refreshNowIfAllowed()
+        let throttled = await updater.refreshNowIfAllowed()
+
+        #expect(cached == fileURL)
+        #expect(refreshed == fileURL)
+        #expect(throttled == nil)
+        #expect(await recorder.count == 1)
+    }
+
     @Test("rejects a catalog without the official Fast table")
     func rejectsMissingFastTable() async {
         let directory = FileManager.default.temporaryDirectory

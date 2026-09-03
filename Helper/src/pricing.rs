@@ -585,12 +585,14 @@ fn parse_official_anthropic_rates(
 ) -> Result<HashMap<String, AnthropicModelRate>, String> {
     let mut lines = markdown.lines();
     let Some(header) = lines.find(|line| {
-        line.trim_start().starts_with("| Model")
-            && line.contains("Base Input Tokens")
-            && line.contains("5m Cache Writes")
-            && line.contains("1h Cache Writes")
-            && line.contains("Cache Hits & Refreshes")
-            && line.contains("Output Tokens")
+        let header = line.trim_start().to_ascii_lowercase();
+        header.starts_with("| model")
+            && header.contains("base input tokens")
+            && header.contains("5m cache writes")
+            && header.contains("1h cache writes")
+            && (header.contains("cache hits and refreshes")
+                || header.contains("cache hits & refreshes"))
+            && header.contains("output tokens")
     }) else {
         return Err("official Anthropic pricing table header was not found".to_string());
     };
@@ -702,10 +704,15 @@ fn official_rate_from_cells(cells: &[&str]) -> Option<AnthropicModelRate> {
 
 fn parse_usd_per_mtok(value: &str) -> Option<f64> {
     let value = value.trim();
-    if !value.ends_with("/ MTok") {
+    let (price, footnote) = value.split_once("/ MTok")?;
+    if !footnote.chars().all(|character| {
+        character.is_ascii_digit()
+            || matches!(character, '^' | '{' | '}' | '[' | ']')
+            || matches!(character, '¹' | '²' | '³')
+    }) {
         return None;
     }
-    let number = value.strip_prefix('$')?.split_whitespace().next()?;
+    let number = price.trim().strip_prefix('$')?.trim();
     let price = number.replace(',', "").parse::<f64>().ok()?;
     (price.is_finite() && price > 0.0 && price <= 1_000.0).then_some(price)
 }
@@ -740,6 +747,8 @@ fn normalize_anthropic_model_id(model_id: &str) -> String {
     }
 
     for (alias, canonical) in [
+        ("claude-5-1-fable", "claude-fable-5-1"),
+        ("claude-5-1-mythos", "claude-mythos-5-1"),
         ("claude-5-fable", "claude-fable-5"),
         ("claude-5-mythos", "claude-mythos-5"),
         ("claude-5-opus", "claude-opus-5"),
@@ -752,6 +761,8 @@ fn normalize_anthropic_model_id(model_id: &str) -> String {
         ("claude-4-5-sonnet", "claude-sonnet-4-5"),
         ("claude-4-6-haiku", "claude-haiku-4-6"),
         ("claude-4-5-haiku", "claude-haiku-4-5"),
+        ("fable-5-1", "claude-fable-5-1"),
+        ("mythos-5-1", "claude-mythos-5-1"),
         ("fable-5", "claude-fable-5"),
         ("mythos-5", "claude-mythos-5"),
         ("opus-5", "claude-opus-5"),
@@ -1460,8 +1471,9 @@ mod tests {
         const MARKDOWN: &str = r#"
 ## Model pricing
 
-| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
 | --- | --- | --- | --- | --- | --- |
+| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok1 | $50 / MTok |
 | Claude Fable 5 | $10 / MTok | $12.50 / MTok | $20 / MTok | $1 / MTok | $50 / MTok |
 | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
 | Claude Sonnet 5 [through August 31, 2026](/pricing) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
@@ -1499,6 +1511,13 @@ mod tests {
                 .input,
             3.0
         );
+        let fable = standard
+            .calculate_token_costs("claude-fable-5-1", &TokenBreakdown {
+                cache_read: 1_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(fable.cache_read, 0.25);
         assert!(AnthropicPricing::from_official_markdown(
             "# Pricing without a table",
             NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),

@@ -36,6 +36,26 @@ private actor RecordingActivityHelperRunner: ActivityHelperRunning {
     }
 }
 
+private actor SequencedActivityHelperRunner: ActivityHelperRunning {
+    private var outputs: [Data]
+    private(set) var argumentHistory: [[String]] = []
+
+    init(outputs: [Data]) {
+        self.outputs = outputs
+    }
+
+    func run(
+        executableURL _: URL,
+        arguments: [String],
+        environment _: [String: String],
+        timeout _: TimeInterval) throws -> Data
+    {
+        self.argumentHistory.append(arguments)
+        guard !self.outputs.isEmpty else { throw ActivityServiceError.emptyOutput }
+        return self.outputs.removeFirst()
+    }
+}
+
 private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
     let fileURL: URL?
 
@@ -45,6 +65,26 @@ private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
 
     func refreshIfNeeded() -> URL? {
         self.fileURL
+    }
+}
+
+private actor RefreshingAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
+    let cachedURL: URL
+    let refreshedURL: URL
+    private(set) var forcedRefreshCount = 0
+
+    init(cachedURL: URL, refreshedURL: URL) {
+        self.cachedURL = cachedURL
+        self.refreshedURL = refreshedURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.cachedURL
+    }
+
+    func refreshNowIfAllowed() -> URL? {
+        self.forcedRefreshCount += 1
+        return self.refreshedURL
     }
 }
 
@@ -270,6 +310,37 @@ struct ActivityServiceTests {
         ])
     }
 
+    @Test("refreshes the matching catalog and reruns the helper for an unpriced model")
+    func refreshesUnpricedModel() async throws {
+        let runner = SequencedActivityHelperRunner(outputs: [
+            Self.pricingSnapshot(costSource: "unknown", costUsd: 0),
+            Self.pricingSnapshot(costSource: "estimated", costUsd: 12.5),
+        ])
+        let catalog = RefreshingAnthropicPricingCatalog(
+            cachedURL: URL(fileURLWithPath: "/tmp/anthropic-pricing-old.md"),
+            refreshedURL: URL(fileURLWithPath: "/tmp/anthropic-pricing-new.md"))
+        let service = ActivityService(
+            anthropicPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let snapshot = try await service.fetchActivity()
+
+        #expect(snapshot.sessions[0].requests[0].costSource == .estimated)
+        #expect(snapshot.sessions[0].requests[0].costUsd == 12.5)
+        #expect(await catalog.forcedRefreshCount == 1)
+        #expect(await runner.argumentHistory == [
+            [
+                "--statistics-timezone", "utc",
+                "--anthropic-pricing-markdown", "/tmp/anthropic-pricing-old.md",
+            ],
+            [
+                "--statistics-timezone", "utc",
+                "--anthropic-pricing-markdown", "/tmp/anthropic-pricing-new.md",
+            ],
+        ])
+    }
+
     @Test("rejects malformed helper JSON")
     func rejectsMalformedJSON() async {
         let service = ActivityService(
@@ -351,6 +422,47 @@ struct ActivityServiceTests {
         #expect(request.modelDurationMs == nil)
         #expect(request.timeToFirstTokenMs == nil)
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
+    }
+
+    private static func pricingSnapshot(costSource: String, costUsd: Double) -> Data {
+        Data(
+            """
+            {
+              "schemaVersion": 3,
+              "generatedAtMs": 1788300000000,
+              "timezone": "UTC",
+              "today": {
+                "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                "costUsd": \(costUsd),
+                "requestCount": 1,
+                "sessionCount": 1
+              },
+              "sessions": [{
+                "id": "session-fable",
+                "platform": "claude",
+                "startedAtMs": 1788300000000,
+                "endedAtMs": 1788300001000,
+                "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                "costUsd": \(costUsd),
+                "models": ["claude-fable-5-1"],
+                "requests": [{
+                  "id": "request-fable",
+                  "platform": "claude",
+                  "sessionId": "session-fable",
+                  "physicalSessionId": "session-fable",
+                  "isSubagent": false,
+                  "model": "claude-fable-5-1",
+                  "provider": "anthropic",
+                  "startedAtMs": 1788300000000,
+                  "endedAtMs": 1788300001000,
+                  "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                  "costUsd": \(costUsd),
+                  "costSource": "\(costSource)"
+                }]
+              }],
+              "days": []
+            }
+            """.utf8)
     }
 
     private static let fixtureData = Data(

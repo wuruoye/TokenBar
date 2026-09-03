@@ -2,6 +2,11 @@ import Foundation
 
 public protocol OpenAIPricingCatalogUpdating: Sendable {
     func refreshIfNeeded() async -> URL?
+    func refreshNowIfAllowed() async -> URL?
+}
+
+public extension OpenAIPricingCatalogUpdating {
+    func refreshNowIfAllowed() async -> URL? { nil }
 }
 
 public actor OpenAIPricingCatalogUpdater: OpenAIPricingCatalogUpdating {
@@ -35,21 +40,29 @@ public actor OpenAIPricingCatalogUpdater: OpenAIPricingCatalogUpdating {
     }
 
     public func refreshIfNeeded() async -> URL? {
+        await self.refresh(force: false)
+    }
+
+    public func refreshNowIfAllowed() async -> URL? {
+        await self.refresh(force: true)
+    }
+
+    private func refresh(force: Bool) async -> URL? {
         let now = self.now()
-        if self.isFresh(at: now) {
+        if !force, self.isFresh(at: now) {
             return self.fileURL
         }
         if let lastAttemptAt,
            now.timeIntervalSince(lastAttemptAt) < self.retryInterval
         {
-            return self.existingURL
+            return force ? nil : self.existingURL
         }
         self.lastAttemptAt = now
 
         do {
             let data = try await self.fetch(self.sourceURL)
             guard Self.isValidOfficialMarkdown(data) else {
-                return self.existingURL
+                return force ? nil : self.existingURL
             }
             let directory = self.fileURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(
@@ -61,7 +74,7 @@ public actor OpenAIPricingCatalogUpdater: OpenAIPricingCatalogUpdating {
                 ofItemAtPath: self.fileURL.path)
             return self.fileURL
         } catch {
-            return self.existingURL
+            return force ? nil : self.existingURL
         }
     }
 
