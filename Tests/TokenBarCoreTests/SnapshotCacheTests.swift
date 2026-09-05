@@ -23,10 +23,7 @@ struct SnapshotCacheTests {
             costUsd: 2.5,
             requestCount: 8,
             sessionCount: 3,
-            averageGenerationTokensPerSecond: 25,
-            timedGeneratedTokens: 30,
-            totalModelDurationMs: 1_200,
-            timedRequestCount: 2)
+            averageGenerationTokensPerSecond: 25)
         let nestedRequest = RequestSummary(
             id: "child-request",
             sessionId: "session-1",
@@ -82,30 +79,6 @@ struct SnapshotCacheTests {
         #expect(loaded?.rangeTotals == rangeTotals)
         #expect(loaded?.weeklySinceReset == weeklySinceReset)
         #expect(permissions == 0o600)
-    }
-
-    @Test("round-trips daily timing summaries")
-    func roundTripsDailyTimingSummaries() throws {
-        let day = DailySummary(
-            date: "2026-09-02",
-            tokens: TokenBreakdown(
-                input: 10,
-                output: 120,
-                cacheRead: 30,
-                cacheWrite: 5,
-                reasoning: 20),
-            costUsd: 0.5,
-            requestCount: 3,
-            sessionCount: 2,
-            timedGeneratedTokens: 100,
-            totalModelDurationMs: 2_500,
-            timedRequestCount: 2)
-
-        let decoded = try JSONDecoder().decode(
-            DailySummary.self,
-            from: JSONEncoder().encode(day))
-
-        #expect(decoded == day)
     }
 
     @Test("persists independent platform quota snapshots")

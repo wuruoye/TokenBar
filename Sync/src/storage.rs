@@ -5,11 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::incremental::IncrementalState;
-
 const LAST_RUN_FILE: &str = "last-run.json";
-const INCREMENTAL_STATE_FILE: &str = "incremental-upload-v2.json";
-const MAX_INCREMENTAL_STATE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -55,17 +51,4 @@ pub fn read_last_run(state_dir: &Path) -> Result<Option<LastRunStatus>> {
         return Ok(None);
     }
     read_json(&path).map(Some)
-}
-
-pub fn write_incremental_state(state_dir: &Path, state: &IncrementalState) -> Result<()> {
-    write_json(&state_dir.join(INCREMENTAL_STATE_FILE), state)
-}
-
-pub fn read_incremental_state(state_dir: &Path) -> Option<IncrementalState> {
-    let path = state_dir.join(INCREMENTAL_STATE_FILE);
-    let metadata = fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_INCREMENTAL_STATE_BYTES {
-        return None;
-    }
-    read_json(&path).ok()
 }

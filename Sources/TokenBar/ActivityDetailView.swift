@@ -38,38 +38,11 @@ struct ActivityDetailView: View {
                 cacheWrite: total.cacheWrite.saturatingAdd(day.tokens.cacheWrite),
                 reasoning: total.reasoning.saturatingAdd(day.tokens.reasoning))
         }
-        let hasCompleteTiming = self.days.allSatisfy {
-            $0.timedGeneratedTokens != nil
-                && $0.totalModelDurationMs != nil
-                && $0.timedRequestCount != nil
-        }
-        let timedGeneratedTokens = hasCompleteTiming
-            ? self.days.reduce(0) { $0.saturatingAdd($1.timedGeneratedTokens ?? 0) }
-            : nil
-        let totalModelDurationMs = hasCompleteTiming
-            ? self.days.reduce(0) { $0.saturatingAdd($1.totalModelDurationMs ?? 0) }
-            : nil
-        let timedRequestCount = hasCompleteTiming
-            ? self.days.reduce(0) { $0 + ($1.timedRequestCount ?? 0) }
-            : nil
-        let averageGenerationTokensPerSecond = if let timedGeneratedTokens,
-                                                  let totalModelDurationMs,
-                                                  timedGeneratedTokens > 0,
-                                                  totalModelDurationMs > 0
-        {
-            Double(timedGeneratedTokens) * 1_000 / Double(totalModelDurationMs)
-        } else {
-            nil
-        }
         return ActivityTotals(
             tokens: tokens,
             costUsd: self.days.reduce(0) { $0 + $1.costUsd },
             requestCount: self.days.reduce(0) { $0 + $1.requestCount },
-            sessionCount: self.days.reduce(0) { $0 + $1.sessionCount },
-            averageGenerationTokensPerSecond: averageGenerationTokensPerSecond,
-            timedGeneratedTokens: timedGeneratedTokens,
-            totalModelDurationMs: totalModelDurationMs,
-            timedRequestCount: timedRequestCount)
+            sessionCount: self.days.reduce(0) { $0 + $1.sessionCount })
     }
 
     var body: some View {

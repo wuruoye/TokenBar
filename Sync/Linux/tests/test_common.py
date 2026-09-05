@@ -2,13 +2,8 @@ import unittest
 
 from tokenbar_sync.common import (
     ValidationError,
-    apply_partition_delta,
-    incremental_delta,
     json_loads_strict,
-    materialize_snapshot,
-    partition_manifest,
     sanitize_snapshot,
-    snapshot_partitions,
     validate_envelope,
 )
 
@@ -52,53 +47,6 @@ def envelope(snapshot=None):
 
 
 class CommonTests(unittest.TestCase):
-    def test_incremental_partitions_round_trip_and_replace_history(self):
-        snapshot = envelope()["snapshot"]
-        snapshot["days"] = [{
-            "date": "2026-08-11",
-            "tokens": zero_tokens(),
-            "costUsd": 0,
-            "requestCount": 1,
-            "sessionCount": 0,
-            "models": [],
-        }]
-        snapshot["sessions"] = [{
-            "id": "session/a",
-            "platform": "codex",
-            "startedAtMs": 1,
-            "endedAtMs": 2,
-            "tokens": zero_tokens(),
-            "costUsd": 0,
-            "models": [],
-            "requests": [],
-        }]
-        previous = snapshot_partitions(snapshot)
-        rebuilt = materialize_snapshot(previous)
-        self.assertEqual(rebuilt, snapshot)
-
-        current = dict(snapshot)
-        current["generatedAtMs"] = 2
-        current["days"] = [{**snapshot["days"][0], "requestCount": 2}]
-        current["sessions"] = []
-        current_parts = snapshot_partitions(current)
-        upserts, deletes, manifest = incremental_delta(
-            current_parts,
-            partition_manifest(previous),
-        )
-        self.assertIn("summary", upserts)
-        self.assertEqual(len(deletes), 1)
-        self.assertEqual(apply_partition_delta(snapshot, upserts, deletes), current)
-        self.assertEqual(manifest, partition_manifest(current_parts))
-
-    def test_incremental_delta_rejects_private_content(self):
-        snapshot = envelope()["snapshot"]
-        with self.assertRaisesRegex(ValidationError, "privacy-sanitized"):
-            apply_partition_delta(
-                snapshot,
-                {"summary": {"promptPreview": "private"}},
-                [],
-            )
-
     def test_recursive_sanitizer(self):
         source = {
             "schemaVersion": 9,
@@ -259,58 +207,6 @@ class CommonTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValidationError):
                     validate_envelope(invalid, path_device_id=DEVICE_ID)
-
-    def test_validate_timing_summary_contract(self):
-        valid = envelope()
-        valid["snapshot"]["today"].update({
-            "tokens": {**zero_tokens(), "output": 100},
-            "averageGenerationTokensPerSecond": 50.0,
-            "timedGeneratedTokens": 100,
-            "totalModelDurationMs": 2_000,
-            "timedRequestCount": 1,
-        })
-        self.assertIs(validate_envelope(valid, path_device_id=DEVICE_ID), valid)
-
-        partial = envelope()
-        partial["snapshot"]["today"]["timedGeneratedTokens"] = 100
-        with self.assertRaisesRegex(ValidationError, "all timing summary fields"):
-            validate_envelope(partial, path_device_id=DEVICE_ID)
-
-        inconsistent = envelope()
-        inconsistent["snapshot"]["today"].update({
-            "tokens": {**zero_tokens(), "output": 100},
-            "averageGenerationTokensPerSecond": 10.0,
-            "timedGeneratedTokens": 100,
-            "totalModelDurationMs": 2_000,
-            "timedRequestCount": 1,
-        })
-        with self.assertRaisesRegex(ValidationError, "inconsistent timing totals"):
-            validate_envelope(inconsistent, path_device_id=DEVICE_ID)
-
-        invalid_day = envelope()
-        invalid_day["snapshot"]["days"] = [{
-            "date": "2026-08-11",
-            "tokens": zero_tokens(),
-            "costUsd": 0,
-            "requestCount": 1,
-            "sessionCount": 1,
-            "timedGeneratedTokens": 100,
-            "totalModelDurationMs": 0,
-            "timedRequestCount": 1,
-            "models": [],
-        }]
-        with self.assertRaisesRegex(ValidationError, "positive token and duration totals"):
-            validate_envelope(invalid_day, path_device_id=DEVICE_ID)
-
-        excessive = envelope()
-        excessive["snapshot"]["today"].update({
-            "averageGenerationTokensPerSecond": 50.0,
-            "timedGeneratedTokens": 100,
-            "totalModelDurationMs": 2_000,
-            "timedRequestCount": 1,
-        })
-        with self.assertRaisesRegex(ValidationError, "more tokens than it contains"):
-            validate_envelope(excessive, path_device_id=DEVICE_ID)
 
 
 if __name__ == "__main__":

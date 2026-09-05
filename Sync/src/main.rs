@@ -1,7 +1,6 @@
 mod collector;
 mod config;
 mod device;
-mod incremental;
 mod protocol;
 mod storage;
 mod sync_client;
@@ -16,10 +15,9 @@ use serde::Serialize;
 use tokenbar_helper::StatisticsTimeZone;
 
 use crate::config::{AppConfig, ConfigOverrides};
-use crate::incremental::{IncrementalPlan, UploadMode};
 use crate::protocol::{DeviceDescriptor, DeviceOs};
 use crate::storage::LastRunStatus;
-use crate::sync_client::{Endpoint, SyncClient, SyncError};
+use crate::sync_client::{Endpoint, SyncClient};
 use crate::weekly_resets::PlatformWeeklyResets;
 
 #[derive(Debug, Parser)]
@@ -146,74 +144,40 @@ fn collect_command(config: &AppConfig, output: Option<PathBuf>) -> Result<()> {
 fn upload_command(config: &AppConfig) -> Result<()> {
     let endpoint = required_endpoint(config)?;
     let token = required_token()?;
-    let endpoint_key = endpoint.state_key();
     let client = SyncClient::new(endpoint)?;
     let now_ms = Utc::now().timestamp_millis();
-    let resets = fetch_weekly_resets(&client, &token, now_ms);
+    let resets = match client.download(&token) {
+        Ok(response) => PlatformWeeklyResets::from_download(&response, now_ms),
+        Err(error) => {
+            eprintln!(
+                "weekly reset metadata unavailable ({}); continuing without remote resets",
+                error.category()
+            );
+            PlatformWeeklyResets::default()
+        }
+    };
     let snapshot = collector::collect(config, resets)?;
     let schema_version = snapshot.schema_version;
     let generated_at_ms = snapshot.generated_at_ms;
     let envelope = protocol::upload_envelope(snapshot.value, descriptor(config)?)?;
     debug_assert_eq!(envelope.generated_at_ms, generated_at_ms);
     let attempted_at_ms = Utc::now().timestamp_millis();
-    let previous_state = storage::read_incremental_state(&config.state_dir);
-    let mut plan = IncrementalPlan::build(
-        &envelope,
-        previous_state.as_ref(),
-        &endpoint_key,
-        config.days,
-        attempted_at_ms,
-    )?;
 
-    let uploaded = match client.upload_v2(&token, &plan.body) {
-        Ok(result) => Ok((result.http_status, result.revision, plan.mode.label())),
-        Err(SyncError::Conflict) if plan.mode == UploadMode::Delta => {
-            plan.force_full();
-            client
-                .upload_v2(&token, &plan.body)
-                .map(|result| (result.http_status, result.revision, plan.mode.label()))
-        }
-        Err(SyncError::Http(404)) => client
-            .upload(&token, &envelope)
-            .map(|result| (result.http_status, 0, "v1-full")),
-        Err(error) => Err(error),
-    };
-
-    match uploaded {
-        Ok((http_status, revision, transport)) => {
-            if revision > 0 {
-                match plan.state_after(
-                    endpoint_key,
-                    revision,
-                    config.days,
-                    attempted_at_ms,
-                ) {
-                    Ok(state) => {
-                        if let Err(error) = storage::write_incremental_state(&config.state_dir, &state)
-                        {
-                            eprintln!(
-                                "incremental metadata could not be saved; next run will recalibrate: {error:#}"
-                            );
-                        }
-                    }
-                    Err(error) => eprintln!(
-                        "incremental metadata was invalid; next run will recalibrate: {error:#}"
-                    ),
-                }
-            }
+    match client.upload(&token, &envelope) {
+        Ok(result) => {
             storage::write_last_run(
                 &config.state_dir,
                 &LastRunStatus {
                     attempted_at_ms,
                     succeeded: true,
-                    http_status: Some(http_status),
+                    http_status: Some(result.http_status),
                     category: "success".to_string(),
                     snapshot_schema_version: Some(schema_version),
                 },
             )?;
             println!(
-                "upload succeeded: HTTP {}, device={}, schemaVersion={}, transport={}",
-                http_status, envelope.device.id, schema_version, transport
+                "upload succeeded: HTTP {}, device={}, schemaVersion={}",
+                result.http_status, envelope.device.id, schema_version
             );
             Ok(())
         }
@@ -301,26 +265,10 @@ fn prefetch_weekly_resets(config: &AppConfig) -> PlatformWeeklyResets {
     let Ok(client) = SyncClient::new(endpoint) else {
         return PlatformWeeklyResets::default();
     };
-    fetch_weekly_resets(&client, &token, Utc::now().timestamp_millis())
-}
-
-fn fetch_weekly_resets(
-    client: &SyncClient,
-    token: &str,
-    now_ms: i64,
-) -> PlatformWeeklyResets {
-    match client.reset_metadata(token) {
-        Ok(response) => PlatformWeeklyResets::from_metadata(&response, now_ms),
-        Err(SyncError::Http(404)) => match client.download(token) {
-            Ok(response) => PlatformWeeklyResets::from_download(&response, now_ms),
-            Err(error) => {
-                eprintln!(
-                    "weekly reset metadata unavailable ({}); continuing without remote resets",
-                    error.category()
-                );
-                PlatformWeeklyResets::default()
-            }
-        },
+    match client.download(&token) {
+        Ok(response) => {
+            PlatformWeeklyResets::from_download(&response, Utc::now().timestamp_millis())
+        }
         Err(error) => {
             eprintln!(
                 "weekly reset metadata unavailable ({}); continuing without remote resets",

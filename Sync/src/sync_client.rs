@@ -4,8 +4,6 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::redirect::Policy;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use thiserror::Error;
 use url::{Host, Url};
 use uuid::Uuid;
@@ -14,8 +12,6 @@ use crate::protocol::{
     normalize_download, validate_upload_envelope, DownloadResponse, UploadEnvelope,
     MAX_UPLOAD_BYTES,
 };
-use crate::incremental::{V2UploadEnvelope, PROTOCOL_V2};
-use crate::weekly_resets::ResetMetadataResponse;
 
 const MAX_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -64,42 +60,11 @@ impl Endpoint {
         url.set_path(&format!("/v1/snapshots/{device_id}"));
         url
     }
-
-    fn v2_upload_url(&self, device_id: Uuid) -> Url {
-        let mut url = self.0.clone();
-        url.set_path(&format!("/v2/snapshots/{device_id}"));
-        url
-    }
-
-    fn reset_metadata_url(&self) -> Url {
-        let mut url = self.0.clone();
-        url.set_path("/v2/reset-metadata");
-        url
-    }
-
-    pub fn state_key(&self) -> String {
-        self.0.as_str().to_string()
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct UploadResult {
     pub http_status: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct IncrementalUploadResult {
-    pub http_status: u16,
-    pub revision: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct IncrementalUploadResponse {
-    protocol_version: u32,
-    revision: u64,
-    status: String,
-    received_at_ms: i64,
 }
 
 #[derive(Debug, Error)]
@@ -130,8 +95,6 @@ pub enum SyncError {
     DownloadTooLarge,
     #[error("download response is not valid protocol v1 JSON")]
     InvalidDownload,
-    #[error("server response is not valid protocol v2 JSON")]
-    InvalidV2Response,
 }
 
 impl SyncError {
@@ -139,7 +102,7 @@ impl SyncError {
         match self {
             Self::InvalidEndpoint | Self::HttpsRequired | Self::MissingToken => "configuration",
             Self::UploadTooLarge | Self::ServerBodyTooLarge | Self::DownloadTooLarge => "size",
-            Self::Encode | Self::InvalidDownload | Self::InvalidV2Response => "protocol",
+            Self::Encode | Self::InvalidDownload => "protocol",
             Self::Network => "network",
             Self::Authentication => "authentication",
             Self::Conflict => "conflict",
@@ -207,69 +170,6 @@ impl SyncClient {
         }
     }
 
-    pub fn upload_v2(
-        &self,
-        token: &str,
-        envelope: &V2UploadEnvelope,
-    ) -> Result<IncrementalUploadResult, SyncError> {
-        require_token(token)?;
-        let body = serde_json::to_vec(envelope).map_err(|_| SyncError::Encode)?;
-        if body.len() > MAX_UPLOAD_BYTES {
-            return Err(SyncError::UploadTooLarge);
-        }
-        let response = self
-            .client
-            .put(self.endpoint.v2_upload_url(envelope.device_id()))
-            .bearer_auth(token)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .map_err(|_| SyncError::Network)?;
-        let status = response.status().as_u16();
-        match status {
-            200..=299 => {}
-            401 | 403 => return Err(SyncError::Authentication),
-            409 => return Err(SyncError::Conflict),
-            413 => return Err(SyncError::ServerBodyTooLarge),
-            other => return Err(SyncError::Http(other)),
-        }
-        let decoded: IncrementalUploadResponse =
-            decode_limited(response, 64 * 1024, SyncError::InvalidV2Response)?;
-        if decoded.protocol_version != PROTOCOL_V2
-            || decoded.revision == 0
-            || decoded.received_at_ms <= 0
-            || !matches!(decoded.status.as_str(), "created" | "updated" | "retry")
-        {
-            return Err(SyncError::InvalidV2Response);
-        }
-        Ok(IncrementalUploadResult {
-            http_status: status,
-            revision: decoded.revision,
-        })
-    }
-
-    pub fn reset_metadata(&self, token: &str) -> Result<ResetMetadataResponse, SyncError> {
-        require_token(token)?;
-        let response = self
-            .client
-            .get(self.endpoint.reset_metadata_url())
-            .bearer_auth(token)
-            .send()
-            .map_err(|_| SyncError::Network)?;
-        let status = response.status().as_u16();
-        match status {
-            200..=299 => {}
-            401 | 403 => return Err(SyncError::Authentication),
-            other => return Err(SyncError::Http(other)),
-        }
-        let decoded: ResetMetadataResponse =
-            decode_limited(response, 64 * 1024, SyncError::InvalidV2Response)?;
-        if decoded.protocol_version != PROTOCOL_V2 {
-            return Err(SyncError::InvalidV2Response);
-        }
-        Ok(decoded)
-    }
-
     pub fn download(&self, token: &str) -> Result<DownloadResponse, SyncError> {
         require_token(token)?;
         let response = self
@@ -305,28 +205,6 @@ impl SyncClient {
     }
 }
 
-fn decode_limited<T: DeserializeOwned>(
-    response: reqwest::blocking::Response,
-    limit: usize,
-    invalid: SyncError,
-) -> Result<T, SyncError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(SyncError::DownloadTooLarge);
-    }
-    let mut bytes = Vec::new();
-    response
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| SyncError::Network)?;
-    if bytes.len() > limit {
-        return Err(SyncError::DownloadTooLarge);
-    }
-    serde_json::from_slice(&bytes).map_err(|_| invalid)
-}
-
 fn require_token(token: &str) -> Result<(), SyncError> {
     if token.trim().is_empty() {
         return Err(SyncError::MissingToken);
@@ -345,7 +223,6 @@ mod tests {
     use tokenbar_helper::SCHEMA_VERSION;
 
     use super::*;
-    use crate::incremental::IncrementalPlan;
     use crate::protocol::{DeviceDescriptor, DeviceOs, PROTOCOL_VERSION};
 
     fn serve_response(
@@ -482,48 +359,6 @@ mod tests {
             client.upload("test-only-placeholder", &envelope),
             Err(SyncError::UploadTooLarge)
         ));
-    }
-
-    #[test]
-    fn v2_upload_uses_incremental_path_and_decodes_revision() {
-        let response = r#"{"protocolVersion":2,"revision":7,"status":"updated","receivedAtMs":456}"#;
-        let (origin, server) = serve_once(response);
-        let endpoint = Endpoint::parse_with_policy(&origin, true).unwrap();
-        let endpoint_key = endpoint.state_key();
-        let client = SyncClient::new(endpoint).unwrap();
-        let id = Uuid::new_v4();
-        let envelope = UploadEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            device: device(id),
-            generated_at_ms: 123,
-            snapshot: snapshot(123),
-        };
-        let plan = IncrementalPlan::build(&envelope, None, &endpoint_key, 30, 1_000).unwrap();
-
-        let result = client
-            .upload_v2("test-only-placeholder", &plan.body)
-            .unwrap();
-        let request = server.join().unwrap();
-
-        assert_eq!(result.revision, 7);
-        assert!(request.starts_with(&format!("PUT /v2/snapshots/{id} HTTP/1.1\r\n")));
-        let body: serde_json::Value =
-            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(body["protocolVersion"], 2);
-        assert_eq!(body["mode"], "full");
-    }
-
-    #[test]
-    fn reset_metadata_uses_small_v2_endpoint() {
-        let response = r#"{"protocolVersion":2,"resets":{"codex":123}}"#;
-        let (origin, server) = serve_once(response);
-        let client = SyncClient::new(Endpoint::parse_with_policy(&origin, true).unwrap()).unwrap();
-
-        let result = client.reset_metadata("test-only-placeholder").unwrap();
-        let request = server.join().unwrap();
-
-        assert_eq!(result.resets.get("codex"), Some(&123));
-        assert!(request.starts_with("GET /v2/reset-metadata HTTP/1.1\r\n"));
     }
 
     #[test]

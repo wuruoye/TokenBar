@@ -1,6 +1,6 @@
-# TokenBar Sync revisioned snapshot service
+# TokenBar Sync protocol v1 MVP
 
-Python 3 service and headless Linux collector/uploader for latest-per-device TokenBar activity snapshots. The service itself has no third-party Python dependency. The collector invokes this repository's Rust `tokenbar-helper`, sanitizes its JSON in memory, and only then constructs a network envelope. The service defaults to loopback, authenticates all `/v1/*` and `/v2/*` routes with bearer tokens, stores durable SQLite state, and never logs tokens or payloads.
+Python 3 service and headless Linux collector/uploader for latest-per-device TokenBar activity snapshots. The service itself has no third-party Python dependency. The collector invokes this repository's Rust `tokenbar-helper`, sanitizes its JSON in memory, and only then constructs a network envelope. The service defaults to loopback, authenticates all `/v1/*` routes with bearer tokens, stores durable SQLite state, and never logs tokens or payloads.
 
 ## Fixed protocol
 
@@ -10,8 +10,6 @@ Python 3 service and headless Linux collector/uploader for latest-per-device Tok
 - Request bodies are limited to 16 MiB.
 - `protocolVersion` must be `1`; ids must use canonical lowercase UUID form and the path/body ids must match; OS must be `macos`, `windows`, or `linux`; `generatedAtMs` must be a positive integer. The snapshot must have a positive `schemaVersion`, the same `generatedAtMs`, a non-empty timezone, and the core ActivitySnapshot objects/arrays.
 - Newer snapshots replace older ones. An exact retry at the same timestamp returns success and retains the original `receivedAtMs`. Older writes, and different content at the same timestamp, return HTTP 409.
-
-Protocol v2 adds `PUT /v2/snapshots/{deviceId}`, `POST /v2/snapshots/query`, and `GET /v2/reset-metadata`. It sends replacement partitions and tombstones against a server revision, materializes and deeply validates the result transactionally, and returns only changed remote partitions to the Mac. See [`../docs/protocol-v2.md`](../docs/protocol-v2.md). Protocol-v1 routes remain available as a full-snapshot fallback.
 
 Example download response:
 
@@ -24,15 +22,12 @@ Example download response:
       "generatedAtMs": 123,
       "receivedAtMs": 456,
       "snapshot": {
-        "schemaVersion": 10,
+        "schemaVersion": 9,
         "generatedAtMs": 123,
         "timezone": "UTC",
         "today": {
           "tokens": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0},
           "costUsd": 0,
-          "timedGeneratedTokens": 0,
-          "totalModelDurationMs": 0,
-          "timedRequestCount": 0,
           "requestCount": 0,
           "sessionCount": 0
         },
@@ -48,7 +43,7 @@ Example download response:
 
 The client sanitizes immediately before envelope creation and again before upload. At every nesting level it sets `promptPreview`, `outputPreview`, `sessionPath`, session `title`, `workspacePath`, and `workspaceLabel` to `null`. It also nulls raw prompt/session-content fields and absolute POSIX, Windows, UNC, or `file://` paths, and removes credential-bearing properties.
 
-The server rejects a snapshot that still contains any other protected value, or whose required totals/session/day/source fields cannot be decoded by the Mac client. For rolling protocol-v1 upgrades it clears a legacy `workspaceLabel` before validation and storage. It never reads raw Codex session files and never logs authorization headers or request/response payloads. Headless clients keep the upload envelope only in memory and never persist a payload retry spool. Their v2 state file contains only revision, schema/timezone/window metadata, calibration time, partition identities, and SHA-256 values.
+The server rejects a snapshot that still contains any other protected value, or whose required totals/session/day/source fields cannot be decoded by the Mac client. For rolling protocol-v1 upgrades it clears a legacy `workspaceLabel` before validation and storage. It never reads raw Codex session files and never logs authorization headers or request/response payloads. Headless clients keep the upload envelope only in memory and never persist a payload retry spool.
 
 ## Local run
 
@@ -86,17 +81,17 @@ In another shell, export the same token and helper path, then run:
 ./bin/tokenbar-sync-client download
 ```
 
-ActivitySnapshot versioning is independent of envelope `protocolVersion`. The collector requires a structurally decodable ActivitySnapshot with a positive integer `schemaVersion` and preserves it exactly; it does not hardcode v8, v9, or v10. This allows, for example, a Windows helper producing v8 and the current Mac helper producing v9 to share v2 transport or the protocol-v1 fallback.
+ActivitySnapshot versioning is independent of envelope `protocolVersion`. The collector requires a structurally decodable ActivitySnapshot with a positive integer `schemaVersion` and preserves it exactly; it does not hardcode v8, v9, or v10. This allows, for example, a Windows helper producing v8 and the current Mac helper producing v9 to share protocol-v1 transport.
 
 By default the client runs `tokenbar-helper --days 30 --statistics-timezone utc`. The explicit helper option changes the actual statistics calculation: message dates are normalized in the selected zone, the visible day window and `today` use that zone, weekly-reset timestamps are converted to scan dates in that zone, and `snapshot.timezone` is emitted consistently. Linux and Windows sync should use UTC. `--statistics-timezone local` (or `TOKENBAR_STATISTICS_TIMEZONE=local`) is available only for a deployment where all merging clients intentionally use local statistics.
 
-Immediately before every fresh collection, the client performs an authenticated `GET /v2/reset-metadata`, which returns only reset timestamps. Against an older server, HTTP 404 falls back to the protocol-v1 snapshot list with its 64 MiB cap. For each of `codex`, `claude`, and `grok`, the service selects the newest valid reset no more than eight days old and no later than its source snapshot's `generatedAtMs`; top-level `weeklySinceReset.startedAtMs` remains a legacy Codex fallback. The values map to the helper's three reset flags. A failed request, absent platform, or invalid timestamp quietly yields no flag for that platform, so Today and normal history still collect and upload.
+Immediately before every fresh collection, the client performs an authenticated `GET /v1/snapshots` with a 64 MiB response cap. For each of `codex`, `claude`, and `grok`, it walks valid snapshots from newest to oldest `receivedAtMs` and takes the first reset no more than eight days old and no later than its source snapshot's `generatedAtMs`. A top-level `weeklySinceReset.startedAtMs` is accepted only as a legacy Codex fallback. The selected values are passed to the helper as `--weekly-reset-ms`, `--claude-weekly-reset-ms`, and `--grok-weekly-reset-ms`. A failed download, malformed response, absent platform, or invalid/stale/future timestamp quietly yields no flag for that platform, so Today and the normal 30-day snapshot still collect and upload. Download payloads are never logged.
 
-For testing or an external helper runner, `TOKENBAR_ACTIVITY_SNAPSHOT` or `--snapshot-file` can point to an already-produced ActivitySnapshot. A UTC upload rejects a file whose `snapshot.timezone` is not exactly `UTC`; choose `local` explicitly for a local-zone file. The unrelated `tokscale` TUI cache is not an ActivitySnapshot source and is not accepted. A stable UUID is generated once at `~/.config/tokenbar-sync/device-id`. Normal v2 rounds send only changed partitions; a full calibration runs after 24 hours plus per-device jitter, on incompatible/missing metadata, or when the delta is at least 70% of full. Failed uploads do not persist snapshot payloads; the next invocation collects a fresh snapshot.
+For testing or an external helper runner, `TOKENBAR_ACTIVITY_SNAPSHOT` or `--snapshot-file` can point to an already-produced ActivitySnapshot. A UTC upload rejects a file whose `snapshot.timezone` is not exactly `UTC`; choose `local` explicitly for a local-zone file. The unrelated `tokscale` TUI cache is not an ActivitySnapshot source and is not accepted. A stable UUID is generated once at `~/.config/tokenbar-sync/device-id`. Failed uploads do not persist snapshot payloads; the next invocation collects a fresh snapshot.
 
-Non-loopback endpoints must use HTTPS, and the client bypasses ambient forward proxies and refuses HTTP redirects so the bearer token cannot be forwarded to a different URL. The sync token is removed from the environment inherited by `tokenbar-helper`. Every timer run collects a fresh in-memory envelope. A v2 base-revision conflict retries that fresh envelope in full mode; a network/authentication failure or remaining HTTP 409 exits without retaining payload state, and the next run collects again.
+Non-loopback endpoints must use HTTPS, and the client bypasses ambient forward proxies and refuses HTTP redirects so the bearer token cannot be forwarded to a different URL. The sync token is removed from the environment inherited by `tokenbar-helper`. Every timer run collects a fresh in-memory envelope. A network/authentication failure or HTTP 409 exits without retaining payload state; the next run collects again.
 
-Client configuration variables are `TOKENBAR_SYNC_URL`, `TOKENBAR_SYNC_TOKEN`, `TOKENBAR_ACTIVITY_SNAPSHOT`, `TOKENBAR_HELPER`, `TOKENBAR_HELPER_DAYS`, `TOKENBAR_STATISTICS_TIMEZONE`, `TOKENBAR_SYNC_DEVICE_ID`, `TOKENBAR_SYNC_DEVICE_ID_FILE`, `TOKENBAR_SYNC_DEVICE_NAME`, `TOKENBAR_SYNC_CLIENT_VERSION`, and optional `TOKENBAR_SYNC_STATE_DIR`.
+Client configuration variables are `TOKENBAR_SYNC_URL`, `TOKENBAR_SYNC_TOKEN`, `TOKENBAR_ACTIVITY_SNAPSHOT`, `TOKENBAR_HELPER`, `TOKENBAR_HELPER_DAYS`, `TOKENBAR_STATISTICS_TIMEZONE`, `TOKENBAR_SYNC_DEVICE_ID`, `TOKENBAR_SYNC_DEVICE_ID_FILE`, `TOKENBAR_SYNC_DEVICE_NAME`, and `TOKENBAR_SYNC_CLIENT_VERSION`.
 
 ## Tests
 
@@ -120,7 +115,7 @@ After installation, generate an independent random 32–512 character ASCII toke
 
 ## Deployment recommendation
 
-Keep `TOKENBAR_SYNC_BIND=127.0.0.1:18765`; do not expose the Python listener directly. When public multi-device access is authorized, add narrowly scoped `/v1/*` and `/v2/*` routes to the host's existing Caddy production configuration, terminate HTTPS there, preserve the Authorization header, cap request bodies to 16 MiB, and rate-limit the routes. Prefer private VPN access or mTLS in addition to the bearer token. Back up the SQLite database with a SQLite-aware snapshot/backup procedure.
+Keep `TOKENBAR_SYNC_BIND=127.0.0.1:18765`; do not expose the Python listener directly. When public multi-device access is authorized, add a narrowly scoped route to the host's existing Caddy production configuration, terminate HTTPS there, preserve the Authorization header, cap request bodies to 16 MiB, and rate-limit the route. Prefer private VPN access or mTLS in addition to the bearer token. Back up the SQLite database with a SQLite-aware snapshot/backup procedure.
 
 No Caddy, firewall, DNS, or persistent service change is part of this artifact.
 

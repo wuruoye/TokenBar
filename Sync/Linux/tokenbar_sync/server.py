@@ -22,19 +22,11 @@ from urllib.parse import unquote, urlsplit
 from . import PROTOCOL_VERSION
 from .common import (
     MAX_BODY_BYTES,
-    MAX_INT64,
-    PROTOCOL_V2,
     UUID_RE,
     ValidationError,
-    apply_partition_delta,
     canonical_json,
-    incremental_delta,
     json_loads_strict,
-    partition_manifest,
     sanitize_snapshot,
-    snapshot_partitions,
-    validate_partition_manifest,
-    validate_device,
     validate_envelope,
 )
 
@@ -42,8 +34,6 @@ from .common import (
 DEFAULT_BIND = "127.0.0.1:18765"
 DEFAULT_DATABASE = "./tokenbar-sync.sqlite3"
 MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000
-MAX_WEEKLY_RESET_AGE_MS = 8 * 24 * 60 * 60 * 1000
-DELTA_FULL_RATIO = 0.70
 MIN_TOKEN_CHARACTERS = 32
 MAX_TOKEN_CHARACTERS = 512
 PLACEHOLDER_TOKENS = {
@@ -53,23 +43,13 @@ PLACEHOLDER_TOKENS = {
 
 
 class ConflictError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        full_required: bool = False,
-        revision: int | None = None,
-    ):
-        self.full_required = full_required
-        self.revision = revision
-        super().__init__(message)
+    pass
 
 
 @dataclass(frozen=True)
 class UpsertResult:
     outcome: str
     received_at_ms: int
-    revision: int
 
 
 class SnapshotRepository:
@@ -104,23 +84,10 @@ class SnapshotRepository:
                     device_json TEXT NOT NULL,
                     generated_at_ms INTEGER NOT NULL,
                     received_at_ms INTEGER NOT NULL,
-                    snapshot_json TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 1,
-                    last_request_hash TEXT
+                    snapshot_json TEXT NOT NULL
                 ) WITHOUT ROWID
                 """
             )
-            columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(snapshots)")
-            }
-            if "revision" not in columns:
-                connection.execute(
-                    "ALTER TABLE snapshots ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
-                )
-            if "last_request_hash" not in columns:
-                connection.execute(
-                    "ALTER TABLE snapshots ADD COLUMN last_request_hash TEXT"
-                )
             connection.commit()
         finally:
             connection.close()
@@ -134,12 +101,7 @@ class SnapshotRepository:
         finally:
             connection.close()
 
-    def upsert(
-        self,
-        envelope: dict[str, Any],
-        *,
-        request_hash: str | None = None,
-    ) -> UpsertResult:
+    def upsert(self, envelope: dict[str, Any]) -> UpsertResult:
         device_id = envelope["device"]["id"]
         device_json = canonical_json(envelope["device"])
         snapshot_json = canonical_json(envelope["snapshot"])
@@ -151,8 +113,7 @@ class SnapshotRepository:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT device_id, device_json, generated_at_ms, received_at_ms,
-                       snapshot_json, revision, last_request_hash
+                SELECT device_id, device_json, generated_at_ms, received_at_ms, snapshot_json
                 FROM snapshots WHERE device_id = ?
                 """,
                 (device_id,),
@@ -167,9 +128,7 @@ class SnapshotRepository:
                         and snapshot_json == existing["snapshot_json"]
                     ):
                         connection.commit()
-                        return UpsertResult(
-                            "retry", existing["received_at_ms"], existing["revision"]
-                        )
+                        return UpsertResult("retry", existing["received_at_ms"])
                     raise ConflictError(
                         "snapshot with the same generatedAtMs differs from the stored snapshot"
                     )
@@ -177,7 +136,7 @@ class SnapshotRepository:
                     """
                     UPDATE snapshots
                     SET device_json = ?, generated_at_ms = ?, received_at_ms = ?,
-                        snapshot_json = ?, revision = ?, last_request_hash = ?
+                        snapshot_json = ?
                     WHERE device_id = ?
                     """,
                     (
@@ -185,20 +144,18 @@ class SnapshotRepository:
                         generated_at_ms,
                         received_at_ms,
                         snapshot_json,
-                        existing["revision"] + 1,
-                        request_hash,
                         device_id,
                     ),
                 )
                 connection.commit()
-                return UpsertResult("updated", received_at_ms, existing["revision"] + 1)
+                return UpsertResult("updated", received_at_ms)
 
             connection.execute(
                 """
                 INSERT INTO snapshots (
                     device_id, device_json, generated_at_ms,
-                    received_at_ms, snapshot_json, revision, last_request_hash
-                ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                    received_at_ms, snapshot_json
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     device_id,
@@ -206,105 +163,22 @@ class SnapshotRepository:
                     generated_at_ms,
                     received_at_ms,
                     snapshot_json,
-                    request_hash,
                 ),
             )
             connection.commit()
-            return UpsertResult("created", received_at_ms, 1)
+            return UpsertResult("created", received_at_ms)
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
 
-    def upsert_delta(
-        self,
-        envelope: dict[str, Any],
-        *,
-        request_hash: str,
-    ) -> UpsertResult:
-        device_id = envelope["device"]["id"]
-        generated_at_ms = envelope["generatedAtMs"]
-        received_at_ms = time.time_ns() // 1_000_000
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                """
-                SELECT device_id, device_json, generated_at_ms, received_at_ms,
-                       snapshot_json, revision, last_request_hash
-                FROM snapshots WHERE device_id = ?
-                """,
-                (device_id,),
-            ).fetchone()
-            if existing is None:
-                raise ConflictError(
-                    "a full snapshot is required before an incremental update",
-                    full_required=True,
-                )
-            if hmac.compare_digest(existing["last_request_hash"] or "", request_hash):
-                connection.commit()
-                return UpsertResult(
-                    "retry", existing["received_at_ms"], existing["revision"]
-                )
-            if envelope["baseRevision"] != existing["revision"]:
-                raise ConflictError(
-                    "baseRevision does not match the stored snapshot",
-                    full_required=True,
-                    revision=existing["revision"],
-                )
-            if generated_at_ms <= existing["generated_at_ms"]:
-                raise ConflictError(
-                    "generatedAtMs must be newer than the stored snapshot",
-                    full_required=True,
-                    revision=existing["revision"],
-                )
-            previous = json_loads_strict(existing["snapshot_json"])
-            snapshot = apply_partition_delta(
-                previous,
-                envelope["upserts"],
-                envelope["deletes"],
-            )
-            v1_envelope = {
-                "protocolVersion": PROTOCOL_VERSION,
-                "device": envelope["device"],
-                "generatedAtMs": generated_at_ms,
-                "snapshot": snapshot,
-            }
-            validate_envelope(v1_envelope, path_device_id=device_id)
-            next_revision = existing["revision"] + 1
-            connection.execute(
-                """
-                UPDATE snapshots
-                SET device_json = ?, generated_at_ms = ?, received_at_ms = ?,
-                    snapshot_json = ?, revision = ?, last_request_hash = ?
-                WHERE device_id = ?
-                """,
-                (
-                    canonical_json(envelope["device"]),
-                    generated_at_ms,
-                    received_at_ms,
-                    canonical_json(snapshot),
-                    next_revision,
-                    request_hash,
-                    device_id,
-                ),
-            )
-            connection.commit()
-            return UpsertResult("updated", received_at_ms, next_revision)
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def list_snapshots(self, *, include_revision: bool = False) -> list[dict[str, Any]]:
+    def list_snapshots(self) -> list[dict[str, Any]]:
         connection = self._connect()
         try:
             rows = connection.execute(
                 """
-                SELECT device_id, device_json, generated_at_ms, received_at_ms,
-                       snapshot_json, revision
+                SELECT device_id, device_json, generated_at_ms, received_at_ms, snapshot_json
                 FROM snapshots ORDER BY device_id ASC
                 """
             ).fetchall()
@@ -332,227 +206,17 @@ class SnapshotRepository:
                     or received_at_ms > time.time_ns() // 1_000_000 + MAX_FUTURE_CLOCK_SKEW_MS
                 ):
                     raise ValueError("stored receivedAtMs is invalid")
-                record = {
-                    "device": device,
-                    "generatedAtMs": row["generated_at_ms"],
-                    "receivedAtMs": received_at_ms,
-                    "snapshot": snapshot,
-                }
-                if include_revision:
-                    revision = row["revision"]
-                    if not isinstance(revision, int) or revision <= 0:
-                        raise ValueError("stored revision is invalid")
-                    record["revision"] = revision
-                snapshots.append(record)
+                snapshots.append(
+                    {
+                        "device": device,
+                        "generatedAtMs": row["generated_at_ms"],
+                        "receivedAtMs": received_at_ms,
+                        "snapshot": snapshot,
+                    }
+                )
         except (AttributeError, TypeError, ValueError, RecursionError) as error:
             raise sqlite3.DatabaseError("stored snapshot is invalid") from error
         return snapshots
-
-
-def _validate_v2_upload(
-    envelope: Any,
-    *,
-    path_device_id: str,
-) -> dict[str, Any]:
-    if not isinstance(envelope, dict) or envelope.get("protocolVersion") != PROTOCOL_V2:
-        raise ValidationError("protocolVersion must be 2")
-    mode = envelope.get("mode")
-    if mode == "full":
-        if set(envelope) != {
-            "protocolVersion",
-            "mode",
-            "device",
-            "generatedAtMs",
-            "snapshot",
-        }:
-            raise ValidationError("request body fields do not match protocol v2 full mode")
-        validate_envelope(
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "device": envelope["device"],
-                "generatedAtMs": envelope["generatedAtMs"],
-                "snapshot": envelope["snapshot"],
-            },
-            path_device_id=path_device_id,
-        )
-    elif mode == "delta":
-        if set(envelope) != {
-            "protocolVersion",
-            "mode",
-            "device",
-            "generatedAtMs",
-            "baseRevision",
-            "upserts",
-            "deletes",
-        }:
-            raise ValidationError("request body fields do not match protocol v2 delta mode")
-        device = validate_device(envelope.get("device"))
-        if device["id"] != path_device_id:
-            raise ValidationError("device.id must match the path deviceId")
-        base_revision = envelope.get("baseRevision")
-        if (
-            not isinstance(base_revision, int)
-            or isinstance(base_revision, bool)
-            or base_revision <= 0
-        ):
-            raise ValidationError("baseRevision must be a positive integer")
-        generated_at_ms = envelope.get("generatedAtMs")
-        if (
-            not isinstance(generated_at_ms, int)
-            or isinstance(generated_at_ms, bool)
-            or generated_at_ms <= 0
-            or generated_at_ms > MAX_INT64
-        ):
-            raise ValidationError("generatedAtMs must be a positive signed 64-bit integer")
-        if not isinstance(envelope.get("upserts"), dict):
-            raise ValidationError("incremental upserts must be an object")
-        if not isinstance(envelope.get("deletes"), list):
-            raise ValidationError("incremental deletes must be an array")
-    else:
-        raise ValidationError("mode must be full or delta")
-    return envelope
-
-
-def _validate_incremental_query(value: Any) -> tuple[dict[str, dict[str, Any]], bool, str | None]:
-    if not isinstance(value, dict) or set(value) - {
-        "protocolVersion",
-        "known",
-        "forceFull",
-        "excludeDeviceId",
-    }:
-        raise ValidationError("query body fields do not match protocol v2")
-    if value.get("protocolVersion") != PROTOCOL_V2:
-        raise ValidationError("protocolVersion must be 2")
-    known = value.get("known")
-    if not isinstance(known, list) or len(known) > 10_000:
-        raise ValidationError("known must be an array")
-    force_full = value.get("forceFull", False)
-    if not isinstance(force_full, bool):
-        raise ValidationError("forceFull must be a boolean")
-    exclude_device_id = value.get("excludeDeviceId")
-    if exclude_device_id is not None and (
-        not isinstance(exclude_device_id, str)
-        or UUID_RE.fullmatch(exclude_device_id) is None
-        or str(uuid.UUID(exclude_device_id)) != exclude_device_id
-    ):
-        raise ValidationError("excludeDeviceId must be a canonical UUID string")
-
-    result: dict[str, dict[str, Any]] = {}
-    for item in known:
-        if not isinstance(item, dict) or set(item) != {"deviceId", "revision", "manifest"}:
-            raise ValidationError("known snapshot metadata is invalid")
-        device_id = item.get("deviceId")
-        revision = item.get("revision")
-        if (
-            not isinstance(device_id, str)
-            or UUID_RE.fullmatch(device_id) is None
-            or str(uuid.UUID(device_id)) != device_id
-            or device_id in result
-        ):
-            raise ValidationError("known snapshot deviceId is invalid or duplicated")
-        if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
-            raise ValidationError("known snapshot revision must be a positive integer")
-        manifest = validate_partition_manifest(item.get("manifest"))
-        result[device_id] = {"revision": revision, "manifest": manifest}
-    return result, force_full, exclude_device_id
-
-
-def _incremental_query_response(
-    records: list[dict[str, Any]],
-    request: Any,
-) -> dict[str, Any]:
-    known, force_full, exclude_device_id = _validate_incremental_query(request)
-    current_device_ids = {
-        record["device"]["id"]
-        for record in records
-        if record["device"]["id"] != exclude_device_id
-    }
-    deleted_device_ids = sorted(
-        device_id
-        for device_id in set(known) - current_device_ids
-        if device_id != exclude_device_id
-    )
-    changes: list[dict[str, Any]] = []
-    for record in records:
-        device_id = record["device"]["id"]
-        if device_id == exclude_device_id:
-            continue
-        partitions = snapshot_partitions(record["snapshot"])
-        manifest = partition_manifest(partitions)
-        previous = known.get(device_id)
-        common = {
-            "device": record["device"],
-            "generatedAtMs": record["generatedAtMs"],
-            "receivedAtMs": record["receivedAtMs"],
-            "revision": record["revision"],
-            "manifest": manifest,
-        }
-        if (
-            not force_full
-            and previous is not None
-            and previous["revision"] == record["revision"]
-            and previous["manifest"] == manifest
-        ):
-            continue
-        if force_full or previous is None:
-            changes.append({"mode": "full", **common, "snapshot": record["snapshot"]})
-            continue
-
-        upserts, deletes, _manifest = incremental_delta(
-            partitions,
-            previous["manifest"],
-        )
-        delta = {"mode": "delta", **common, "upserts": upserts, "deletes": deletes}
-        delta_bytes = len(canonical_json(delta).encode("utf-8"))
-        full = {"mode": "full", **common, "snapshot": record["snapshot"]}
-        full_bytes = len(canonical_json(full).encode("utf-8"))
-        changes.append(full if delta_bytes >= full_bytes * DELTA_FULL_RATIO else delta)
-    return {
-        "protocolVersion": PROTOCOL_V2,
-        "snapshots": changes,
-        "deletedDeviceIds": deleted_device_ids,
-    }
-
-
-def _weekly_reset_metadata(records: list[dict[str, Any]]) -> dict[str, int]:
-    now_ms = time.time_ns() // 1_000_000
-    ordered = sorted(records, key=lambda item: item["receivedAtMs"], reverse=True)
-    resets: dict[str, int] = {}
-
-    def accept(value: Any, generated_at_ms: int) -> int | None:
-        if (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and now_ms - MAX_WEEKLY_RESET_AGE_MS <= value <= generated_at_ms <= now_ms
-        ):
-            return value
-        return None
-
-    for record in ordered:
-        snapshot = record["snapshot"]
-        generated_at_ms = record["generatedAtMs"]
-        for source in snapshot.get("sources") or []:
-            platform = source.get("platform")
-            if platform not in {"codex", "claude", "grok"} or platform in resets:
-                continue
-            weekly = source.get("weeklySinceReset")
-            reset = accept(
-                weekly.get("startedAtMs") if isinstance(weekly, dict) else None,
-                generated_at_ms,
-            )
-            if reset is not None:
-                resets[platform] = reset
-    if "codex" not in resets:
-        for record in ordered:
-            weekly = record["snapshot"].get("weeklySinceReset")
-            reset = accept(
-                weekly.get("startedAtMs") if isinstance(weekly, dict) else None,
-                record["generatedAtMs"],
-            )
-            if reset is not None:
-                resets["codex"] = reset
-                break
-    return resets
 
 
 class TokenBarHTTPServer(ThreadingHTTPServer):
@@ -581,7 +245,7 @@ class TokenBarHTTPServer(ThreadingHTTPServer):
 
 class TokenBarRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "TokenBarSync/2"
+    server_version = "TokenBarSync/1"
     sys_version = ""
 
     @property
@@ -648,54 +312,9 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
         )
         return False
 
-    def _read_json_body(self) -> tuple[Any, bytes] | None:
-        if self.headers.get("Transfer-Encoding") is not None:
-            self.close_connection = True
-            self._error(HTTPStatus.BAD_REQUEST, "Transfer-Encoding is not supported")
-            return None
-        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
-        if content_type != "application/json":
-            self.close_connection = True
-            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json")
-            return None
-        content_length_headers = self.headers.get_all("Content-Length", [])
-        if len(content_length_headers) > 1:
-            self.close_connection = True
-            self._error(HTTPStatus.BAD_REQUEST, "multiple Content-Length headers are not allowed")
-            return None
-        content_length_value = self.headers.get("Content-Length")
-        if content_length_value is None:
-            self.close_connection = True
-            self._error(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
-            return None
-        try:
-            content_length = int(content_length_value, 10)
-        except ValueError:
-            self.close_connection = True
-            self._error(HTTPStatus.BAD_REQUEST, "Content-Length is invalid")
-            return None
-        if content_length < 0:
-            self.close_connection = True
-            self._error(HTTPStatus.BAD_REQUEST, "Content-Length is invalid")
-            return None
-        if content_length > MAX_BODY_BYTES:
-            self.close_connection = True
-            self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body exceeds 16 MiB")
-            return None
-        raw = self.rfile.read(content_length)
-        if len(raw) != content_length:
-            self.close_connection = True
-            self._error(HTTPStatus.BAD_REQUEST, "request body is incomplete")
-            return None
-        try:
-            return json_loads_strict(raw), raw
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
-            self._error(HTTPStatus.BAD_REQUEST, "request body is invalid JSON")
-            return None
-
     def do_GET(self) -> None:
         target = urlsplit(self.path)
-        if target.path.startswith(("/v1/", "/v2/")) and not self._require_auth():
+        if target.path.startswith("/v1/") and not self._require_auth():
             return
         if target.query or target.fragment:
             self._error(HTTPStatus.NOT_FOUND, "not found")
@@ -722,23 +341,11 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
                 {"protocolVersion": PROTOCOL_VERSION, "snapshots": snapshots},
             )
             return
-        if target.path == "/v2/reset-metadata":
-            try:
-                snapshots = self.app.repository.list_snapshots()
-                resets = _weekly_reset_metadata(snapshots)
-            except sqlite3.Error:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "storage error")
-                return
-            self._send_json(
-                HTTPStatus.OK,
-                {"protocolVersion": PROTOCOL_V2, "resets": resets},
-            )
-            return
         self._error(HTTPStatus.NOT_FOUND, "not found")
 
     def do_PUT(self) -> None:
         target = urlsplit(self.path)
-        if not target.path.startswith(("/v1/", "/v2/")):
+        if not target.path.startswith("/v1/"):
             self.close_connection = True
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -749,13 +356,8 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
-        if target.path.startswith("/v1/snapshots/"):
-            prefix = "/v1/snapshots/"
-            protocol = PROTOCOL_VERSION
-        elif target.path.startswith("/v2/snapshots/"):
-            prefix = "/v2/snapshots/"
-            protocol = PROTOCOL_V2
-        else:
+        prefix = "/v1/snapshots/"
+        if not target.path.startswith(prefix):
             self.close_connection = True
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -764,19 +366,51 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error(HTTPStatus.BAD_REQUEST, "path deviceId must be a UUID string")
             return
-        decoded = self._read_json_body()
-        if decoded is None:
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "Transfer-Encoding is not supported")
             return
-        envelope, raw = decoded
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+        if content_type != "application/json":
+            self.close_connection = True
+            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json")
+            return
+        content_length_headers = self.headers.get_all("Content-Length", [])
+        if len(content_length_headers) > 1:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "multiple Content-Length headers are not allowed")
+            return
+        content_length_value = self.headers.get("Content-Length")
+        if content_length_value is None:
+            self.close_connection = True
+            self._error(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+            return
         try:
-            if protocol == PROTOCOL_VERSION and isinstance(envelope, dict):
+            content_length = int(content_length_value, 10)
+        except ValueError:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "Content-Length is invalid")
+            return
+        if content_length < 0:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "Content-Length is invalid")
+            return
+        if content_length > MAX_BODY_BYTES:
+            self.close_connection = True
+            self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body exceeds 16 MiB")
+            return
+        raw = self.rfile.read(content_length)
+        if len(raw) != content_length:
+            self.close_connection = True
+            self._error(HTTPStatus.BAD_REQUEST, "request body is incomplete")
+            return
+        try:
+            envelope = json_loads_strict(raw)
+            if isinstance(envelope, dict):
                 _redact_legacy_workspace_labels(envelope.get("snapshot"))
-            if protocol == PROTOCOL_VERSION:
-                validate_envelope(envelope, path_device_id=path_device_id)
-            else:
-                _validate_v2_upload(envelope, path_device_id=path_device_id)
+            validate_envelope(envelope, path_device_id=path_device_id)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
-            message = str(error) if isinstance(error, ValidationError) else "request body is invalid"
+            message = str(error) if isinstance(error, ValidationError) else "request body is invalid JSON"
             self._error(HTTPStatus.BAD_REQUEST, message)
             return
         if envelope["generatedAtMs"] > (
@@ -785,71 +419,21 @@ class TokenBarRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "generatedAtMs is too far in the future")
             return
         try:
-            if protocol == PROTOCOL_VERSION:
-                result = self.app.repository.upsert(envelope)
-            elif envelope["mode"] == "full":
-                result = self.app.repository.upsert(
-                    {
-                        "protocolVersion": PROTOCOL_VERSION,
-                        "device": envelope["device"],
-                        "generatedAtMs": envelope["generatedAtMs"],
-                        "snapshot": envelope["snapshot"],
-                    },
-                    request_hash=hashlib.sha256(canonical_json(envelope).encode("utf-8")).hexdigest(),
-                )
-            else:
-                result = self.app.repository.upsert_delta(
-                    envelope,
-                    request_hash=hashlib.sha256(canonical_json(envelope).encode("utf-8")).hexdigest(),
-                )
+            result = self.app.repository.upsert(envelope)
         except ConflictError as error:
-            value: dict[str, Any] = {"error": str(error)}
-            if protocol == PROTOCOL_V2:
-                value["fullRequired"] = error.full_required
-                if error.revision is not None:
-                    value["revision"] = error.revision
-            self._send_json(HTTPStatus.CONFLICT, value)
-            return
-        except ValidationError as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error))
-            return
-        except (sqlite3.Error, ValueError, RecursionError):
-            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "storage error")
-            return
-        status = HTTPStatus.CREATED if result.outcome == "created" else HTTPStatus.OK
-        response = {"status": result.outcome, "receivedAtMs": result.received_at_ms}
-        if protocol == PROTOCOL_V2:
-            response["protocolVersion"] = PROTOCOL_V2
-            response["revision"] = result.revision
-        self._send_json(status, response)
-
-    def do_POST(self) -> None:
-        target = urlsplit(self.path)
-        if not target.path.startswith("/v2/"):
-            self.close_connection = True
-            self._error(HTTPStatus.NOT_FOUND, "not found")
-            return
-        if not self._require_auth():
-            self.close_connection = True
-            return
-        if target.query or target.fragment or target.path != "/v2/snapshots/query":
-            self.close_connection = True
-            self._error(HTTPStatus.NOT_FOUND, "not found")
-            return
-        decoded = self._read_json_body()
-        if decoded is None:
-            return
-        request, _raw = decoded
-        try:
-            records = self.app.repository.list_snapshots(include_revision=True)
-            response = _incremental_query_response(records, request)
-        except ValidationError as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error))
+            self._error(HTTPStatus.CONFLICT, str(error))
             return
         except sqlite3.Error:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "storage error")
             return
-        self._send_json(HTTPStatus.OK, response)
+        status = HTTPStatus.CREATED if result.outcome == "created" else HTTPStatus.OK
+        self._send_json(
+            status,
+            {
+                "status": result.outcome,
+                "receivedAtMs": result.received_at_ms,
+            },
+        )
 
 
 def _redact_legacy_workspace_labels(value: Any, *, _depth: int = 0) -> None:

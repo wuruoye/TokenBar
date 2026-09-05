@@ -1,5 +1,5 @@
 [Unit]
-Description=TokenBar revisioned activity snapshot sync service
+Description=TokenBar protocol-v1 snapshot sync service
 After=network.target
 
 [Service]
