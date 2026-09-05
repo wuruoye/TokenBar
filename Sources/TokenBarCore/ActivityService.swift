@@ -8,6 +8,10 @@ public protocol ActivityProviding: Sendable {
     func fetchActivity(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+
+    func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
 }
 
 public extension ActivityProviding {
@@ -30,6 +34,17 @@ public extension ActivityProviding {
         try await self.fetchActivity(
             sinceWeeklyResetAt: sinceWeeklyResetAtByPlatform[.codex],
             statisticsTimeZone: statisticsTimeZone)
+    }
+
+    func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        let snapshot = try await self.fetchActivity(
+            sinceWeeklyResetAtByPlatform: [:],
+            statisticsTimeZone: statisticsTimeZone)
+        guard snapshot.days.map(\.date).max() == date else { return [] }
+        return snapshot.sessions
     }
 }
 
@@ -83,8 +98,10 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let arguments: [String]
     private let environment: [String: String]
     private let timeout: TimeInterval
-    private let memoryDatabaseURL: URL?
+    private let memoryDatabaseURLProvider: @Sendable () async -> URL?
+    private let openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)?
     private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
+    private let openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
     private let runner: any ActivityHelperRunning
 
@@ -92,14 +109,19 @@ public struct ActivityService: ActivityProviding, Sendable {
         helperURL: URL? = nil,
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
+        memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
+        openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
+        openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         timeout: TimeInterval = 120,
         runner: any ActivityHelperRunning = SubprocessActivityHelperRunner())
     {
         self.arguments = arguments
-        self.memoryDatabaseURL = memoryDatabaseURL
+        self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
+        self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
+        self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.runner = runner
@@ -111,15 +133,20 @@ public struct ActivityService: ActivityProviding, Sendable {
     init(
         arguments: [String] = [],
         memoryDatabaseURL: URL? = nil,
+        memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
+        openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
+        openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
         timeout: TimeInterval = 120,
         resolveHelper: @escaping @Sendable () throws -> URL,
         runner: any ActivityHelperRunning)
     {
         self.arguments = arguments
-        self.memoryDatabaseURL = memoryDatabaseURL
+        self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
+        self.openAIPricingCatalog = openAIPricingCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
+        self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
         self.timeout = timeout
         self.resolveHelper = resolveHelper
@@ -142,18 +169,104 @@ public struct ActivityService: ActivityProviding, Sendable {
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
         let helperURL = try self.resolveHelper()
-        let anthropicPricingURL = await self.anthropicPricingCatalog?.refreshIfNeeded()
+        let memoryDatabaseURL = await self.memoryDatabaseURLProvider()
+        return try await self.fetchSnapshot(
+            helperURL: helperURL,
+            sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+            memoryDatabaseURL: memoryDatabaseURL,
+            snapshotArguments: [],
+            statisticsTimeZone: statisticsTimeZone)
+    }
+
+    public func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        let helperURL = try self.resolveHelper()
+        let snapshot = try await self.fetchSnapshot(
+            helperURL: helperURL,
+            sinceWeeklyResetAtByPlatform: [:],
+            memoryDatabaseURL: nil,
+            snapshotArguments: ["--days", "1", "--end-date", date],
+            statisticsTimeZone: statisticsTimeZone)
+        return snapshot.sessions
+    }
+
+    private func fetchSnapshot(
+        helperURL: URL,
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        memoryDatabaseURL: URL?,
+        snapshotArguments: [String],
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
+        async let openAIPricingURL = self.openAIPricingCatalog?.refreshIfNeeded()
+        async let anthropicPricingURL = self.anthropicPricingCatalog?.refreshIfNeeded()
+        async let openRouterPricingURL = self.openRouterPricingCatalog?.refreshIfNeeded()
+        let pricingURLs = await (openAIPricingURL, anthropicPricingURL, openRouterPricingURL)
+        let initial = try await self.runSnapshot(
+            helperURL: helperURL,
+            sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+            memoryDatabaseURL: memoryDatabaseURL,
+            openAIPricingURL: pricingURLs.0,
+            anthropicPricingURL: pricingURLs.1,
+            openRouterPricingURL: pricingURLs.2,
+            snapshotArguments: snapshotArguments,
+            statisticsTimeZone: statisticsTimeZone)
+
+        let unpricedPlatforms = Self.unpricedCatalogPlatforms(in: initial)
+        guard !unpricedPlatforms.isEmpty else { return initial }
+        async let refreshedOpenAIPricingURL: URL? = unpricedPlatforms.contains(.codex)
+            ? self.openAIPricingCatalog?.refreshNowIfAllowed()
+            : nil
+        async let refreshedAnthropicPricingURL: URL? = unpricedPlatforms.contains(.claude)
+            ? self.anthropicPricingCatalog?.refreshNowIfAllowed()
+            : nil
+        async let refreshedGooglePricingURL: URL? = unpricedPlatforms.contains(.antigravity)
+            ? self.openRouterPricingCatalog?.refreshNowIfAllowed()
+            : nil
+        let refreshedURLs = await (
+            refreshedOpenAIPricingURL,
+            refreshedAnthropicPricingURL,
+            refreshedGooglePricingURL)
+        guard refreshedURLs.0 != nil || refreshedURLs.1 != nil || refreshedURLs.2 != nil
+        else {
+            return initial
+        }
+
+        return (try? await self.runSnapshot(
+            helperURL: helperURL,
+            sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+            memoryDatabaseURL: memoryDatabaseURL,
+            openAIPricingURL: refreshedURLs.0 ?? pricingURLs.0,
+            anthropicPricingURL: refreshedURLs.1 ?? pricingURLs.1,
+            openRouterPricingURL: refreshedURLs.2 ?? pricingURLs.2,
+            snapshotArguments: snapshotArguments,
+            statisticsTimeZone: statisticsTimeZone)) ?? initial
+    }
+
+    private func runSnapshot(
+        helperURL: URL,
+        sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        memoryDatabaseURL: URL?,
+        openAIPricingURL: URL?,
+        anthropicPricingURL: URL?,
+        openRouterPricingURL: URL?,
+        snapshotArguments: [String],
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
+    {
         let data = try await self.runner.run(
             executableURL: helperURL,
             arguments: self.helperArguments(
                 sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
+                memoryDatabaseURL: memoryDatabaseURL,
+                openAIPricingURL: openAIPricingURL,
                 anthropicPricingURL: anthropicPricingURL,
+                openRouterPricingURL: openRouterPricingURL,
+                snapshotArguments: snapshotArguments,
                 statisticsTimeZone: statisticsTimeZone),
             environment: self.helperEnvironment(statisticsTimeZone: statisticsTimeZone),
             timeout: self.timeout)
-        guard !data.isEmpty else {
-            throw ActivityServiceError.emptyOutput
-        }
+        guard !data.isEmpty else { throw ActivityServiceError.emptyOutput }
         do {
             return try JSONDecoder().decode(ActivitySnapshot.self, from: data)
         } catch {
@@ -161,12 +274,34 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
     }
 
+    private static func unpricedCatalogPlatforms(
+        in snapshot: ActivitySnapshot) -> Set<TokenPlatform>
+    {
+        var platforms: Set<TokenPlatform> = []
+        for session in snapshot.sessions {
+            for request in session.requests.flatMap(\.physicalRequests)
+                where request.costSource == .unknown && request.tokens.total > 0
+            {
+                let platform = request.platform ?? session.platform ?? .codex
+                if platform == .codex || platform == .claude || platform == .antigravity {
+                    platforms.insert(platform)
+                }
+            }
+        }
+        return platforms
+    }
+
     private func helperArguments(
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
+        memoryDatabaseURL: URL?,
+        openAIPricingURL: URL?,
         anthropicPricingURL: URL?,
+        openRouterPricingURL: URL?,
+        snapshotArguments: [String],
         statisticsTimeZone: TokenBarStatisticsTimeZone) -> [String]
     {
         var arguments = self.arguments
+        arguments += snapshotArguments
         arguments += ["--statistics-timezone", statisticsTimeZone.rawValue]
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.codex]) {
             arguments += ["--weekly-reset-ms", String(value)]
@@ -177,11 +312,20 @@ public struct ActivityService: ActivityProviding, Sendable {
         if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.grok]) {
             arguments += ["--grok-weekly-reset-ms", String(value)]
         }
-        if let memoryDatabaseURL = self.memoryDatabaseURL {
+        if let value = Self.milliseconds(sinceWeeklyResetAtByPlatform[.antigravity]) {
+            arguments += ["--antigravity-weekly-reset-ms", String(value)]
+        }
+        if let memoryDatabaseURL {
             arguments += ["--memory-database", memoryDatabaseURL.path]
+        }
+        if let openAIPricingURL {
+            arguments += ["--openai-pricing-markdown", openAIPricingURL.path]
         }
         if let anthropicPricingURL {
             arguments += ["--anthropic-pricing-markdown", anthropicPricingURL.path]
+        }
+        if let openRouterPricingURL {
+            arguments += ["--openrouter-pricing-json", openRouterPricingURL.path]
         }
         return arguments
     }

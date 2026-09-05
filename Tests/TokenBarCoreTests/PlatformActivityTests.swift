@@ -3,24 +3,33 @@ import Testing
 
 @Suite("Platform activity")
 struct PlatformActivityTests {
-    @Test("dashboard exposes the three provider tabs and visibility filters")
+    @Test("dashboard exposes the four provider tabs and visibility filters")
     func platformTabs() {
-        #expect(DashboardScope.allCases == [.codex, .claude, .grok])
+        #expect(DashboardScope.allCases == [.codex, .claude, .grok, .antigravity])
         #expect(DashboardScope.visibleScopes(
             showsClaude: true,
-            showsGrok: true) == [.codex, .claude, .grok])
+            showsGrok: true,
+            showsAntigravity: true) == [.codex, .claude, .grok, .antigravity])
         #expect(DashboardScope.visibleScopes(
             showsClaude: false,
-            showsGrok: true) == [.codex, .grok])
+            showsGrok: true,
+            showsAntigravity: false) == [.codex, .grok])
         #expect(DashboardScope.visibleScopes(
             showsClaude: false,
-            showsGrok: false) == [.codex])
+            showsGrok: false,
+            showsAntigravity: true) == [.codex, .antigravity])
+        #expect(DashboardScope.visibleScopes(
+            showsClaude: false,
+            showsGrok: false,
+            showsAntigravity: false) == [.codex])
         #expect(DashboardScope.codex.platform == .codex)
         #expect(DashboardScope.claude.platform == .claude)
         #expect(DashboardScope.grok.platform == .grok)
+        #expect(DashboardScope.antigravity.platform == .antigravity)
         #expect(DashboardScope.codex.supportsCodexMemory)
         #expect(!DashboardScope.claude.supportsCodexMemory)
         #expect(!DashboardScope.grok.supportsCodexMemory)
+        #expect(!DashboardScope.antigravity.supportsCodexMemory)
     }
 
     @Test("scopes totals, days, and colliding session ids by platform")

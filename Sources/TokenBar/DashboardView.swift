@@ -6,17 +6,23 @@ struct DashboardSummaryView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
+        providesQuota: Bool = true,
         showsClaude: Bool,
-        showsGrok: Bool) -> CGFloat
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
     {
         DashboardOverviewView.preferredHeight(
             quota: quota,
+            providesQuota: providesQuota,
             showsClaude: showsClaude,
-            showsGrok: showsGrok)
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
             + ActivitySummarySection.preferredHeight
             + 1
     }
@@ -27,6 +33,8 @@ struct DashboardSummaryView: View {
                 model: self.model,
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
+                showsAntigravity: self.showsAntigravity,
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
             Divider().padding(.horizontal, 12)
             ActivitySummarySection(
@@ -44,7 +52,7 @@ struct DashboardOverviewView: View {
     static let compactHeaderHeight: CGFloat = 34
     private static let unavailableQuotaHeight: CGFloat = 56
     private static let weeklyQuotaHeight: CGFloat = 79
-    private static let fiveHourQuotaIncrement: CGFloat = 46
+    private static let fiveHourQuotaIncrement: CGFloat = 54
     private static let resetCreditsIncrement: CGFloat = 27
     static let todayHeight: CGFloat = 122
     static let weeklyResetActivityHeight: CGFloat = 64
@@ -52,27 +60,42 @@ struct DashboardOverviewView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     static func preferredHeight(
         quota: QuotaSnapshot?,
+        providesQuota: Bool = true,
         showsClaude: Bool,
-        showsGrok: Bool) -> CGFloat
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
     {
-        self.headerHeight(showsClaude: showsClaude, showsGrok: showsGrok)
-            + self.contentHeight(quota: quota)
+        self.headerHeight(
+            showsClaude: showsClaude,
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
+            + self.contentHeight(quota: quota, providesQuota: providesQuota)
     }
 
-    static func headerHeight(showsClaude: Bool, showsGrok: Bool) -> CGFloat {
+    static func headerHeight(
+        showsClaude: Bool,
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> CGFloat
+    {
         DashboardScope.visibleScopes(
             showsClaude: showsClaude,
-            showsGrok: showsGrok).count > 1
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity).count > 1
             ? self.headerHeight
             : self.compactHeaderHeight
     }
 
-    static func contentHeight(quota: QuotaSnapshot?) -> CGFloat {
-        self.quotaHeight(quota: quota)
+    static func contentHeight(
+        quota: QuotaSnapshot?,
+        providesQuota: Bool = true) -> CGFloat
+    {
+        (providesQuota ? self.quotaHeight(quota: quota) : 0)
             + self.todayHeight
             + self.weeklyResetActivityHeight
             + 2
@@ -101,13 +124,16 @@ struct DashboardOverviewView: View {
                 model: self.model,
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
+                showsAntigravity: self.showsAntigravity,
                 accentColor: self.accentColor,
                 onSelectScope: nil)
                 .frame(height: Self.headerHeight(
                     showsClaude: self.showsClaude,
-                    showsGrok: self.showsGrok))
+                    showsGrok: self.showsGrok,
+                    showsAntigravity: self.showsAntigravity))
             DashboardOverviewContentView(
                 model: self.model,
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
         }
         .background(Color.clear)
@@ -118,13 +144,15 @@ struct DashboardHeaderView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
     let showsGrok: Bool
+    let showsAntigravity: Bool
     let accentColor: Color
     let onSelectScope: ((DashboardScope) -> Void)?
 
     var body: some View {
         let scopes = DashboardScope.visibleScopes(
             showsClaude: self.showsClaude,
-            showsGrok: self.showsGrok)
+            showsGrok: self.showsGrok,
+            showsAntigravity: self.showsAntigravity)
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Text("TokenBar")
@@ -168,27 +196,35 @@ struct DashboardHeaderView: View {
 
 struct DashboardOverviewContentView: View {
     @Bindable var model: DashboardModel
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
-        let quotaState = self.model.quotaState(for: self.model.scope.platform)
+        let platform = self.model.scope.platform
+        let quotaState = self.model.quotaState(for: platform)
         VStack(spacing: 0) {
-            Divider().padding(.horizontal, 12)
-            QuotaSummarySection(
-                state: quotaState,
-                accentColor: self.accentColor)
-                .frame(
-                    height: DashboardOverviewView.quotaHeight(quota: quotaState.value),
-                    alignment: .top)
+            if self.model.providesQuota(for: platform) {
+                Divider().padding(.horizontal, 12)
+                QuotaSummarySection(
+                    state: quotaState,
+                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                    accentColor: self.accentColor)
+                    .frame(
+                        height: DashboardOverviewView.quotaHeight(quota: quotaState.value),
+                        alignment: .top)
+            }
             Divider().padding(.horizontal, 12)
             TodaySummarySection(
                 state: self.model.visibleActivity,
+                weeklyQuotaUsage: self.model.weeklyQuotaUsageToday(for: platform),
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
                 .frame(height: DashboardOverviewView.todayHeight)
             Divider().padding(.horizontal, 12)
             WeeklyResetActivitySection(
                 quota: quotaState.value,
                 state: self.model.visibleActivity,
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
                 .frame(height: DashboardOverviewView.weeklyResetActivityHeight)
         }
@@ -240,6 +276,7 @@ private struct DashboardScopeSelector: View {
 
 private struct QuotaSummarySection: View {
     let state: DashboardSourceState<QuotaSnapshot>
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
@@ -266,6 +303,7 @@ private struct QuotaSummarySection: View {
                 WeeklyQuotaProgressRow(
                     window: weekly,
                     measuredAt: snapshot.updatedAt,
+                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                     accentColor: self.accentColor)
             } else {
                 InlinePlaceholder(
@@ -305,12 +343,15 @@ private struct QuotaSummarySection: View {
 private struct WeeklyQuotaProgressRow: View {
     let window: QuotaWindowSnapshot
     let measuredAt: Date
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
         if let reset = self.window.resetsAt,
            reset > Date(),
-           let pacing = self.window.weeklyPacing(at: self.measuredAt)
+           let pacing = self.window.weeklyPacing(
+               at: self.measuredAt,
+               weekdaysOnly: self.usesWeekdayWeeklyPacing)
         {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -331,7 +372,8 @@ private struct WeeklyQuotaProgressRow: View {
 
                 HStack(spacing: 4) {
                     Text(
-                        "Day \(pacing.currentSegment)/\(WeeklyQuotaPacing.segmentCount)"
+                        "\(pacing.weekdaysOnly ? "Workday" : "Day") "
+                            + "\(pacing.currentSegment)/\(pacing.segmentCount)"
                             + " · \(Int(pacing.actualUsedPercent.rounded()))% used")
                     Spacer(minLength: 6)
                     Text("\(Int(pacing.expectedUsedPercent.rounded()))% expected")
@@ -384,7 +426,10 @@ private struct WeeklyQuotaProgressRow: View {
     private func helpText(_ pacing: WeeklyQuotaPacing) -> String {
         let start = pacing.windowStart.formatted(date: .abbreviated, time: .shortened)
         let end = pacing.windowEnd.formatted(date: .abbreviated, time: .shortened)
-        return "Weekly cycle \(start) – \(end). Each segment is one seventh of the quota window. "
+        let paceDescription = pacing.weekdaysOnly
+            ? "Each segment is one calendar workday from midnight to midnight; weekends do not advance the pace. "
+            : "Each segment is one seventh of the quota window. "
+        return "Weekly cycle \(start) – \(end). \(paceDescription)"
             + "Used \(Int(pacing.actualUsedPercent.rounded()))%; "
             + "linear pace \(Int(pacing.expectedUsedPercent.rounded()))%."
     }
@@ -398,7 +443,7 @@ private struct WeeklyQuotaSegmentedBar: View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 HStack(spacing: 3) {
-                    ForEach(0 ..< WeeklyQuotaPacing.segmentCount, id: \.self) { index in
+                    ForEach(0 ..< self.pacing.segmentCount, id: \.self) { index in
                         GeometryReader { segment in
                             ZStack(alignment: .leading) {
                                 Rectangle()
@@ -427,7 +472,7 @@ private struct WeeklyQuotaSegmentedBar: View {
     }
 
     private func fillFraction(for index: Int) -> Double {
-        let segmentPercent = 100 / Double(WeeklyQuotaPacing.segmentCount)
+        let segmentPercent = 100 / Double(self.pacing.segmentCount)
         let segmentStart = Double(index) * segmentPercent
         return ((self.pacing.actualUsedPercent - segmentStart) / segmentPercent).clamped(to: 0 ... 1)
     }
@@ -529,6 +574,7 @@ private struct ResetCreditsRow: View {
 private struct WeeklyResetActivitySection: View {
     let quota: QuotaSnapshot?
     let state: DashboardSourceState<ActivitySnapshot>
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     private var pacing: WeeklyQuotaPacing? {
@@ -539,7 +585,9 @@ private struct WeeklyResetActivitySection: View {
         else {
             return nil
         }
-        return weekly.weeklyPacing(at: quota.updatedAt)
+        return weekly.weeklyPacing(
+            at: quota.updatedAt,
+            weekdaysOnly: self.usesWeekdayWeeklyPacing)
     }
 
     private var summary: ActivityRangeSummary? {
@@ -558,7 +606,9 @@ private struct WeeklyResetActivitySection: View {
                 Text("Since weekly reset")
                     .font(.system(size: 12, weight: .semibold))
                 if let pacing = self.pacing {
-                    Text("Day \(pacing.currentSegment)/\(WeeklyQuotaPacing.segmentCount)")
+                    Text(
+                        "\(pacing.weekdaysOnly ? "Workday" : "Day") "
+                            + "\(pacing.currentSegment)/\(pacing.segmentCount)")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
@@ -581,7 +631,7 @@ private struct WeeklyResetActivitySection: View {
                 HStack {
                     Text(
                         "Cache \(totals.tokens.cachePercentageText) · "
-                            + self.averageTPSText(totals)
+                            + self.performanceText(totals)
                             + "\(totals.sessionCount) sessions · \(totals.requestCount) turns")
                     Spacer(minLength: 6)
                     Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
@@ -610,13 +660,15 @@ private struct WeeklyResetActivitySection: View {
         return self.state.errorMessage ?? "Weekly reset activity unavailable"
     }
 
-    private func averageTPSText(_ totals: ActivityTotals) -> String {
-        totals.menuAverageTPSText.map { "\($0) · " } ?? ""
+    private func performanceText(_ totals: ActivityTotals) -> String {
+        totals.menuPerformanceText.map { "\($0) · " } ?? ""
     }
 }
 
 private struct TodaySummarySection: View {
     let state: DashboardSourceState<ActivitySnapshot>
+    let weeklyQuotaUsage: WeeklyQuotaDailyUsage?
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
@@ -625,6 +677,13 @@ private struct TodaySummarySection: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
+                    if let weeklyQuotaUsage {
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor,
+                            leadingSeparator: true)
+                    }
                     Spacer()
                     Text(totals.tokens.total.compactCount)
                         .font(.system(size: 20, weight: .semibold, design: .rounded))
@@ -638,13 +697,21 @@ private struct TodaySummarySection: View {
 
                 ActivityTotalsBreakdown(
                     totals: totals,
-                    averageTPSText: totals.menuAverageTPSText ?? self.state.value?.menuAverageTPSText,
+                    performanceText: totals.menuPerformanceText
+                        ?? self.state.value?.menuPerformanceText,
                     accentColor: self.accentColor,
                     showsBar: false)
             } else {
                 HStack {
                     Text("Today")
                         .font(.system(size: 12, weight: .semibold))
+                    if let weeklyQuotaUsage {
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor,
+                            leadingSeparator: true)
+                    }
                     Spacer()
                     InlinePlaceholder(text: self.state.isRefreshing ? "Scanning activity…" : "No activity today")
                 }
@@ -656,9 +723,54 @@ private struct TodaySummarySection: View {
     }
 }
 
+struct WeeklyQuotaUsageLabel: View {
+    let usage: WeeklyQuotaDailyUsage
+    let usesWeekdayWeeklyPacing: Bool
+    let accentColor: Color
+    var leadingSeparator = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(self.leadingSeparator ? "· Weekly quota" : "Weekly quota")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Text(self.usage.menuValueText)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(self.tint)
+        }
+        .help(self.helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Weekly quota used today, \(self.usage.menuValueText) of the weekly allowance")
+    }
+
+    // 匀速消耗周额度时单日应占的百分点：按 5 个工作日或 7 天平摊
+    private var evenDailyShare: Double {
+        100 / (self.usesWeekdayWeeklyPacing ? 5.0 : 7.0)
+    }
+
+    private var tint: Color {
+        switch self.usage.usedPercentagePoints / self.evenDailyShare {
+        case ..<0.85: TokenBarPalette.mint
+        case ..<1.25: self.accentColor
+        case ..<2: Color.orange
+        default: Color.red
+        }
+    }
+
+    private var helpText: String {
+        let share = self.evenDailyShare.formatted(.number.precision(.fractionLength(0 ... 1)))
+        let pace = self.usesWeekdayWeeklyPacing
+            ? " An even pace is about \(share)pp per weekday."
+            : " An even pace is about \(share)pp per day."
+        return self.usage.menuHelpText + pace
+    }
+}
+
 struct ActivityTotalsBreakdown: View {
     let totals: ActivityTotals
-    let averageTPSText: String?
+    let performanceText: String?
     let accentColor: Color
     var showsBar = true
 
@@ -696,7 +808,7 @@ struct ActivityTotalsBreakdown: View {
             HStack {
                 Text(
                     "Cache \(self.totals.tokens.cachePercentageText) · "
-                        + self.averageTPSSuffix
+                        + self.performanceSuffix
                         + "\(self.totals.sessionCount) sessions · \(self.totals.requestCount) turns")
                 Spacer()
                 Text(self.totals.costUsd.costText(tokenTotal: self.totals.tokens.total))
@@ -710,8 +822,8 @@ struct ActivityTotalsBreakdown: View {
         }
     }
 
-    private var averageTPSSuffix: String {
-        self.averageTPSText.map { "\($0) · " } ?? ""
+    private var performanceSuffix: String {
+        self.performanceText.map { "\($0) · " } ?? ""
     }
 }
 
@@ -990,6 +1102,20 @@ extension String {
 
     var shortDateLabel: String {
         self.count >= 10 ? String(self.suffix(5)).replacingOccurrences(of: "-", with: "/") : self
+    }
+}
+
+extension WeeklyQuotaDailyUsage {
+    var menuValueText: String {
+        self.usedPercentagePoints.formatted(
+            .number.precision(.fractionLength(0 ... 1))) + "pp"
+    }
+
+    var menuHelpText: String {
+        let base = "Observed weekly-quota change between TokenBar samples on \(self.date)."
+        guard self.isPartial else { return base }
+        return base + " Tracking for a quota cycle began after some quota was already used, "
+            + "so the day's earlier usage is not included."
     }
 }
 

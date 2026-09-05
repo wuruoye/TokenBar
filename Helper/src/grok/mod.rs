@@ -48,6 +48,7 @@ struct PendingTurn {
     output_parts: Vec<String>,
     model_hint: Option<String>,
     started_at_ms: Option<i64>,
+    first_output_at_ms: Option<i64>,
 }
 
 pub fn parse_local_grok_messages(
@@ -140,7 +141,9 @@ pub fn extract_request_detail(
         };
         match update_kind(update) {
             Some("user_message_chunk") => capture_user_chunk(&mut pending, update, timestamp),
-            Some("agent_message_chunk") => capture_agent_chunk(&mut pending, update),
+            Some("agent_message_chunk") => {
+                capture_agent_chunk(&mut pending, update, timestamp)
+            }
             Some("turn_completed") => {
                 if timestamp >= start_ms && timestamp <= end_ms {
                     let prompt = joined_prompt(&pending.prompt_parts);
@@ -243,7 +246,9 @@ fn parse_grok_file(path: &Path) -> Vec<UnifiedMessage> {
         };
         match update_kind(update) {
             Some("user_message_chunk") => capture_user_chunk(&mut pending, update, timestamp),
-            Some("agent_message_chunk") => capture_agent_chunk(&mut pending, update),
+            Some("agent_message_chunk") => {
+                capture_agent_chunk(&mut pending, update, timestamp)
+            }
             Some("turn_completed") => {
                 append_completed_turn(&mut messages, &metadata, &pending, update, timestamp);
                 pending = PendingTurn::default();
@@ -275,6 +280,15 @@ fn append_completed_turn(
         .started_at_ms
         .map(|started_at| timestamp.saturating_sub(started_at))
         .filter(|duration| *duration > 0);
+    let time_to_first_token_ms = pending
+        .started_at_ms
+        .map(|started_at| {
+            pending
+                .first_output_at_ms
+                .unwrap_or(timestamp)
+                .saturating_sub(started_at)
+        })
+        .filter(|duration| *duration >= 0);
 
     let model_rows = usage
         .get("modelUsage")
@@ -333,6 +347,7 @@ fn append_completed_turn(
         message.model_duration_ms = integer_field(row, "apiDurationMs", "api_duration_ms")
             .filter(|duration| *duration > 0);
         message.duration_ms = (emitted == 0).then_some(duration_ms).flatten();
+        message.time_to_first_token_ms = time_to_first_token_ms;
         message.is_turn_start = emitted == 0;
         if emitted == 0 {
             message.set_content_preview(prompt_preview.clone());
@@ -423,8 +438,9 @@ fn capture_user_chunk(pending: &mut PendingTurn, update: &Value, timestamp: i64)
     }
 }
 
-fn capture_agent_chunk(pending: &mut PendingTurn, update: &Value) {
+fn capture_agent_chunk(pending: &mut PendingTurn, update: &Value, timestamp: i64) {
     if let Some(text) = content_text(update.get("content")) {
+        pending.first_output_at_ms.get_or_insert(timestamp);
         pending.output_parts.push(text);
     }
 }
@@ -561,7 +577,11 @@ fn integer_field(value: &Value, camel: &str, snake: &str) -> Option<i64> {
 
 fn canonical_model(model: &str) -> String {
     let model = model.trim().to_ascii_lowercase();
-    if model.is_empty() { "grok".to_string() } else { model }
+    if model.is_empty() {
+        "grok".to_string()
+    } else {
+        model
+    }
 }
 
 fn file_modified_timestamp_ms(path: &Path) -> i64 {
@@ -669,10 +689,57 @@ mod tests {
         assert_eq!(message.cost_source, CostSource::ProviderReported);
         assert_eq!(message.duration_ms, Some(2_000));
         assert_eq!(message.model_duration_ms, Some(1_200));
+        assert_eq!(message.time_to_first_token_ms, Some(1_000));
         assert_eq!(message.content_preview.as_deref(), Some("Implement it"));
         assert_eq!(message.output_preview.as_deref(), Some("Done"));
         assert_eq!(message.workspace_key.as_deref(), Some("/tmp/TokenBar"));
         assert!(message.is_turn_start);
+    }
+
+    #[test]
+    fn multi_model_rows_share_the_turn_first_token_time() {
+        let metadata = SessionMetadata {
+            physical_session_id: "session-1".to_string(),
+            logical_session_id: "session-1".to_string(),
+            is_subagent: false,
+            agent: None,
+            workspace_key: None,
+            workspace_label: None,
+            fallback_model: "grok-build".to_string(),
+        };
+        let pending = PendingTurn {
+            started_at_ms: Some(1_000),
+            first_output_at_ms: Some(1_250),
+            ..PendingTurn::default()
+        };
+        let update = serde_json::json!({
+            "prompt_id": "prompt-1",
+            "usage": {
+                "modelUsage": {
+                    "grok-main": {
+                        "inputTokens": 10,
+                        "outputTokens": 5,
+                        "apiDurationMs": 500
+                    },
+                    "grok-worker": {
+                        "inputTokens": 20,
+                        "outputTokens": 8,
+                        "apiDurationMs": 750
+                    }
+                }
+            }
+        });
+        let mut messages = Vec::new();
+
+        append_completed_turn(&mut messages, &metadata, &pending, &update, 2_000);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|message| message.time_to_first_token_ms == Some(250)));
+        assert!(messages
+            .iter()
+            .all(|message| message.model_duration_ms.is_some()));
     }
 
     #[test]

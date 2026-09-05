@@ -3,6 +3,9 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde_json::Value;
@@ -40,6 +43,8 @@ pub fn collect(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let mut child = command
         .spawn()
         .context("could not start tokenbar-helper")?;
@@ -111,6 +116,7 @@ fn append_reset_arguments(arguments: &mut Vec<OsString>, resets: PlatformWeeklyR
         ("--weekly-reset-ms", resets.codex),
         ("--claude-weekly-reset-ms", resets.claude),
         ("--grok-weekly-reset-ms", resets.grok),
+        ("--antigravity-weekly-reset-ms", resets.antigravity),
     ] {
         if let Some(value) = value {
             arguments.push(OsString::from(flag));
@@ -144,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_three_platform_resets_to_exact_helper_flags() {
+    fn maps_every_platform_reset_to_exact_helper_flags() {
         let mut arguments = Vec::new();
         append_reset_arguments(
             &mut arguments,
@@ -152,6 +158,7 @@ mod tests {
                 codex: Some(11),
                 claude: Some(22),
                 grok: Some(33),
+                antigravity: Some(44),
             },
         );
         assert_eq!(
@@ -163,6 +170,8 @@ mod tests {
                 OsString::from("22"),
                 OsString::from("--grok-weekly-reset-ms"),
                 OsString::from("33"),
+                OsString::from("--antigravity-weekly-reset-ms"),
+                OsString::from("44"),
             ]
         );
     }

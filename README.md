@@ -5,7 +5,7 @@
 <h1 align="center">TokenBar</h1>
 
 <p align="center">
-  Codex, Claude Code, and Grok Build quota and token activity, at a glance in your macOS menu bar.
+  Codex, Claude Code, Grok Build, and Antigravity quota and token activity, at a glance in your macOS menu bar.
 </p>
 
 <p align="center">
@@ -19,29 +19,33 @@
   <img src="docs/images/dashboard.png" width="460" alt="TokenBar dashboard showing Codex quota, today's token usage, weekly-reset totals, and recent activity">
 </p>
 
-TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, and Grok Build. It combines each platform's quota windows with local token accounting, costs, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
+TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, Grok Build, and Antigravity. It combines each platform's quota windows with local token accounting, costs, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
 
-> TokenBar is an independent project and is not affiliated with or endorsed by OpenAI, Anthropic, or xAI.
+> TokenBar is an independent project and is not affiliated with or endorsed by OpenAI, Anthropic, xAI, or Google.
+
+The native Windows taskbar and tray client supports Codex, Claude Code, and Grok Build. See [Windows/README.md](Windows/README.md) for installation, behavior, and build instructions.
 
 ## Highlights
 
-- See one compact menu bar item with separate Codex, Claude, and Grok `T/W` sections.
+- See one compact menu bar item with separate Codex, Claude, Grok, and Antigravity `T/W` sections.
 - Click a provider section to open TokenBar directly on that platform's tab.
-- Switch between the **Codex**, **Claude**, and **Grok** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
-- Hide or restore the Claude and Grok sections and tabs immediately from Settings, without restarting TokenBar.
+- Switch between the **Codex**, **Claude**, **Grok**, and **Antigravity** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
+- Hide or restore the Claude, Grok, and Antigravity sections and tabs immediately from Settings, without restarting TokenBar.
 - Track every provider's quota window independently without mixing percentages or reset cycles.
 - Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
 - Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
-- Compare weekly usage with a linear seven-segment pace calculated from the last weekly reset.
+- Compare weekly usage with a linear seven-day pace calculated from the last weekly reset, or switch to a five-workday pace that pauses on weekends.
+- Record each day's observed weekly-quota increase alongside Today and the selected Activity date, using the same UTC or local statistics timezone as token totals.
 - Review today and since-weekly-reset totals for input, output, cache, reasoning, estimated cost, sessions, and turns; Today also shows the estimated cost of each token category.
 - Explore 7-day and 30-day activity, then hover a day to inspect usage by model.
-- On the **Codex** tab only, track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output.
-- Browse the selected platform's recent sessions, using provider-generated titles when available. Codex and Claude sessions open in their desktop apps; Grok sessions resume in Terminal from their original workspace.
+- Optionally track Codex Memory extraction (Phase 1) and consolidation (Phase 2) tokens by input, cached input, cache write, output, and reasoning output on the **Codex** tab only.
+- Browse today's recent sessions in the main menu, or select any date in Activity Detail to load that day's sessions from this Mac's local logs. Provider-generated titles, session opening, and turn/request drill-down remain available for historical dates.
 - Drill down from a session to each root-prompt turn, then to the main and subagent requests that contributed to it.
 - Compare weighted average generation throughput from local output, reasoning-token, and active model-request duration data at the day, session, turn, and physical-request levels.
 - See `FAST` or `MIXED` badges on sessions, turns, and physical requests that used Codex Fast mode.
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Optionally combine privacy-redacted activity snapshots from Windows, Linux, and other Macs through a self-hosted HTTPS sync service; remote sessions are labeled by device and stay read-only.
+- Optionally launch TokenBar automatically when you sign in to macOS, with approval handled through the system Login Items settings.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
 
 ## Screenshots
@@ -55,13 +59,12 @@ _The screenshots use generated demo data and contain no real account or session 
 
 ## Requirements
 
-The Windows tray client, build scripts and usage guide are available in [Windows/](Windows/README.md).
-
 - macOS 14 or later.
 - At least one supported client:
   - [Codex CLI](https://developers.openai.com/codex/cli/) installed and authenticated. Running `codex` in Terminal should work before starting TokenBar; `CODEX_CLI_PATH` can point to a nonstandard installation.
   - Claude Code installed, used at least once, and authenticated. TokenBar reads its local projects from `~/.claude/projects` (or `CLAUDE_CONFIG_DIR`) and its existing OAuth credential for quota.
   - [Grok Build](https://x.ai/cli) installed, used at least once, and authenticated. TokenBar reads durable local sessions and the latest CLI-written quota snapshot from `~/.grok` (or `GROK_HOME`).
+  - [Antigravity](https://antigravity.google/) installed and used at least once. TokenBar reads the per-conversation SQLite databases under `~/.gemini/antigravity/conversations` (or `ANTIGRAVITY_HOME`). Quota needs Antigravity to be running, because it comes from that app's own local language server.
 - To build from source: Apple Swift 6.2 command-line tools and a recent stable Rust toolchain with Cargo.
 
 TokenBar is currently distributed from source. There is no prebuilt, notarized GitHub release yet.
@@ -101,10 +104,10 @@ Signing with a Developer ID does not notarize the bundle; distribution still req
 
 1. Launch `TokenBar.app`. TokenBar appears only in the menu bar; it has no Dock icon.
 2. Click a provider's `T/W` section to open its matching tab. Opening the menu refreshes local activity and any quota data older than one minute.
-3. Use the three tabs to switch platforms without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
-4. Hover **Activity** for the daily chart and per-model breakdowns.
-5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings.
-6. Click a recent session to open it in the matching desktop app or resume a Grok session in Terminal. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
+3. Use the platform tabs to switch providers without closing the menu. Quota, Today, Activity, and Recent Sessions all follow the selected tab.
+4. Hover **Activity** and move across the daily chart; the selected date's session submenu opens directly and updates with the highlighted bar.
+5. Hover **Codex Memory** for Today/30-day Phase 1 and Phase 2 details. If Codex is not configured yet, use the explicit enable button there or in Settings. Turn off **Monitor Codex Memory usage** in Settings to hide this section and stop its local receiver.
+6. Click a recent or Activity Detail session to open it in the matching desktop app, resume a Grok session in Terminal, or reopen an Antigravity conversation's workspace folder in Antigravity. Hover the row to inspect its turns; a turn represents one root user prompt and aggregates all main/subagent work attributed to that prompt.
 7. If a turn has multiple contributing requests, hover it to expand the main and subagent rows. Hover a request again to load its full prompt and output.
 8. Use **Copy Session** or click a request row to copy its stable locator.
 
@@ -118,7 +121,7 @@ The default background refresh interval is five minutes. Opening the menu always
 
 ## How counting works
 
-TokenBar normalizes Codex, Claude Code, and Grok Build into the same three activity levels:
+TokenBar normalizes Codex, Claude Code, Grok Build, and Antigravity into the same three activity levels:
 
 1. **Session** — a root conversation within one platform. TokenBar prefers the Codex-generated title when available and otherwise falls back to the first useful prompt.
 2. **Turn** — the interval beginning with a root user prompt and ending before the next root user prompt. Main-thread and subagent requests launched for that prompt are aggregated into the turn, including subagent work that finishes later.
@@ -126,9 +129,11 @@ TokenBar normalizes Codex, Claude Code, and Grok Build into the same three activ
 
 Platform is part of every aggregation and identity key, so sessions from different clients with the same raw ID remain separate. Claude Code's repeated streaming snapshots are deduplicated by message/request identity before totals are calculated.
 
-Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex and Grok report overlapping total fields; TokenBar converts them into disjoint buckets before aggregation so cache and reasoning are counted once. Complete Grok turn costs are provider-reported; partial or incomplete Grok costs stay unknown rather than appearing as zero-cost usage.
+Token totals contain input, output, cache-read, cache-write, and reasoning buckets. Codex, Claude Code, Grok, and Antigravity report overlapping total fields; TokenBar converts them into disjoint buckets before aggregation so cache and reasoning are counted once. Claude Code reports `output_tokens_details.thinking_tokens` as a subset of its billed output, so TokenBar moves that count into the reasoning bucket after deduplicating streaming snapshots. Both buckets are billed at the output rate, leaving the estimate unchanged. A request whose reported thinking count exceeds its own output total keeps the raw output and drops the unusable breakdown. Complete Grok turn costs are provider-reported; partial or incomplete Grok costs stay unknown rather than appearing as zero-cost usage. Antigravity records a request's cached prefix, its total output, and the thinking share of that output, so TokenBar keeps the cached count in cache-read and splits the remainder into output and reasoning. Antigravity runs both Gemini and Claude models, so each request is priced from the catalog that owns its model: Anthropic's for Claude, and the Gemini rates for the rest. Gemini bills thinking tokens at the output rate, and Gemini Pro requests switch to the long-context rate above a 200K-token prompt.
 
-`Avg tok/s` divides generated output plus reasoning tokens by the summed active duration of the underlying model requests. Tool execution, polling, and other time between model requests stay in the displayed turn duration but are excluded from TPS. TokenBar omits TPS when a local transcript does not expose enough request-boundary timing to calculate it reliably.
+First-token latency appears in seconds beside generation speed in `tok/s`. Session, day, and range rows use the arithmetic mean of the available turn samples. TokenBar prefers Codex's recorded first-token metric and otherwise uses its first durable response item, approximates Claude latency from the local request boundary to the UUIDv7 timestamp embedded in its message ID, uses Grok's first durable output chunk or completed turn, and uses the first-token timestamp Antigravity records on each generation step.
+
+Generation speed divides generated output plus reasoning tokens by the summed active duration of the underlying model requests. Tool execution, polling, and other time between model requests stay in the displayed turn duration but are excluded from TPS. TokenBar omits a performance metric when a local transcript does not expose enough timing data to calculate it reliably.
 
 Codex records Fast mode as the `priority` service tier (`fast` is also accepted for older logs); `default` and `standard` are treated as Standard. When every service-tier snapshot in one physical session agrees, TokenBar applies that tier to the whole session, including usage written before the first snapshot. If a session switches tier, TokenBar follows the timeline from each snapshot and leaves any prefix before the first snapshot unknown. Subagents inherit the last tier from their replayed parent context without counting the parent's earlier tier history as their own. A turn containing both Fast and Standard physical requests is marked `MIXED`.
 
@@ -138,13 +143,17 @@ Codex records Fast mode as the `priority` service tier (`fast` is also accepted 
 cache-read tokens / (input tokens + cache-read tokens + cache-write tokens) × 100%
 ```
 
-Costs prefixed with `~` are token-cost estimates using current OpenRouter quotes when available, with reviewed official rates bundled for offline use. Provider-reported costs, when present in the source data, remain authoritative. TokenBar reads only the non-sensitive `auth_mode` field from the active Codex home's `auth.json` to choose the Fast basis. ChatGPT subscription sessions follow Codex credit consumption—GPT-5.4 uses 2× and GPT-5.5/5.6 and GPT-6 Astra use 2.5×—while API Key sessions follow API Fast pricing, where GPT-5.6 and GPT-6 Astra use 2×. Subscription totals are credit-weighted compatibility estimates. OpenRouter quotes can differ from direct-provider prices; refreshed quotes also update historical estimates. See [OpenAI pricing](https://developers.openai.com/api/docs/pricing), [Codex Fast mode](https://learn.chatgpt.com/docs/agent-configuration/speed), and the [OpenRouter Models API](https://openrouter.ai/docs/guides/overview/models). A model without an explicitly verified Fast multiplier keeps its standard estimate.
+Costs prefixed with `~` are compatibility estimates, not provider invoices. Provider-reported costs, when present in the source data, remain authoritative. The macOS app refreshes OpenAI's official Markdown pricing table at most once every 24 hours and strictly validates both its Standard and Fast schemas before use; a validated local cache and reviewed built-in rates cover offline starts and failed refreshes. When a scan finds a Codex or Claude request with tokens but no price, TokenBar bypasses the 24-hour freshness window, attempts one matching catalog refresh, and reruns the helper after a successful update. Repeated unknown-model refreshes are limited to once per hour. TokenBar reads only the non-sensitive `auth_mode` field from the active Codex home's `auth.json` to choose the Fast basis. ChatGPT subscription sessions follow Codex credit consumption—GPT-5.4 uses 2× and GPT-5.5/5.6 and GPT-6 Astra use 2.5×—while API Key sessions use the official Fast table. See OpenAI's [Codex Fast mode documentation](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode) and [pricing table](https://developers.openai.com/api/docs/pricing). A model without verified Fast pricing keeps its standard estimate.
 
 Codex reports `cached_input_tokens` and `cache_write_input_tokens` as subcategories of `input_tokens`. TokenBar separates those buckets internally so their rows add back to the provider's raw input total exactly once. In the dashboard, cache writes are included in **Input**, while **Cache** means cache reads; the internal split is retained so each category can use its own price. For GPT-5.6, cache writes use OpenAI's documented 1.25× uncached-input rate; models without a verified cache-write rate remain unpriced if a nonzero write is reported. See the [GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model#using-gpt-5-6).
 
-Recognized OpenAI model IDs retain their estimate behind custom Codex gateways. Model IDs are matched within the correct author namespace; free and other variant suffixes do not replace a standard model quote. GPT-6 Astra's bundled short-context rates are $10 input, $1 cached input, $12.50 cache writes and $50 output per million tokens. Each physical request above 272K raw input tokens uses 2× input/cache rates and 1.5× output/reasoning rates. OpenRouter context overrides are applied once when available. The research-preview `gpt-5.3-codex-spark` ID retains its documented bundled fallback. Requests without a usable quote remain unpriced.
+Recognized OpenAI model IDs retain the estimate behind custom Codex gateways, and the unpriced research-preview `gpt-5.3-codex-spark` ID uses the public GPT-5.3-Codex rate so historical totals stay aligned with Tokscale. Unknown model families remain unpriced. For GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra, TokenBar applies the official long-context table row to each physical model request whose raw input exceeds 272K tokens. The threshold is evaluated before turn, session, and daily aggregation. See OpenAI's [pricing table](https://developers.openai.com/api/docs/pricing).
 
-The shared Rust helper checks OpenRouter's public model catalog at most once every 24 hours, validates decimal USD-per-token rates and context overrides, and atomically caches the result. Failed downloads preserve the last valid cache and wait one hour before retrying. Codex and Claude estimates prefer complete matching quotes; incomplete fields fall back to reviewed official rates. Claude's 5-minute and 1-hour cache writes remain separate. The macOS Anthropic Markdown updater remains available as an official fallback. Grok's provider-reported costs are preserved.
+Claude compatibility estimates use a reviewed built-in fallback plus Anthropic's official [pricing table](https://platform.claude.com/docs/en/about-claude/pricing). TokenBar checks the official Markdown catalog at most once every 24 hours, validates its document shape before caching it, strictly validates the table schema and rates before use, and keeps the previous catalog or built-in rates when the request or validation fails. Claude Code's 5-minute and 1-hour cache-write token buckets are priced separately when the transcript exposes that breakdown. Unknown model IDs still remain unpriced instead of inheriting a nearby model's rate.
+
+The shared Rust helper also refreshes the public OpenRouter model catalog every 24 hours. Explicit official pricing tables keep priority for matching models; otherwise Codex and Claude use complete OpenRouter quotes, then bundled rates. Failed downloads keep the last valid cache with a one-hour retry interval. Quotes use decimal USD-per-token values and apply context overrides once. Prices prefixed with `~` are current-quote estimates; OpenRouter quotes can differ from direct-provider prices, and refreshing them recalculates historical estimates. No API key, local model identifiers, session content, or provider credentials are sent to this endpoint.
+
+GPT-6 Astra's bundled rates per million tokens are $10 input, $1 cached input, $12.50 cache writes, and $50 output. Above 272K raw input tokens, the rates are $20, $2, $25, and $75 respectively. Fast multipliers are 2× for API pricing and 2.5× for ChatGPT subscription credits.
 
 Pricing caches are shared per user: `%LOCALAPPDATA%/TokenBar/pricing` on Windows, `~/Library/Application Support/TokenBar/pricing` on macOS, and `$XDG_CACHE_HOME/tokenbar/pricing` (or `~/.cache/tokenbar/pricing`) on Linux. `TOKENBAR_PRICING_CACHE_DIR` overrides the cache directory. `--offline-pricing` disables downloads; `--openrouter-pricing-json PATH` uses a supplied public Models API JSON file without networking.
 
@@ -152,7 +161,7 @@ Fast pricing never changes raw token/cache counts. Quota percentages come from C
 
 ### Codex Memory tokens
 
-TokenBar runs a metrics-only OTLP/HTTP JSON receiver on `127.0.0.1:4318`. The receiver accepts only `POST /v1/metrics`, retains only `codex.memory.phase1.token_usage` and `codex.memory.phase2.token_usage`, and stores observations in `~/Library/Application Support/TokenBar/memory-telemetry.sqlite`. It reads histogram `sum`; histogram `count` is only the number of observations and is never treated as token usage.
+When **Monitor Codex Memory usage** is on, TokenBar runs a metrics-only OTLP/HTTP JSON receiver on `127.0.0.1:4318`. The receiver accepts only `POST /v1/metrics`, retains only `codex.memory.phase1.token_usage` and `codex.memory.phase2.token_usage`, and stores observations in `~/Library/Application Support/TokenBar/memory-telemetry.sqlite`. It reads histogram `sum`; histogram `count` is only the number of observations and is never treated as token usage. Turning monitoring off stops the receiver, hides Memory usage, and excludes the local Memory snapshot from multi-device sync without changing Codex's own memory setting.
 
 The owner-only database keeps each observation plus a persisted series watermark. DELTA points are added once per unique interval. CUMULATIVE points add only the increase over the latest in-order watermark; duplicate and out-of-order exports add zero, while a new start time or resource series is counted independently. This state survives TokenBar and Codex process restarts. The Memory detail view reports how many raw observations are stored locally.
 
@@ -171,34 +180,38 @@ TokenBar is designed to keep session content local:
 - The Rust helper reads Codex JSONL logs under `~/.codex/sessions` and `~/.codex/archived_sessions`, or the equivalent directory selected by `CODEX_HOME`.
 - It reads Claude Code JSONL logs under `~/.claude/projects`, or the equivalent directory selected by `CLAUDE_CONFIG_DIR`.
 - It reads Grok Build's `summary.json` and durable `updates.jsonl` files under `~/.grok/sessions`, or the equivalent directory selected by `GROK_HOME`.
+- It opens Antigravity's conversation databases read-only under `~/.gemini/antigravity/conversations`, or the equivalent directory selected by `ANTIGRAVITY_HOME`, and reads conversation titles from `agyhub_summaries_proto.pb` in the same directory. TokenBar never writes to Antigravity's data.
 - Codex-generated titles are read from `session_index.jsonl` in the same Codex home directory.
-- Local activity parsing, turn attribution, and pricing never upload session content or read a Tokscale runtime cache. Price updates are unauthenticated reads of the public OpenRouter model list and, on macOS, Anthropic's pricing Markdown. No local model names, session content, or provider credentials are sent to the price endpoint. Cached rates use owner-only file permissions on Unix.
+- Local activity parsing, turn attribution, and pricing never upload session content or read a Tokscale runtime cache. Pricing refreshes are unauthenticated reads of OpenAI's and Anthropic's public pricing Markdown and OpenRouter's public model catalog at most once every 24 hours. Validated files are stored under `~/Library/Application Support/TokenBar/` with owner-only permissions.
 - Full prompt and output text is read lazily when a request detail menu opens and is retained in memory only for the current process.
 - The persistent activity cache omits titles, prompt/output previews, and source paths, including those nested under physical requests. It is stored at `~/Library/Application Support/TokenBar/activity-snapshot.json` with owner-only permissions.
 - The last successful provider quota snapshots are stored at `~/Library/Application Support/TokenBar/quota-snapshots.json`, also with owner-only permissions, so a temporary provider rate limit does not blank the menu.
+- Per-day weekly-quota changes are stored at `~/Library/Application Support/TokenBar/weekly-quota-usage.json` with owner-only permissions. Timestamped increases are retained for the 30-day Activity range and regroup when the statistics timezone changes. The first sample in each weekly cycle is a baseline, so usage from before that sample is not attributed to its day.
 - The optional Codex Memory receiver stores token counts, timestamps, metric names, deduplication fingerprints, and a small allowlist of process identity fields. It discards the full request body and never stores prompts, traces, logs, arbitrary metric attributes, or unrelated metrics.
 - TokenBar does not send its own telemetry or analytics. The Codex Memory integration receives the two selected metrics over loopback only.
 
-Quota is the intentional network-facing part of the Codex and Claude integrations. TokenBar asks the locally installed Codex app-server for Codex rate limits. For Claude it makes a read-only request to Anthropic's OAuth usage endpoint with the existing Claude Code credential from `.credentials.json` or the macOS Keychain; when a live refresh is unavailable, TokenBar can use Claude Desktop's recent local usage sample and labels that source in the quota header. Grok quota is different: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
+Quota is the intentional network-facing part of the Codex integration. TokenBar asks the locally installed Codex app-server for Codex rate limits. Claude quota stays local: TokenBar reads Claude Desktop's recent usage sample and a sanitized Claude Code statusline snapshot at `~/Library/Application Support/TokenBar/claude-rate-limits.json`. The snapshot contains only subscriber rate-limit windows and sample time, so valid future reset times can supplement fresher Desktop percentages without storing the rest of the statusline payload. If Claude omits reset metadata, this build initially schedules the weekly reset for Sunday at 20:00 local time, persists that anchor in the quota cache, and re-anchors either window when usage falls from above 1% to at most 1%; expired inferred anchors advance by whole window durations. A later provider reset always takes precedence. TokenBar never reads Claude Code credentials from `.credentials.json` or the macOS Keychain and never calls Anthropic's OAuth usage endpoint. Grok quota is also local: TokenBar reads the latest billing snapshot already written to Grok Build's local unified log, and never reads Grok's `auth.json` or sends an authenticated Grok request. Antigravity quota is local too: Antigravity writes its language server's loopback port and CSRF token into its own logs under `~/Library/Logs/Antigravity`, and TokenBar asks that local server for the same quota summary the IDE shows. TokenBar never reads `~/.gemini/jetski-standalone-oauth-token` and never contacts Google. Antigravity meters Gemini and third-party models as two independent pools; only one fits a provider tab, so TokenBar reports the pool that runs out first and takes both windows from that same pool. TokenBar does not refresh, rewrite, or copy provider credentials into its own cache. The optional Codex extra-reset lookup uses the existing Codex OAuth credential. If Codex's `config.toml` explicitly sets a custom HTTPS `chatgpt_base_url`, TokenBar honors that origin and sends the same bearer credential to it; redirects remain restricted to that exact HTTPS origin.
 
 ## Settings
 
 Open **Settings** with `Command-,` to configure:
 
 - **Theme color:** System, Blue, Purple, Green, Orange, or Pink.
-- **Show Claude Code:** add or remove the Claude `T/W` section and Claude tab immediately. When hidden, TokenBar skips Claude quota refreshes and does not read the Claude credential from disk or the macOS Keychain.
+- **Show Claude Code:** add or remove the Claude `T/W` section and Claude tab immediately. Claude quota uses only local statusline and Claude Desktop samples; TokenBar never reads the Claude credential.
 - **Show Grok Build:** add or remove the Grok `T/W` section and Grok tab immediately. When hidden, TokenBar skips Grok quota-log refreshes.
+- **Show Antigravity:** add or remove the Antigravity `T/W` section and Antigravity tab immediately. When hidden, TokenBar skips Antigravity quota refreshes.
+- **Use weekdays only for weekly pace:** split weekly pace into five workdays and pause expected usage on Saturday and Sunday.
 - **Statistics timezone:** UTC to match the Codex usage dashboard, or local time.
 - **Recent sessions:** show 5 or 10 sessions before the **Show More** control.
 - **Full request content:** enable or disable the last hover level for prompts and outputs.
-- **Codex Memory:** inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
+- **Codex Memory:** start or stop TokenBar's Memory monitor, inspect the loopback receiver and Codex configuration state, and explicitly enable metrics when no custom `[otel]` configuration exists.
 - **Multi-device sync:** configure the optional HTTPS endpoint, Keychain-backed device access token, and this Mac's stable device identity. Headless Windows/Linux components and the self-hosted service are documented in [`Sync/README.md`](Sync/README.md).
 - **Background refresh:** 1, 5, 10, or 15 minutes.
 - **Reset celebrations:** play confetti for 5-hour resets, weekly resets, both, or neither, with a test button for previewing the animation immediately.
 
 ## Development
 
-No sibling repository checkout is required. The Swift package contains the menu bar UI and independent provider quota clients; `Helper` contains the Codex, Claude, and Grok adapters plus the shared Rust activity aggregator.
+No sibling repository checkout is required. The Swift package contains the menu bar UI and independent provider quota clients; `Helper` contains the Codex, Claude, Grok, and Antigravity adapters plus the shared Rust activity aggregator.
 
 ### Build and run
 
@@ -298,7 +311,7 @@ TokenBar does not embed Sparkle yet, so GitHub Releases are the update channel f
 ```text
 Sources/TokenBar/             AppKit/SwiftUI menu bar UI
 Sources/TokenBarCore/         Models, quota client, caching, and presentation logic
-Helper/                       Codex/Claude/Grok parsers and shared activity aggregator
+Helper/                       Codex/Claude/Grok/Antigravity parsers and shared activity aggregator
 Sync/                         Windows/Linux headless clients, Linux service, and protocol
 Tests/TokenBarCoreTests/      Swift behavior and fixture tests
 Resources/                    Bundle metadata and app icon assets
@@ -322,7 +335,7 @@ This is intentional when Codex returns no 5-hour window. Weekly quota can still 
 
 ### No local activity appears
 
-Confirm that the client has created JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.claude/projects`, or `~/.grok/sessions`. If you use a custom home, launch TokenBar with the matching `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or `GROK_HOME` environment.
+Confirm that the client has created JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.claude/projects`, or `~/.grok/sessions`, or conversation databases under `~/.gemini/antigravity/conversations`. If you use a custom home, launch TokenBar with the matching `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GROK_HOME`, or `ANTIGRAVITY_HOME` environment.
 
 ### An extra reset count is missing
 
@@ -330,7 +343,7 @@ Extra resets are best-effort and require current OAuth credentials in the Codex 
 
 ### A cost is absent
 
-TokenBar leaves requests unpriced when neither the log nor its internal pricing data has a trustworthy rate for the model.
+TokenBar leaves requests unpriced when neither the log nor its internal pricing data has a trustworthy rate for the model. Google publishes no machine-readable Gemini rate table, so TokenBar reads the same rates from OpenRouter's public model catalog, including its long-context override, and keeps a reviewed bundled table for when that catalog is unavailable or changes shape. Discounted `:batch` catalog rows are ignored. The bundled table also carries Google's scheduled 2027-01-01 increase and applies whichever rate is in effect on the day being counted.
 
 ### A development build cannot find the helper
 

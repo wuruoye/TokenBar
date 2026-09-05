@@ -7,9 +7,25 @@ struct ActivityDetailView: View {
     static let preferredHeight: CGFloat = 540
 
     @Bindable var model: DashboardModel
+    let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
+    let onSelectDate: (String) -> Void
 
     @State private var selectedDate: String?
+
+    init(
+        model: DashboardModel,
+        usesWeekdayWeeklyPacing: Bool,
+        accentColor: Color,
+        initialSelectedDate: String? = nil,
+        onSelectDate: @escaping (String) -> Void = { _ in })
+    {
+        self.model = model
+        self.usesWeekdayWeeklyPacing = usesWeekdayWeeklyPacing
+        self.accentColor = accentColor
+        self._selectedDate = State(initialValue: initialSelectedDate)
+        self.onSelectDate = onSelectDate
+    }
 
     private var days: [DailySummary] {
         Array((self.model.visibleActivitySnapshot?.days ?? []).sorted { $0.date < $1.date }.suffix(30))
@@ -53,7 +69,7 @@ struct ActivityDetailView: View {
             if let totals = self.rangeTotals {
                 ActivityTotalsBreakdown(
                     totals: totals,
-                    averageTPSText: totals.menuAverageTPSText,
+                    performanceText: totals.menuPerformanceText,
                     accentColor: self.accentColor)
             }
             Divider()
@@ -72,6 +88,11 @@ struct ActivityDetailView: View {
             height: Self.preferredHeight,
             alignment: .topLeading)
         .background(Color.clear)
+        .onChange(of: self.selectedDay?.date, initial: true) { _, date in
+            if let date {
+                self.onSelectDate(date)
+            }
+        }
     }
 
     private var header: some View {
@@ -170,24 +191,43 @@ struct ActivityDetailView: View {
     }
 
     private func dayDetail(_ day: DailySummary) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        let weeklyQuotaUsage = self.model.weeklyQuotaUsage(
+            for: self.model.scope.platform,
+            on: day.date)
+        return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(day.date)
                         .font(.system(size: 13, weight: .semibold))
                     Text(
-                        "\(day.sessionCount) sessions · \(day.requestCount) turns · "
-                            + "Cache \(day.tokens.cachePercentageText)")
+                        [
+                            "\(day.sessionCount) sessions",
+                            "\(day.requestCount) turns",
+                            "Cache \(day.tokens.cachePercentageText)",
+                            day.menuPerformanceText,
+                        ]
+                        .compactMap(\.self)
+                        .joined(separator: " · "))
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(day.tokens.total.compactCount)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                Text(day.costUsd.costText(tokenTotal: day.tokens.total))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(day.tokens.total.compactCount)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                        Text(day.costUsd.costText(tokenTotal: day.tokens.total))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                    }
+                    if let weeklyQuotaUsage {
+                        WeeklyQuotaUsageLabel(
+                            usage: weeklyQuotaUsage,
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor)
+                    }
+                }
             }
 
             Text("Models")

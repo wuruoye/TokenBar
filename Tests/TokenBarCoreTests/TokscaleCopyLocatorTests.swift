@@ -2,7 +2,7 @@
 import Testing
 
 struct TokscaleCopyLocatorTests {
-    @Test("Session copy matches Tokscale locator exactly")
+    @Test("Session copy uses the agent-adapter provider and session keys")
     func sessionLocator() {
         let request = self.makeRequest()
         let session = SessionSummary(
@@ -15,7 +15,7 @@ struct TokscaleCopyLocatorTests {
             models: [request.model],
             requests: [request])
 
-        #expect(session.tokscaleCopyText == "platform=codex session_id=root-session")
+        #expect(session.tokscaleCopyText == "provider=codex session_id=root-session")
         #expect(!session.tokscaleCopyText.contains("\n"))
     }
 
@@ -29,7 +29,67 @@ struct TokscaleCopyLocatorTests {
         #expect(!request.tokscaleCopyText.contains("\n"))
     }
 
-    @Test("Claude copy uses the Claude platform locator")
+    @Test("Synced session copy includes server and restores the remote session ID")
+    func syncedSessionLocator() {
+        let request = self.makeRequest()
+        let server = "11111111-1111-4111-8111-111111111111"
+        let session = SessionSummary(
+            id: "sync:\(server):root-session",
+            workspaceLabel: "Windows Workstation",
+            startedAtMs: request.startedAtMs,
+            endedAtMs: request.endedAtMs,
+            tokens: request.tokens,
+            costUsd: request.costUsd,
+            models: [request.model],
+            requests: [request],
+            title: "Remote session")
+
+        #expect(session.synchronizedDeviceID == server)
+        #expect(session.synchronizedOriginalSessionID == "root-session")
+        #expect(
+            session.tokscaleCopyText
+                == "provider=codex server=\(server) session_id=root-session")
+    }
+
+    @Test("Claude session copy keeps the transcript UUID")
+    func claudeSessionLocator() {
+        let request = self.makeRequest()
+        let sessionID = "2622858e-6ba4-4405-976d-d041e4e0c218"
+        let session = SessionSummary(
+            id: sessionID,
+            workspaceLabel: "TokenBar",
+            startedAtMs: request.startedAtMs,
+            endedAtMs: request.endedAtMs,
+            tokens: request.tokens,
+            costUsd: request.costUsd,
+            models: [request.model],
+            requests: [request],
+            platform: .claude)
+
+        #expect(
+            session.tokscaleCopyText
+                == "provider=claude session_id=2622858e-6ba4-4405-976d-d041e4e0c218")
+        #expect(!session.tokscaleCopyText.contains("host_session_id"))
+    }
+
+    @Test("Grok session copy uses the provider key")
+    func grokSessionLocator() {
+        let request = self.makeRequest()
+        let session = SessionSummary(
+            id: "grok-session",
+            workspaceLabel: "TokenBar",
+            startedAtMs: request.startedAtMs,
+            endedAtMs: request.endedAtMs,
+            tokens: request.tokens,
+            costUsd: request.costUsd,
+            models: [request.model],
+            requests: [request],
+            platform: .grok)
+
+        #expect(session.tokscaleCopyText == "provider=grok session_id=grok-session")
+    }
+
+    @Test("Claude request copy keeps the Tokscale platform locator")
     func claudeLocator() {
         let codex = self.makeRequest()
         let request = RequestSummary(

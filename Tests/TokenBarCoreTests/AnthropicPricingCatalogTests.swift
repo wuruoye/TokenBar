@@ -66,13 +66,39 @@ struct AnthropicPricingCatalogTests {
         #expect(try Data(contentsOf: fileURL) == stale)
     }
 
+    @Test("forces a fresh catalog once and throttles repeated unknown-model refreshes")
+    func forcesFreshCatalogOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let fileURL = directory.appendingPathComponent("anthropic-pricing.md")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Self.validMarkdown.write(to: fileURL)
+        let now = Date(timeIntervalSince1970: 1_788_300_000)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: fileURL.path)
+        let recorder = PricingFetchRecorder(data: Self.validMarkdown)
+        let updater = AnthropicPricingCatalogUpdater(
+            fileURL: fileURL,
+            now: { now },
+            fetch: { url in await recorder.fetch(url) })
+
+        let cached = await updater.refreshIfNeeded()
+        let refreshed = await updater.refreshNowIfAllowed()
+        let throttled = await updater.refreshNowIfAllowed()
+
+        #expect(cached == fileURL)
+        #expect(refreshed == fileURL)
+        #expect(throttled == nil)
+        #expect(await recorder.count == 1)
+    }
+
     private static let validMarkdown = Data(
         """
         # Pricing
 
         ## Model pricing
 
-        | Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+        | Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
         | --- | --- | --- | --- | --- | --- |
         | Claude Fable 5 | $10 / MTok | $12.50 / MTok | $20 / MTok | $1 / MTok | $50 / MTok |
         | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |

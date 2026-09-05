@@ -5,20 +5,33 @@ import TokenBarCore
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let memoryTelemetryController = MemoryTelemetryController()
     let activitySyncController = ActivitySyncController(settings: .shared)
+    private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
+    private let openRouterPricingCatalog = OpenRouterPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
         #if DEBUG
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_MODE"] == "1" {
             return DashboardModel(
                 quotaService: DemoQuotaProvider(),
-                additionalQuotaServices: [DemoClaudeQuotaProvider(), DemoGrokQuotaProvider()],
+                additionalQuotaServices: [
+                    DemoClaudeQuotaProvider(),
+                    DemoGrokQuotaProvider(),
+                    DemoAntigravityQuotaProvider(),
+                ],
                 activityService: DemoActivityProvider(),
                 cache: nil)
         }
         #endif
+        let memoryDatabaseURL = self.memoryTelemetryController.paths.databaseURL
         let localActivity = ActivityService(
-            memoryDatabaseURL: self.memoryTelemetryController.paths.databaseURL,
-            anthropicPricingCatalog: self.anthropicPricingCatalog)
+            memoryDatabaseURLProvider: { [weak settings = self.settings] in
+                await MainActor.run {
+                    settings?.monitorsCodexMemory == true ? memoryDatabaseURL : nil
+                }
+            },
+            openAIPricingCatalog: self.openAIPricingCatalog,
+            anthropicPricingCatalog: self.anthropicPricingCatalog,
+            openRouterPricingCatalog: self.openRouterPricingCatalog)
         let synchronizedActivity = SynchronizedActivityService(
             local: localActivity,
             configuration: { [weak activitySyncController = self.activitySyncController] in
@@ -29,9 +42,14 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             })
         return DashboardModel(
             quotaService: CodexQuotaService(),
-            additionalQuotaServices: [ClaudeQuotaService(), GrokQuotaService()],
+            additionalQuotaServices: [
+                ClaudeQuotaService(),
+                GrokQuotaService(),
+                AntigravityQuotaService(),
+            ],
             activityService: synchronizedActivity,
-            quotaCache: QuotaSnapshotCache())
+            quotaCache: QuotaSnapshotCache(),
+            weeklyQuotaUsageCache: WeeklyQuotaUsageCache())
     }()
     private let settings = TokenBarSettings.shared
     private let confettiOverlayController = ScreenConfettiOverlayController()
@@ -95,7 +113,9 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         #endif
-        self.memoryTelemetryController.start()
+        if self.settings.monitorsCodexMemory {
+            self.memoryTelemetryController.start()
+        }
         #if DEBUG
         let requestDetailService: any RequestDetailProviding = environment["TOKENBAR_DEMO_MODE"] == "1"
             ? DemoRequestDetailProvider()

@@ -1,17 +1,47 @@
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
 use serde_json::Value;
 
+use crate::incremental::PROTOCOL_V2;
 use crate::protocol::DownloadResponse;
 
-const PLATFORMS: [&str; 3] = ["codex", "claude", "grok"];
+const PLATFORMS: [&str; 4] = ["codex", "claude", "grok", "antigravity"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlatformWeeklyResets {
     pub codex: Option<i64>,
     pub claude: Option<i64>,
     pub grok: Option<i64>,
+    pub antigravity: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetMetadataResponse {
+    pub protocol_version: u32,
+    pub resets: BTreeMap<String, i64>,
 }
 
 impl PlatformWeeklyResets {
+    pub fn from_metadata(response: &ResetMetadataResponse, now_ms: i64) -> Self {
+        if response.protocol_version != PROTOCOL_V2 || now_ms <= 0 {
+            return Self::default();
+        }
+        let mut result = Self::default();
+        for platform in PLATFORMS {
+            result.set(
+                platform,
+                response
+                    .resets
+                    .get(platform)
+                    .copied()
+                    .filter(|value| *value > 0 && *value <= now_ms),
+            );
+        }
+        result
+    }
+
     pub fn from_download(response: &DownloadResponse, now_ms: i64) -> Self {
         if now_ms <= 0 {
             return Self::default();
@@ -41,7 +71,11 @@ impl PlatformWeeklyResets {
                     now_ms,
                 );
             }
-            if resets.codex.is_some() && resets.claude.is_some() && resets.grok.is_some() {
+            if resets.codex.is_some()
+                && resets.claude.is_some()
+                && resets.grok.is_some()
+                && resets.antigravity.is_some()
+            {
                 break;
             }
         }
@@ -63,6 +97,7 @@ impl PlatformWeeklyResets {
             "codex" => self.codex,
             "claude" => self.claude,
             "grok" => self.grok,
+            "antigravity" => self.antigravity,
             _ => None,
         }
     }
@@ -72,6 +107,7 @@ impl PlatformWeeklyResets {
             "codex" => self.codex = value,
             "claude" => self.claude = value,
             "grok" => self.grok = value,
+            "antigravity" => self.antigravity = value,
             _ => {}
         }
     }

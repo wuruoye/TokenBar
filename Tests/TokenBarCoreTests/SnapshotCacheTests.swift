@@ -23,7 +23,9 @@ struct SnapshotCacheTests {
             costUsd: 2.5,
             requestCount: 8,
             sessionCount: 3,
-            averageGenerationTokensPerSecond: 25)
+            averageGenerationTokensPerSecond: 25,
+            averageTimeToFirstTokenMs: 1_250,
+            firstTokenSampleCount: 8)
         let nestedRequest = RequestSummary(
             id: "child-request",
             sessionId: "session-1",
@@ -36,6 +38,7 @@ struct SnapshotCacheTests {
             endedAtMs: 1_720_000_000_900,
             durationMs: 800,
             modelDurationMs: 600,
+            timeToFirstTokenMs: 700,
             tokens: .zero,
             costUsd: 0.05,
             costSource: .estimated,
@@ -67,6 +70,7 @@ struct SnapshotCacheTests {
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.physicalSessionId == "child-session")
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.serviceTier == .fast)
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.modelDurationMs == 600)
+        #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.timeToFirstTokenMs == 700)
         #expect(loaded?.sessions.first?.title == nil)
         #expect(!raw.contains("prompt secret"))
         #expect(!raw.contains("output secret"))
@@ -105,6 +109,38 @@ struct SnapshotCacheTests {
         #expect(loaded[.codex] == codex)
         #expect(loaded[.claude] == claude)
         #expect(loaded[.claude]?.origin == .claudeDesktop)
+        #expect(permissions == 0o600)
+    }
+
+    @Test("persists weekly quota usage ledgers")
+    func persistsWeeklyQuotaUsage() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBarWeeklyUsageTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("weekly-usage.json")
+        let cache = WeeklyQuotaUsageCache(fileURL: fileURL)
+        let windowStart = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = windowStart.addingTimeInterval(7 * 86_400)
+        func snapshot(usedPercent: Double, offset: TimeInterval) -> QuotaSnapshot {
+            QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: usedPercent,
+                    windowMinutes: 10_080,
+                    resetsAt: reset),
+                resetCredits: nil,
+                updatedAt: windowStart.addingTimeInterval(offset))
+        }
+        let history = try #require(WeeklyQuotaUsageHistory.starting(
+            with: snapshot(usedPercent: 25, offset: 2 * 86_400)))
+            .recording(snapshot(usedPercent: 31, offset: 2 * 86_400 + 300))
+
+        try await cache.saveWeeklyQuotaUsage([.codex: history])
+        let loaded = try await cache.loadWeeklyQuotaUsage()
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+
+        #expect(loaded[.codex] == history)
         #expect(permissions == 0o600)
     }
 }

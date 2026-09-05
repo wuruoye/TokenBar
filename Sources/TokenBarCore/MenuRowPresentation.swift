@@ -48,7 +48,7 @@ public extension TokenBreakdown {
     }
 
     private var compactMenuDetail: String {
-        "\(self.total.tokscaleCount) total · Cache \(self.cachePercentageText)"
+        "\(self.total.tokscaleCount) · \(self.cachePercentageText)"
     }
 }
 
@@ -61,8 +61,16 @@ public extension RequestSummary {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
 
+    var menuTTFTText: String? {
+        self.timeToFirstTokenMs.map(Double.init)?.menuTTFTText
+    }
+
+    var menuPerformanceText: String? {
+        joinedPerformanceText([self.menuTTFTText, self.menuAverageTPSText])
+    }
+
     var menuDetail: String {
-        [self.tokens.requestMenuDetail, self.menuAverageTPSText]
+        [self.tokens.requestMenuDetail, self.menuPerformanceText]
             .compactMap(\.self)
             .joined(separator: " · ")
     }
@@ -120,6 +128,17 @@ public extension RequestSummary {
 }
 
 public extension SessionSummary {
+    var menuDisplayTitle: String {
+        let title = self.menuTitle
+        guard self.isSynchronizedRemote,
+              let deviceName = self.workspaceLabel?.compactMenuText,
+              deviceName != title
+        else {
+            return title
+        }
+        return "\(deviceName) · \(title)"
+    }
+
     var averageGenerationTokensPerSecond: Double? {
         weightedAverageGenerationTokensPerSecond(
             for: self.requests.flatMap(\.physicalRequests))
@@ -129,8 +148,20 @@ public extension SessionSummary {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
 
+    var averageTimeToFirstTokenMs: Double? {
+        averageTimeToFirstToken(for: self.requests)
+    }
+
+    var menuAverageTTFTText: String? {
+        self.averageTimeToFirstTokenMs?.menuTTFTText
+    }
+
+    var menuPerformanceText: String? {
+        joinedPerformanceText([self.menuAverageTTFTText, self.menuAverageTPSText])
+    }
+
     var menuDetail: String {
-        [self.tokens.sessionMenuDetail, self.menuAverageTPSText]
+        [self.tokens.sessionMenuDetail, self.menuPerformanceText]
             .compactMap(\.self)
             .joined(separator: " · ")
     }
@@ -165,12 +196,59 @@ public extension ActivitySnapshot {
     var menuAverageTPSText: String? {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
+
+    var averageTimeToFirstTokenMs: Double? {
+        self.today.averageTimeToFirstTokenMs
+            ?? averageTimeToFirstToken(
+                for: self.sessions.flatMap(\.requests))
+    }
+
+    var menuAverageTTFTText: String? {
+        self.averageTimeToFirstTokenMs?.menuTTFTText
+    }
+
+    var menuPerformanceText: String? {
+        joinedPerformanceText([self.menuAverageTTFTText, self.menuAverageTPSText])
+    }
 }
 
 public extension ActivityTotals {
     var menuAverageTPSText: String? {
         self.averageGenerationTokensPerSecond?.menuAverageTPSText
     }
+
+    var menuAverageTTFTText: String? {
+        self.averageTimeToFirstTokenMs?.menuTTFTText
+    }
+
+    var menuPerformanceText: String? {
+        joinedPerformanceText([self.menuAverageTTFTText, self.menuAverageTPSText])
+    }
+}
+
+public extension DailySummary {
+    var menuAverageTPSText: String? {
+        self.averageGenerationTokensPerSecond?.menuAverageTPSText
+    }
+
+    var menuAverageTTFTText: String? {
+        self.averageTimeToFirstTokenMs?.menuTTFTText
+    }
+
+    var menuPerformanceText: String? {
+        joinedPerformanceText([self.menuAverageTTFTText, self.menuAverageTPSText])
+    }
+}
+
+private func averageTimeToFirstToken(for requests: [RequestSummary]) -> Double? {
+    let values = requests.compactMap(\.timeToFirstTokenMs).filter { $0 >= 0 }
+    guard !values.isEmpty else { return nil }
+    return values.reduce(0.0) { $0 + Double($1) } / Double(values.count)
+}
+
+private func joinedPerformanceText(_ values: [String?]) -> String? {
+    let text = values.compactMap(\.self).joined(separator: " · ")
+    return text.isEmpty ? nil : text
 }
 
 private func weightedAverageGenerationTokensPerSecond(
@@ -211,6 +289,23 @@ private extension ActivityServiceTier {
 }
 
 private extension Double {
+    var menuTTFTText: String? {
+        guard self.isFinite, self >= 0 else { return nil }
+        let duration: String
+        if self < 1_000 {
+            duration = String(
+                format: "%.0fms",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self)
+        } else {
+            duration = String(
+                format: "%.1fs",
+                locale: Locale(identifier: "en_US_POSIX"),
+                self / 1_000)
+        }
+        return duration
+    }
+
     var menuAverageTPSText: String? {
         guard self.isFinite, self >= 0 else { return nil }
         let value: String
@@ -240,7 +335,7 @@ private extension Double {
                 locale: Locale(identifier: "en_US_POSIX"),
                 self)
         }
-        return "Avg \(value) tok/s"
+        return "\(value) tok/s"
     }
 }
 

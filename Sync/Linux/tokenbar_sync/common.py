@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import unicodedata
@@ -11,6 +12,8 @@ from . import PROTOCOL_VERSION
 
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+PROTOCOL_V2 = 2
+MAX_PARTITIONS = 100_000
 MIN_INT64 = -(2**63)
 MAX_INT64 = 2**63 - 1
 OS_VALUES = {"macos", "windows", "linux"}
@@ -25,7 +28,6 @@ PRIVACY_NULL_FIELDS = {
     "promptPreview",
     "outputPreview",
     "sessionPath",
-    "title",
     "workspacePath",
     "workspaceLabel",
     "promptText",
@@ -100,6 +102,250 @@ def canonical_json(value: Any) -> str:
     )
 
 
+def _partition_key(kind: str, *identity: str) -> str:
+    material = "\0".join((kind, *identity)).encode("utf-8")
+    return f"{kind}:{hashlib.sha256(material).hexdigest()}"
+
+
+def snapshot_partitions(snapshot: Any) -> dict[str, Any]:
+    """Split a sanitized ActivitySnapshot into stable replacement partitions."""
+    clean = sanitize_snapshot(snapshot)
+    validate_activity_snapshot(clean)
+
+    root = {
+        key: value
+        for key, value in clean.items()
+        if key not in {"sessions", "days", "sources", "memoryUsage"}
+    }
+    sources = clean.get("sources")
+    source_summaries: list[dict[str, Any]] | None = None
+    if sources is not None:
+        source_summaries = []
+        for source in sources:
+            source_summaries.append(
+                {key: value for key, value in source.items() if key != "days"}
+            )
+
+    memory = clean.get("memoryUsage")
+    memory_summary = (
+        None
+        if memory is None
+        else {key: value for key, value in memory.items() if key != "days"}
+    )
+    partitions: dict[str, Any] = {
+        "summary": {
+            "snapshot": root,
+            "sources": source_summaries,
+            "memoryUsage": memory_summary,
+        }
+    }
+
+    for day in clean.get("days", []):
+        key = _partition_key("day", day["date"])
+        if key in partitions:
+            raise ValidationError("snapshot days contain a duplicate partition")
+        partitions[key] = day
+    for source in sources or []:
+        for day in source["days"]:
+            key = _partition_key("source-day", source["platform"], day["date"])
+            if key in partitions:
+                raise ValidationError("snapshot source days contain a duplicate partition")
+            partitions[key] = {"platform": source["platform"], "day": day}
+    for session in clean.get("sessions", []):
+        platform = session.get("platform") or ""
+        key = _partition_key("session", platform, session["id"])
+        if key in partitions:
+            raise ValidationError("snapshot sessions contain a duplicate identity")
+        partitions[key] = session
+    for day in (memory or {}).get("days", []):
+        key = _partition_key("memory-day", day["date"])
+        if key in partitions:
+            raise ValidationError("snapshot memory days contain a duplicate partition")
+        partitions[key] = day
+
+    if len(partitions) > MAX_PARTITIONS:
+        raise ValidationError("snapshot contains too many incremental partitions")
+    return partitions
+
+
+def partition_manifest(partitions: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(partitions, dict) or len(partitions) > MAX_PARTITIONS:
+        raise ValidationError("incremental partitions are invalid")
+    return {
+        key: hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+        for key, value in partitions.items()
+    }
+
+
+def validate_partition_manifest(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > MAX_PARTITIONS:
+        raise ValidationError("incremental manifest must be an object")
+    manifest: dict[str, str] = {}
+    for key, digest in value.items():
+        if not isinstance(key, str) or not key or len(key) > 256:
+            raise ValidationError("incremental manifest contains an invalid key")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValidationError("incremental manifest contains an invalid SHA-256 value")
+        manifest[key] = digest
+    return manifest
+
+
+def incremental_delta(
+    current: dict[str, Any],
+    previous_manifest: Any,
+) -> tuple[dict[str, Any], list[str], dict[str, str]]:
+    manifest = validate_partition_manifest(previous_manifest)
+    current_manifest = partition_manifest(current)
+    upserts = {
+        key: value
+        for key, value in current.items()
+        if manifest.get(key) != current_manifest[key]
+    }
+    deletes = sorted(set(manifest) - set(current_manifest))
+    return upserts, deletes, current_manifest
+
+
+def materialize_snapshot(partitions: Any) -> dict[str, Any]:
+    """Rebuild and deeply validate a full ActivitySnapshot from partitions."""
+    if not isinstance(partitions, dict) or not 1 <= len(partitions) <= MAX_PARTITIONS:
+        raise ValidationError("incremental partitions must be a non-empty object")
+    summary = partitions.get("summary")
+    if not isinstance(summary, dict) or set(summary) != {
+        "snapshot",
+        "sources",
+        "memoryUsage",
+    }:
+        raise ValidationError("incremental summary partition is invalid")
+    root = summary["snapshot"]
+    if not isinstance(root, dict):
+        raise ValidationError("incremental summary snapshot must be an object")
+    if any(key in root for key in ("sessions", "days", "sources", "memoryUsage")):
+        raise ValidationError("incremental summary contains partitioned fields")
+
+    source_summaries = summary["sources"]
+    if source_summaries is not None and not isinstance(source_summaries, list):
+        raise ValidationError("incremental source summaries must be an array or null")
+    memory_summary = summary["memoryUsage"]
+    if memory_summary is not None and not isinstance(memory_summary, dict):
+        raise ValidationError("incremental memory summary must be an object or null")
+
+    days: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+    source_days: dict[str, list[dict[str, Any]]] = {}
+    memory_days: list[dict[str, Any]] = []
+    for key, value in partitions.items():
+        if key == "summary":
+            continue
+        if key.startswith("day:"):
+            if not isinstance(value, dict) or key != _partition_key("day", value.get("date", "")):
+                raise ValidationError("incremental day partition identity is invalid")
+            days.append(value)
+        elif key.startswith("source-day:"):
+            if not isinstance(value, dict) or set(value) != {"platform", "day"}:
+                raise ValidationError("incremental source-day partition is invalid")
+            platform = value["platform"]
+            day = value["day"]
+            if not isinstance(platform, str) or not isinstance(day, dict):
+                raise ValidationError("incremental source-day partition is invalid")
+            if key != _partition_key("source-day", platform, day.get("date", "")):
+                raise ValidationError("incremental source-day identity is invalid")
+            source_days.setdefault(platform, []).append(day)
+        elif key.startswith("session:"):
+            if not isinstance(value, dict):
+                raise ValidationError("incremental session partition is invalid")
+            platform = value.get("platform") or ""
+            if key != _partition_key("session", platform, value.get("id", "")):
+                raise ValidationError("incremental session identity is invalid")
+            sessions.append(value)
+        elif key.startswith("memory-day:"):
+            if not isinstance(value, dict) or key != _partition_key(
+                "memory-day", value.get("date", "")
+            ):
+                raise ValidationError("incremental memory-day identity is invalid")
+            memory_days.append(value)
+        else:
+            raise ValidationError("incremental partition kind is unsupported")
+
+    snapshot = dict(root)
+    snapshot["days"] = sorted(days, key=lambda item: item["date"], reverse=True)
+    snapshot["sessions"] = sorted(
+        sessions,
+        key=lambda item: (
+            item.get("endedAtMs", 0),
+            item.get("startedAtMs", 0),
+            item.get("platform") or "",
+            item.get("id") or "",
+        ),
+        reverse=True,
+    )
+    if source_summaries is not None:
+        rebuilt_sources: list[dict[str, Any]] = []
+        source_platforms: set[str] = set()
+        for source_summary in source_summaries:
+            if not isinstance(source_summary, dict) or "days" in source_summary:
+                raise ValidationError("incremental source summary is invalid")
+            platform = source_summary.get("platform")
+            if not isinstance(platform, str) or not platform or platform in source_platforms:
+                raise ValidationError("incremental source summary platform is invalid")
+            source_platforms.add(platform)
+            source = dict(source_summary)
+            source["days"] = sorted(
+                source_days.pop(platform, []),
+                key=lambda item: item["date"],
+                reverse=True,
+            )
+            rebuilt_sources.append(source)
+        if source_days:
+            raise ValidationError("incremental source-day has no source summary")
+        snapshot["sources"] = sorted(
+            rebuilt_sources, key=lambda item: item["platform"]
+        )
+    elif source_days:
+        raise ValidationError("incremental source-day has no source summary")
+
+    if memory_summary is not None:
+        memory = dict(memory_summary)
+        memory["days"] = sorted(
+            memory_days, key=lambda item: item["date"], reverse=True
+        )
+        snapshot["memoryUsage"] = memory
+    elif memory_days:
+        raise ValidationError("incremental memory-day has no memory summary")
+
+    clean = sanitize_snapshot(snapshot)
+    validate_activity_snapshot(clean)
+    return clean
+
+
+def apply_partition_delta(
+    snapshot: Any,
+    upserts: Any,
+    deletes: Any,
+) -> dict[str, Any]:
+    if not isinstance(upserts, dict) or len(upserts) > MAX_PARTITIONS:
+        raise ValidationError("incremental upserts must be an object")
+    if not isinstance(deletes, list) or len(deletes) > MAX_PARTITIONS:
+        raise ValidationError("incremental deletes must be an array")
+    if any(not isinstance(key, str) or not key or len(key) > 256 for key in upserts):
+        raise ValidationError("incremental upserts contain an invalid key")
+    if any(not isinstance(key, str) or not key or len(key) > 256 for key in deletes):
+        raise ValidationError("incremental deletes contain an invalid key")
+    if len(set(deletes)) != len(deletes) or set(upserts).intersection(deletes):
+        raise ValidationError("incremental changes contain duplicate keys")
+    clean_upserts = sanitize_snapshot(upserts)
+    if clean_upserts != upserts:
+        raise ValidationError("incremental upserts are not privacy-sanitized")
+    partitions = snapshot_partitions(snapshot)
+    for key in deletes:
+        partitions.pop(key, None)
+    partitions.update(clean_upserts)
+    return materialize_snapshot(partitions)
+
+
 def _normalized_key(key: str) -> str:
     return re.sub(r"[^a-z0-9]", "", key.casefold())
 
@@ -110,6 +356,22 @@ def _looks_like_absolute_local_path(value: str) -> bool:
         or value.startswith("\\\\")
         or re.match(r"^[A-Za-z]:[\\/]", value) is not None
         or value.casefold().startswith("file://")
+    )
+
+
+def _is_activity_session(value: dict[str, Any]) -> bool:
+    return all(
+        key in value
+        for key in ("id", "startedAtMs", "endedAtMs", "tokens", "models", "requests")
+    )
+
+
+def _valid_session_title(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= 512
+        and not any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
     )
 
 
@@ -125,12 +387,15 @@ def sanitize_snapshot(value: Any, *, _depth: int = 0) -> Any:
         raise ValidationError("snapshot nesting exceeds 100 levels")
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
+        is_session = _is_activity_session(value)
         for key, child in value.items():
             if not isinstance(key, str):
                 raise ValidationError("snapshot object keys must be strings")
             if _normalized_key(key) in CREDENTIAL_KEYS:
                 continue
-            if key in PRIVACY_NULL_FIELDS:
+            if key == "title" and is_session:
+                clean[key] = child if _valid_session_title(child) else None
+            elif key == "title" or key in PRIVACY_NULL_FIELDS:
                 clean[key] = None
             else:
                 clean[key] = sanitize_snapshot(child, _depth=_depth + 1)
@@ -220,6 +485,14 @@ def _validate_totals(value: Any, label: str) -> None:
     speed = totals.get("averageGenerationTokensPerSecond")
     if speed is not None:
         _require_nonnegative_number(speed, f"{label}.averageGenerationTokensPerSecond")
+    first_token = totals.get("averageTimeToFirstTokenMs")
+    sample_count = totals.get("firstTokenSampleCount")
+    if first_token is not None:
+        _require_nonnegative_number(first_token, f"{label}.averageTimeToFirstTokenMs")
+    if sample_count is not None:
+        _require_nonnegative_int(sample_count, f"{label}.firstTokenSampleCount")
+    if (first_token is None) != (sample_count in (None, 0)):
+        raise ValidationError(f"{label} has inconsistent first-token metrics")
 
 
 def _validate_range(value: Any, label: str, *, generated_at_ms: int) -> None:
@@ -252,6 +525,14 @@ def _validate_day(value: Any, label: str) -> str:
     _require_nonnegative_number(day.get("costUsd"), f"{label}.costUsd")
     _require_nonnegative_int(day.get("requestCount"), f"{label}.requestCount")
     _require_nonnegative_int(day.get("sessionCount"), f"{label}.sessionCount")
+    first_token = day.get("averageTimeToFirstTokenMs")
+    sample_count = day.get("firstTokenSampleCount")
+    if first_token is not None:
+        _require_nonnegative_number(first_token, f"{label}.averageTimeToFirstTokenMs")
+    if sample_count is not None:
+        _require_nonnegative_int(sample_count, f"{label}.firstTokenSampleCount")
+    if (first_token is None) != (sample_count in (None, 0)):
+        raise ValidationError(f"{label} has inconsistent first-token metrics")
     models = _require_array(day.get("models", []), f"{label}.models")
     for index, model in enumerate(models):
         _validate_daily_model(model, f"{label}.models[{index}]")
@@ -275,7 +556,7 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
     ended = _require_int64(request.get("endedAtMs"), f"{label}.endedAtMs", positive=True)
     if ended < started:
         raise ValidationError(f"{label}.endedAtMs must not precede startedAtMs")
-    for key in ("durationMs", "modelDurationMs"):
+    for key in ("durationMs", "modelDurationMs", "timeToFirstTokenMs"):
         duration = request.get(key)
         if duration is not None:
             _require_nonnegative_int(duration, f"{label}.{key}")
@@ -298,6 +579,9 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
 def _validate_session(value: Any, label: str) -> None:
     session = _require_object(value, label)
     _require_string(session.get("id"), f"{label}.id")
+    title = session.get("title")
+    if title is not None and not _valid_session_title(title):
+        raise ValidationError(f"{label}.title must be a valid session name")
     started = _require_int64(session.get("startedAtMs"), f"{label}.startedAtMs", positive=True)
     ended = _require_int64(session.get("endedAtMs"), f"{label}.endedAtMs", positive=True)
     if ended < started:
@@ -352,9 +636,13 @@ def _validate_memory_usage(value: Any, label: str) -> None:
         totals = _require_object(memory.get(totals_key), f"{label}.{totals_key}")
         _validate_memory_phase(totals.get("phase1"), f"{label}.{totals_key}.phase1")
         _validate_memory_phase(totals.get("phase2"), f"{label}.{totals_key}.phase2")
+    dates: set[str] = set()
     for index, day_value in enumerate(_require_array(memory.get("days"), f"{label}.days")):
         day = _require_object(day_value, f"{label}.days[{index}]")
-        _require_string(day.get("date"), f"{label}.days[{index}].date")
+        date = _require_string(day.get("date"), f"{label}.days[{index}].date")
+        if date in dates:
+            raise ValidationError(f"{label}.days contains a duplicate date")
+        dates.add(date)
         _validate_memory_phase(day.get("phase1"), f"{label}.days[{index}].phase1")
         _validate_memory_phase(day.get("phase2"), f"{label}.days[{index}].phase2")
 
@@ -373,8 +661,13 @@ def validate_activity_snapshot(snapshot: Any) -> dict[str, Any]:
             "snapshot.weeklySinceReset",
             generated_at_ms=generated_at_ms,
         )
+    session_identities: set[tuple[str, str]] = set()
     for index, session in enumerate(_require_array(value.get("sessions"), "snapshot.sessions")):
         _validate_session(session, f"snapshot.sessions[{index}]")
+        identity = (session.get("platform") or "", session["id"])
+        if identity in session_identities:
+            raise ValidationError("snapshot.sessions contains a duplicate identity")
+        session_identities.add(identity)
     dates: set[str] = set()
     for index, day in enumerate(_require_array(value.get("days"), "snapshot.days")):
         date = _validate_day(day, f"snapshot.days[{index}]")
@@ -398,7 +691,7 @@ def validate_activity_snapshot(snapshot: Any) -> dict[str, Any]:
     return value
 
 
-def _validate_device(device: Any) -> dict[str, Any]:
+def validate_device(device: Any) -> dict[str, Any]:
     if not isinstance(device, dict):
         raise ValidationError("device must be an object")
     required = {"id", "name", "os"}
@@ -455,7 +748,7 @@ def validate_envelope(
     ):
         raise ValidationError("protocolVersion must be 1")
 
-    device = _validate_device(envelope["device"])
+    device = validate_device(envelope["device"])
     if path_device_id is not None and device["id"] != path_device_id:
         raise ValidationError("device.id must match the path deviceId")
 

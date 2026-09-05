@@ -31,11 +31,10 @@ Before network serialization, recursively set these fields to JSON `null` wherev
 - `promptPreview`
 - `outputPreview`
 - `sessionPath`
-- session `title`
 - `workspacePath`
 - `workspaceLabel`
 
-Never transmit credentials or raw session files. During a rolling protocol-v1 upgrade, the server accepts a legacy non-null `workspaceLabel` only to replace it with `null` before validation and storage; other unredacted content remains invalid. The request body limit is 16 MiB.
+Session `title` is retained so a downloaded session can be identified, but only on a structurally valid session record and only when it is a non-empty display string of at most 512 UTF-8 bytes without ASCII control characters. All other `title` fields are set to `null`. Never transmit credentials or raw session files. During a rolling protocol-v1 upgrade, the server accepts a legacy non-null `workspaceLabel` only to replace it with `null` before validation and storage; other unredacted content remains invalid. The request body limit is 16 MiB.
 
 Credential-bearing properties are omitted, known content/path properties are `null`, and unknown absolute POSIX, Windows, UNC, or `file://` paths are also `null`. The server validates protocol version, the device/path ID match, canonical lowercase UUID, OS enum, device/client-version display bounds, positive timestamps, signed 64-bit and nonnegative aggregate ranges, and the complete ActivitySnapshot structure required by the Mac decoder. It rejects a `generatedAtMs` more than five minutes ahead of server time. `PUT` is an idempotent latest-snapshot upsert. An older `generatedAtMs` for the same device returns HTTP 409; an exact retry with identical device/snapshot content succeeds without changing `receivedAtMs`; conflicting content at the same timestamp returns 409.
 
@@ -68,7 +67,7 @@ Authorization: Bearer <shared token>
 
 The server returns one latest row per device in stable device-ID order. The client validates positive timestamps and unique device IDs, normalizes the order, and applies the same recursive sanitization again before saving downloaded JSON.
 
-Before collection, the headless client also uses this GET response as reset metadata. It sorts valid rows by descending `receivedAtMs` and, for each of `codex`, `claude`, and `grok`, selects the newest positive `sources[].weeklySinceReset.startedAtMs` that is no more than eight days old and no later than its snapshot's `generatedAtMs`. Top-level `weeklySinceReset.startedAtMs` is accepted only as a legacy Codex fallback. The values map to `--weekly-reset-ms`, `--claude-weekly-reset-ms`, and `--grok-weekly-reset-ms` respectively. A failed GET or missing/stale reset value never blocks Today/30-day collection and upload.
+Before collection, the headless client also uses this GET response as reset metadata. It sorts valid rows by descending `receivedAtMs` and, for each of `codex`, `claude`, `grok`, and `antigravity`, selects the newest positive `sources[].weeklySinceReset.startedAtMs` that is no more than eight days old and no later than its snapshot's `generatedAtMs`. Top-level `weeklySinceReset.startedAtMs` is accepted only as a legacy Codex fallback. The values map to `--weekly-reset-ms`, `--claude-weekly-reset-ms`, `--grok-weekly-reset-ms`, and `--antigravity-weekly-reset-ms` respectively. A failed GET or missing/stale reset value never blocks Today/30-day collection and upload.
 
 The health endpoint is unauthenticated. Every client uses a 32–512 character non-whitespace ASCII bearer token. The server can accept one plaintext token for local testing or a comma-separated set of SHA-256 token hashes so each deployed device can generate and retain its own secret. Non-loopback client endpoints require HTTPS; HTTP is accepted only for loopback development/deployment. The client rejects all redirects, bypasses ambient forward proxies, and removes `TOKENBAR_SYNC_TOKEN` from the helper child process environment. No client or server component may log an access token or snapshot payload. Mac bounds the streamed response before buffering more than 64 MiB; Windows and Linux also enforce the 64 MiB download limit while reading.
 

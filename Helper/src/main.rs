@@ -6,21 +6,26 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{Days, Utc};
-use serde::Deserialize;
+use chrono::{Days, NaiveDate, Utc};
 use tokenbar_helper::claude::{
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
+};
+use tokenbar_helper::antigravity::{
+    extract_request_detail as extract_antigravity_request_detail,
+    load_antigravity_session_titles, parse_local_antigravity_messages,
+    LocalParseOptions as AntigravityParseOptions,
 };
 use tokenbar_helper::codex::{parse_local_codex_messages, LocalParseOptions};
 use tokenbar_helper::grok::{
     extract_request_detail as extract_grok_request_detail, load_grok_session_titles,
     parse_local_grok_messages, LocalParseOptions as GrokParseOptions,
 };
-use tokenbar_helper::memory::{
-    load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT,
+use serde::Deserialize;
+use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
+use tokenbar_helper::pricing::{
+    AnthropicPricing, CodexPricing, FastPricingBasis, GooglePricing,
 };
-use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
@@ -28,35 +33,41 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--anthropic-pricing-markdown PATH] [--memory-database PATH] [--openrouter-pricing-json PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
     days: usize,
+    end_date: Option<NaiveDate>,
     home_dir: Option<PathBuf>,
     statistics_time_zone: StatisticsTimeZone,
     weekly_reset_ms: Option<i64>,
     claude_weekly_reset_ms: Option<i64>,
     grok_weekly_reset_ms: Option<i64>,
+    antigravity_weekly_reset_ms: Option<i64>,
+    openai_pricing_markdown: Option<PathBuf>,
     anthropic_pricing_markdown: Option<PathBuf>,
+    openrouter_pricing_json: Option<PathBuf>,
     memory_database: Option<PathBuf>,
     offline_pricing: bool,
-    openrouter_pricing_json: Option<PathBuf>,
 }
 
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             days: DEFAULT_DAYS,
+            end_date: None,
             home_dir: None,
             statistics_time_zone: StatisticsTimeZone::default(),
             weekly_reset_ms: None,
             claude_weekly_reset_ms: None,
             grok_weekly_reset_ms: None,
+            antigravity_weekly_reset_ms: None,
+            openai_pricing_markdown: None,
             anthropic_pricing_markdown: None,
+            openrouter_pricing_json: None,
             memory_database: None,
             offline_pricing: false,
-            openrouter_pricing_json: None,
         }
     }
 }
@@ -86,17 +97,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Snapshot(config) => run_snapshot(config),
         Command::RequestDetail(config) => {
             let detail = match config.platform.as_str() {
-                "codex" => extract_codex_request_detail(
-                    &config.session_path,
-                    config.start_ms,
-                    config.end_ms,
-                ),
-                "claude" => extract_claude_request_detail(
-                    &config.session_path,
-                    config.start_ms,
-                    config.end_ms,
-                ),
+                "codex" => {
+                    extract_codex_request_detail(
+                        &config.session_path,
+                        config.start_ms,
+                        config.end_ms,
+                    )
+                }
+                "claude" => {
+                    extract_claude_request_detail(
+                        &config.session_path,
+                        config.start_ms,
+                        config.end_ms,
+                    )
+                }
                 "grok" => extract_grok_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
+                "antigravity" => extract_antigravity_request_detail(
                     &config.session_path,
                     config.start_ms,
                     config.end_ms,
@@ -106,18 +126,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(io::Error::other)?;
             write_json(&detail)
         }
-        Command::MemoryReceiver(config) => run_receiver(config)
-            .map_err(io::Error::other)
-            .map_err(Into::into),
+        Command::MemoryReceiver(config) => run_receiver(config).map_err(io::Error::other).map_err(Into::into),
     }
 }
 
 fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     let generated_at_ms = Utc::now().timestamp_millis();
-    let today = config
+    let current_day = config
         .statistics_time_zone
         .date_at_ms(generated_at_ms)
         .ok_or("the current time is outside the supported range")?;
+    let today = config.end_date.unwrap_or(current_day);
+    if today > current_day {
+        return Err("end date must not be in the future".into());
+    }
     let first_day = today
         .checked_sub_days(Days::new((config.days - 1) as u64))
         .ok_or("day range is too large")?;
@@ -125,11 +147,12 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         config.weekly_reset_ms,
         config.claude_weekly_reset_ms,
         config.grok_weekly_reset_ms,
+        config.antigravity_weekly_reset_ms,
     ]
-    .into_iter()
-    .flatten()
-    .filter_map(|timestamp| config.statistics_time_zone.date_at_ms(timestamp))
-    .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
+        .into_iter()
+        .flatten()
+        .filter_map(|timestamp| config.statistics_time_zone.date_at_ms(timestamp))
+        .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
     // Parsers perform an inexpensive date prefilter before returning timestamped
     // rows. Scan one boundary day on either side, then recompute every row's date
     // below so UTC and local mode stay correct even on Windows where TZ is ignored.
@@ -149,35 +172,16 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let use_env_roots = home_dir.is_none();
 
-    let catalog_load = if let Some(path) = &config.openrouter_pricing_json {
-        let bytes = std::fs::read(path)?;
-        let catalog =
-            tokenbar_helper::openrouter::Catalog::from_json(&bytes).map_err(io::Error::other)?;
-        let status = tokenbar_helper::openrouter::CatalogStatus {
-            source: "openrouter".into(),
-            updated_at_ms: None,
-            model_count: catalog.model_count(),
-            status: "file".into(),
-        };
-        tokenbar_helper::openrouter::CatalogLoad {
-            catalog: Some(catalog),
-            status,
-        }
-    } else if let Some(dir) = tokenbar_helper::openrouter::default_cache_dir() {
-        tokenbar_helper::openrouter::refresh(&dir, config.offline_pricing)
-    } else {
-        tokenbar_helper::openrouter::CatalogLoad {
-            catalog: None,
-            status: tokenbar_helper::openrouter::CatalogStatus {
-                source: "bundled".into(),
-                updated_at_ms: None,
-                model_count: 0,
-                status: "cache-unavailable".into(),
-            },
-        }
-    };
+    let catalog_load = load_openrouter_pricing(&config);
     let catalog = catalog_load.catalog.map(Arc::new);
-    let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config))
+    let fast_pricing_basis = codex_fast_pricing_basis(&config);
+    let pricing = config
+        .openai_pricing_markdown
+        .as_deref()
+        .and_then(|path| {
+            CodexPricing::from_official_markdown_file(path, fast_pricing_basis).ok()
+        })
+        .unwrap_or_else(|| CodexPricing::with_fast_pricing(fast_pricing_basis))
         .with_openrouter_catalog(catalog.clone());
     let mut codex_messages = parse_local_codex_messages(
         LocalParseOptions {
@@ -218,6 +222,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_claude_session_titles(&claude_messages));
+    let antigravity_home_dir = home_dir.clone();
     let grok_messages = parse_local_grok_messages(GrokParseOptions {
         home_dir,
         use_env_roots,
@@ -226,9 +231,28 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     })
     .map_err(io::Error::other)?;
     session_titles.extend(load_grok_session_titles(&grok_messages));
+    let antigravity_options = AntigravityParseOptions {
+        home_dir: antigravity_home_dir,
+        use_env_roots,
+        since: Some(parse_first_day.format("%Y-%m-%d").to_string()),
+        until: Some(parse_last_day.format("%Y-%m-%d").to_string()),
+    };
+    let google_pricing = config
+        .openrouter_pricing_json
+        .as_deref()
+        .and_then(|path| GooglePricing::from_openrouter_catalog_file(path, today).ok())
+        .unwrap_or_else(|| GooglePricing::bundled_for_date(today));
+    let antigravity_messages = parse_local_antigravity_messages(
+        antigravity_options.clone(),
+        &anthropic_pricing,
+        &google_pricing,
+    )
+    .map_err(io::Error::other)?;
+    session_titles.extend(load_antigravity_session_titles(&antigravity_options));
     let mut messages = codex_messages;
     messages.extend(claude_messages);
     messages.extend(grok_messages);
+    messages.extend(antigravity_messages);
     config
         .statistics_time_zone
         .normalize_message_dates(&mut messages);
@@ -244,6 +268,9 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     if let Some(timestamp) = config.grok_weekly_reset_ms {
         weekly_resets.insert("grok".to_string(), timestamp);
     }
+    if let Some(timestamp) = config.antigravity_weekly_reset_ms {
+        weekly_resets.insert("antigravity".to_string(), timestamp);
+    }
     let mut snapshot = build_snapshot_with_platform_resets(
         messages,
         today,
@@ -255,13 +282,43 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     if let Some(database_path) = config.memory_database.as_deref() {
-        snapshot.memory_usage =
-            load_usage_snapshot(database_path, today, generated_at_ms, config.days)
-                .map_err(io::Error::other)?;
+        snapshot.memory_usage = load_usage_snapshot(
+            database_path,
+            today,
+            generated_at_ms,
+            config.days,
+        )
+        .map_err(io::Error::other)?;
     }
 
     snapshot.pricing_catalog = Some(catalog_load.status);
     write_json(&snapshot)
+}
+
+fn load_openrouter_pricing(config: &SnapshotConfig) -> tokenbar_helper::openrouter::CatalogLoad {
+    use tokenbar_helper::openrouter::{self, Catalog, CatalogLoad, CatalogStatus};
+    if let Some(path) = &config.openrouter_pricing_json {
+        // A supplied catalog may contain only Gemini models or be stale.
+        // Keep its fallback behavior without triggering a second download.
+        let catalog = std::fs::metadata(path).ok()
+            .filter(|meta| meta.len() <= 16 * 1024 * 1024)
+            .and_then(|_| std::fs::read(path).ok())
+            .and_then(|bytes| Catalog::from_json(&bytes).ok());
+        let status = CatalogStatus {
+            source: if catalog.is_some() { "openrouter" } else { "bundled" }.into(),
+            updated_at_ms: None,
+            model_count: catalog.as_ref().map_or(0, Catalog::model_count),
+            status: "file".into(),
+        };
+        return CatalogLoad { catalog, status };
+    }
+    if let Some(dir) = openrouter::default_cache_dir() {
+        return openrouter::refresh(&dir, config.offline_pricing);
+    }
+    CatalogLoad { catalog: None, status: CatalogStatus {
+        source: "bundled".into(), updated_at_ms: None, model_count: 0,
+        status: "cache-unavailable".into(),
+    }}
 }
 
 fn codex_session_index_path(config: &SnapshotConfig) -> Option<PathBuf> {
@@ -328,12 +385,6 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--offline-pricing") => config.offline_pricing = true,
-            Some("--openrouter-pricing-json") => {
-                config.openrouter_pricing_json = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("--openrouter-pricing-json requires a path")?,
-                ));
-            }
             Some("--days") => {
                 let value = args.next().ok_or("--days requires a value")?;
                 let value = value.to_str().ok_or("--days must be valid UTF-8")?;
@@ -343,6 +394,14 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                 if config.days == 0 {
                     return Err("--days must be a positive integer".to_string());
                 }
+            }
+            Some("--end-date") => {
+                let value = args.next().ok_or("--end-date requires a value")?;
+                let value = value.to_str().ok_or("--end-date must be valid UTF-8")?;
+                config.end_date = Some(
+                    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                        .map_err(|_| "--end-date must use YYYY-MM-DD")?,
+                );
             }
             Some("--home-dir") => {
                 let value = args.next().ok_or("--home-dir requires a path")?;
@@ -396,9 +455,34 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                         .map_err(|_| "--grok-weekly-reset-ms must be an integer")?,
                 );
             }
+            Some("--openrouter-pricing-json") => {
+                let value = args
+                    .next()
+                    .ok_or("--openrouter-pricing-json requires a path")?;
+                config.openrouter_pricing_json = Some(PathBuf::from(value));
+            }
+            Some("--antigravity-weekly-reset-ms") => {
+                let value = args
+                    .next()
+                    .ok_or("--antigravity-weekly-reset-ms requires a value")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--antigravity-weekly-reset-ms must be valid UTF-8")?;
+                config.antigravity_weekly_reset_ms = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| "--antigravity-weekly-reset-ms must be an integer")?,
+                );
+            }
             Some("--memory-database") => {
                 let value = args.next().ok_or("--memory-database requires a path")?;
                 config.memory_database = Some(PathBuf::from(value));
+            }
+            Some("--openai-pricing-markdown") => {
+                let value = args
+                    .next()
+                    .ok_or("--openai-pricing-markdown requires a path")?;
+                config.openai_pricing_markdown = Some(PathBuf::from(value));
             }
             Some("--anthropic-pricing-markdown") => {
                 let value = args
@@ -449,7 +533,9 @@ fn parse_memory_receiver_args(
             }
             Some("--parent-pid") => {
                 let value = args.next().ok_or("--parent-pid requires a value")?;
-                let value = value.to_str().ok_or("--parent-pid must be valid UTF-8")?;
+                let value = value
+                    .to_str()
+                    .ok_or("--parent-pid must be valid UTF-8")?;
                 parent_pid = Some(
                     value
                         .parse::<u32>()
@@ -486,8 +572,10 @@ fn parse_request_detail_args(
             Some("--platform") => {
                 let value = args.next().ok_or("--platform requires a value")?;
                 let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
-                if !matches!(value, "codex" | "claude" | "grok") {
-                    return Err("--platform must be codex, claude, or grok".to_string());
+                if !matches!(value, "codex" | "claude" | "grok" | "antigravity") {
+                    return Err(
+                        "--platform must be codex, claude, grok, or antigravity".to_string()
+                    );
                 }
                 platform = value.to_string();
             }
@@ -559,8 +647,14 @@ mod tests {
             OsString::from("1799000000000"),
             OsString::from("--grok-weekly-reset-ms"),
             OsString::from("1798000000000"),
+            OsString::from("--antigravity-weekly-reset-ms"),
+            OsString::from("1797000000000"),
+            OsString::from("--openai-pricing-markdown"),
+            OsString::from("/tmp/openai-pricing.md"),
             OsString::from("--anthropic-pricing-markdown"),
             OsString::from("/tmp/anthropic-pricing.md"),
+            OsString::from("--openrouter-pricing-json"),
+            OsString::from("/tmp/openrouter-models.json"),
         ])
         .unwrap();
 
@@ -568,15 +662,18 @@ mod tests {
             config,
             Command::Snapshot(SnapshotConfig {
                 days: 7,
+                end_date: None,
                 home_dir: Some(PathBuf::from("/tmp/home")),
                 statistics_time_zone: StatisticsTimeZone::Utc,
                 weekly_reset_ms: Some(1_800_000_000_000),
                 claude_weekly_reset_ms: Some(1_799_000_000_000),
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
+                antigravity_weekly_reset_ms: Some(1_797_000_000_000),
+                openai_pricing_markdown: Some(PathBuf::from("/tmp/openai-pricing.md")),
                 anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
+                openrouter_pricing_json: Some(PathBuf::from("/tmp/openrouter-models.json")),
                 memory_database: None,
                 offline_pricing: false,
-                openrouter_pricing_json: None,
             })
         );
     }
@@ -603,6 +700,34 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "--statistics-timezone must be utc or local");
+    }
+
+    #[test]
+    fn accepts_a_historical_snapshot_end_date() {
+        let command = parse_args([
+            OsString::from("--days"),
+            OsString::from("1"),
+            OsString::from("--end-date"),
+            OsString::from("2026-08-31"),
+        ])
+        .unwrap();
+
+        let Command::Snapshot(config) = command else {
+            panic!("expected snapshot command");
+        };
+        assert_eq!(config.days, 1);
+        assert_eq!(config.end_date, NaiveDate::from_ymd_opt(2026, 8, 31));
+    }
+
+    #[test]
+    fn rejects_an_invalid_snapshot_end_date() {
+        let error = parse_args([
+            OsString::from("--end-date"),
+            OsString::from("2026-02-30"),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error, "--end-date must use YYYY-MM-DD");
     }
 
     #[test]

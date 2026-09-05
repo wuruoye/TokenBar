@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -17,10 +18,15 @@ from typing import Any
 from . import PACKAGE_VERSION, PROTOCOL_VERSION
 from .common import (
     MAX_BODY_BYTES,
+    PROTOCOL_V2,
     ValidationError,
     canonical_json,
+    incremental_delta,
     json_loads_strict,
+    partition_manifest,
     sanitize_snapshot,
+    snapshot_partitions,
+    validate_partition_manifest,
     validate_activity_snapshot,
     validate_envelope,
 )
@@ -32,6 +38,10 @@ DEFAULT_STATE_DIR = "~/.local/state/tokenbar-sync"
 DEFAULT_HELPER = "tokenbar-helper"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_WEEKLY_RESET_AGE_MS = 8 * 24 * 60 * 60 * 1000
+FULL_CALIBRATION_INTERVAL_MS = 24 * 60 * 60 * 1000
+FULL_CALIBRATION_JITTER_MS = 60 * 60 * 1000
+DELTA_FULL_RATIO = 0.70
+INCREMENTAL_STATE_VERSION = 1
 WEEKLY_RESET_FLAGS = {
     "codex": "--weekly-reset-ms",
     "claude": "--claude-weekly-reset-ms",
@@ -338,6 +348,33 @@ def download_snapshots(base_url: str, token: str) -> dict[str, Any]:
     return value
 
 
+def download_reset_metadata(base_url: str, token: str) -> dict[str, Any]:
+    _status, value = _request_json(
+        "GET",
+        f"{_base_url(base_url)}/v2/reset-metadata",
+        token,
+    )
+    return value
+
+
+def extract_reset_metadata(response: Any) -> dict[str, int]:
+    if not isinstance(response, dict) or response.get("protocolVersion") != PROTOCOL_V2:
+        return {}
+    resets = response.get("resets")
+    if not isinstance(resets, dict):
+        return {}
+    result: dict[str, int] = {}
+    for platform, value in resets.items():
+        if (
+            platform in WEEKLY_RESET_FLAGS
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            result[platform] = value
+    return result
+
+
 def extract_weekly_resets(
     response: Any,
     *,
@@ -412,10 +449,194 @@ def extract_weekly_resets(
 
 def fetch_weekly_resets(base_url: str, token: str) -> dict[str, int]:
     try:
+        return extract_reset_metadata(download_reset_metadata(base_url, token))
+    except SyncHTTPError as error:
+        if error.status != 404:
+            return {}
+    except (RuntimeError, ValidationError):
+        return {}
+    try:
         response = download_snapshots(base_url, token)
     except (RuntimeError, ValidationError):
         return {}
     return extract_weekly_resets(response)
+
+
+def _incremental_state_path(state_dir: str) -> Path:
+    return _expand(state_dir) / "incremental-upload-v2.json"
+
+
+def _load_incremental_state(
+    path: Path,
+    *,
+    endpoint: str,
+    device_id: str,
+    snapshot: dict[str, Any],
+    collection_days: int,
+) -> dict[str, Any] | None:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 4 * 1024 * 1024:
+            return None
+        value = json_loads_strict(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "stateVersion",
+        "endpoint",
+        "deviceId",
+        "revision",
+        "lastFullAtMs",
+        "schemaVersion",
+        "timezone",
+        "collectionDays",
+        "manifest",
+    }:
+        return None
+    if (
+        value.get("stateVersion") != INCREMENTAL_STATE_VERSION
+        or value.get("endpoint") != endpoint
+        or value.get("deviceId") != device_id
+        or value.get("schemaVersion") != snapshot.get("schemaVersion")
+        or value.get("timezone") != snapshot.get("timezone")
+        or value.get("collectionDays") != collection_days
+        or not isinstance(value.get("revision"), int)
+        or isinstance(value.get("revision"), bool)
+        or value["revision"] <= 0
+        or not isinstance(value.get("lastFullAtMs"), int)
+        or isinstance(value.get("lastFullAtMs"), bool)
+        or value["lastFullAtMs"] <= 0
+    ):
+        return None
+    try:
+        value["manifest"] = validate_partition_manifest(value.get("manifest"))
+    except ValidationError:
+        return None
+    return value
+
+
+def _full_calibration_due(
+    state: dict[str, Any] | None,
+    *,
+    device_id: str,
+    now_ms: int,
+) -> bool:
+    if state is None:
+        return True
+    if now_ms < state["lastFullAtMs"]:
+        return True
+    jitter = (
+        int(hashlib.sha256(device_id.encode("ascii")).hexdigest()[:8], 16)
+        % FULL_CALIBRATION_JITTER_MS
+    )
+    return now_ms - state["lastFullAtMs"] >= FULL_CALIBRATION_INTERVAL_MS + jitter
+
+
+def _v2_full_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "protocolVersion": PROTOCOL_V2,
+        "mode": "full",
+        "device": envelope["device"],
+        "generatedAtMs": envelope["generatedAtMs"],
+        "snapshot": envelope["snapshot"],
+    }
+
+
+def _upload_v2(
+    base_url: str,
+    token: str,
+    body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    device_id = urllib.parse.quote(body["device"]["id"], safe="")
+    return _request_json(
+        "PUT",
+        f"{_base_url(base_url)}/v2/snapshots/{device_id}",
+        token,
+        body,
+    )
+
+
+def upload_incremental_snapshot(
+    base_url: str,
+    token: str,
+    envelope: dict[str, Any],
+    *,
+    state_dir: str = DEFAULT_STATE_DIR,
+    collection_days: int = 30,
+    now_ms: int | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    validate_envelope(envelope, path_device_id=envelope.get("device", {}).get("id"))
+    endpoint = _base_url(base_url)
+    device_id = envelope["device"]["id"]
+    current_ms = now_ms if now_ms is not None else time.time_ns() // 1_000_000
+    state_path = _incremental_state_path(state_dir)
+    state = _load_incremental_state(
+        state_path,
+        endpoint=endpoint,
+        device_id=device_id,
+        snapshot=envelope["snapshot"],
+        collection_days=collection_days,
+    )
+    partitions = snapshot_partitions(envelope["snapshot"])
+    manifest = partition_manifest(partitions)
+    full = _v2_full_envelope(envelope)
+    mode = "full"
+    body = full
+    if not _full_calibration_due(state, device_id=device_id, now_ms=current_ms):
+        upserts, deletes, manifest = incremental_delta(partitions, state["manifest"])
+        delta = {
+            "protocolVersion": PROTOCOL_V2,
+            "mode": "delta",
+            "device": envelope["device"],
+            "generatedAtMs": envelope["generatedAtMs"],
+            "baseRevision": state["revision"],
+            "upserts": upserts,
+            "deletes": deletes,
+        }
+        if len(canonical_json(delta).encode("utf-8")) < (
+            len(canonical_json(full).encode("utf-8")) * DELTA_FULL_RATIO
+        ):
+            body = delta
+            mode = "delta"
+
+    try:
+        status, response = _upload_v2(endpoint, token, body)
+    except SyncHTTPError as error:
+        if error.status == 404:
+            status, response = upload_envelope(endpoint, token, envelope)
+            return status, response, "v1-full"
+        if error.status == 409 and mode == "delta":
+            status, response = _upload_v2(endpoint, token, full)
+            mode = "full"
+        else:
+            raise
+
+    revision = response.get("revision")
+    if (
+        response.get("protocolVersion") != PROTOCOL_V2
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision <= 0
+        or response.get("status") not in {"created", "updated", "retry"}
+        or not isinstance(response.get("receivedAtMs"), int)
+        or isinstance(response.get("receivedAtMs"), bool)
+        or response["receivedAtMs"] <= 0
+    ):
+        raise RuntimeError("sync server returned invalid protocol-v2 upload metadata")
+    last_full_at_ms = current_ms if mode == "full" else state["lastFullAtMs"]
+    persisted = {
+        "stateVersion": INCREMENTAL_STATE_VERSION,
+        "endpoint": endpoint,
+        "deviceId": device_id,
+        "revision": revision,
+        "lastFullAtMs": last_full_at_ms,
+        "schemaVersion": envelope["snapshot"]["schemaVersion"],
+        "timezone": envelope["snapshot"]["timezone"],
+        "collectionDays": collection_days,
+        "manifest": manifest,
+    }
+    _atomic_private_write(state_path, canonical_json(persisted) + "\n")
+    return status, response, f"v2-{mode}"
 
 
 def _common_values(
@@ -464,7 +685,13 @@ def command_upload(args: argparse.Namespace) -> int:
         client_version=args.client_version,
     )
     try:
-        status, response = upload_envelope(args.url, token, envelope)
+        status, response, transport = upload_incremental_snapshot(
+            args.url,
+            token,
+            envelope,
+            state_dir=getattr(args, "state_dir", DEFAULT_STATE_DIR),
+            collection_days=getattr(args, "helper_days", 30),
+        )
     except SyncHTTPError as error:
         if error.status == 409:
             raise RuntimeError(
@@ -475,7 +702,7 @@ def command_upload(args: argparse.Namespace) -> int:
     print(
         "uploaded "
         f"generatedAtMs={envelope['generatedAtMs']} "
-        f"http={status} status={response.get('status', 'ok')}"
+        f"http={status} status={response.get('status', 'ok')} transport={transport}"
     )
     return 0
 
@@ -545,6 +772,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     _add_source_arguments(upload)
     upload.add_argument("--url", default=os.environ.get("TOKENBAR_SYNC_URL", DEFAULT_URL))
     upload.add_argument("--token-file")
+    upload.add_argument(
+        "--state-dir",
+        default=os.environ.get("TOKENBAR_SYNC_STATE_DIR", DEFAULT_STATE_DIR),
+        help="private directory for protocol-v2 revision and hash metadata",
+    )
     upload.set_defaults(handler=command_upload)
 
     download = subparsers.add_parser("download", help="download the latest device snapshots")

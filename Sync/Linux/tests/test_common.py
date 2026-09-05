@@ -2,8 +2,13 @@ import unittest
 
 from tokenbar_sync.common import (
     ValidationError,
+    apply_partition_delta,
+    incremental_delta,
     json_loads_strict,
+    materialize_snapshot,
+    partition_manifest,
     sanitize_snapshot,
+    snapshot_partitions,
     validate_envelope,
 )
 
@@ -47,6 +52,53 @@ def envelope(snapshot=None):
 
 
 class CommonTests(unittest.TestCase):
+    def test_incremental_partitions_round_trip_and_replace_history(self):
+        snapshot = envelope()["snapshot"]
+        snapshot["days"] = [{
+            "date": "2026-08-11",
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "requestCount": 1,
+            "sessionCount": 0,
+            "models": [],
+        }]
+        snapshot["sessions"] = [{
+            "id": "session/a",
+            "platform": "codex",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": zero_tokens(),
+            "costUsd": 0,
+            "models": [],
+            "requests": [],
+        }]
+        previous = snapshot_partitions(snapshot)
+        rebuilt = materialize_snapshot(previous)
+        self.assertEqual(rebuilt, snapshot)
+
+        current = dict(snapshot)
+        current["generatedAtMs"] = 2
+        current["days"] = [{**snapshot["days"][0], "requestCount": 2}]
+        current["sessions"] = []
+        current_parts = snapshot_partitions(current)
+        upserts, deletes, manifest = incremental_delta(
+            current_parts,
+            partition_manifest(previous),
+        )
+        self.assertIn("summary", upserts)
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(apply_partition_delta(snapshot, upserts, deletes), current)
+        self.assertEqual(manifest, partition_manifest(current_parts))
+
+    def test_incremental_delta_rejects_private_content(self):
+        snapshot = envelope()["snapshot"]
+        with self.assertRaisesRegex(ValidationError, "privacy-sanitized"):
+            apply_partition_delta(
+                snapshot,
+                {"summary": {"promptPreview": "private"}},
+                [],
+            )
+
     def test_recursive_sanitizer(self):
         source = {
             "schemaVersion": 9,
@@ -55,6 +107,15 @@ class CommonTests(unittest.TestCase):
                 "outputPreview": "private answer",
                 "sessionPath": "/private/session.jsonl",
                 "nested": [{"workspacePath": "C:\\Users\\example", "title": "secret"}],
+            },
+            "session": {
+                "id": "session-1",
+                "title": "Synced session name",
+                "startedAtMs": 1,
+                "endedAtMs": 2,
+                "tokens": {},
+                "models": [],
+                "requests": [],
             },
             "workspaceLabel": "safe-label",
             "api_key": "credential-value",
@@ -68,11 +129,15 @@ class CommonTests(unittest.TestCase):
         self.assertEqual(clean["request"]["sessionPath"], None)
         self.assertEqual(clean["request"]["nested"][0]["workspacePath"], None)
         self.assertEqual(clean["request"]["nested"][0]["title"], None)
+        self.assertEqual(clean["session"]["title"], "Synced session name")
         self.assertIsNone(clean["workspaceLabel"])
         self.assertNotIn("api_key", clean)
         self.assertNotIn("authToken", clean)
         self.assertEqual(clean["tokens"]["output"], 42)
         self.assertIsNone(clean["unknownPath"])
+
+        invalid_session = {**source["session"], "title": "line one\nline two"}
+        self.assertIsNone(sanitize_snapshot(invalid_session)["title"])
 
     def test_validate_rejects_unsanitized_snapshot(self):
         value = envelope()
@@ -127,6 +192,18 @@ class CommonTests(unittest.TestCase):
                     validate_envelope(value, path_device_id=path_id)
 
     def test_validate_rejects_a_snapshot_the_mac_cannot_decode(self):
+        value = envelope()
+        value["snapshot"]["today"].update({
+            "averageTimeToFirstTokenMs": 875.5,
+            "firstTokenSampleCount": 2,
+        })
+        self.assertIs(validate_envelope(value, path_device_id=DEVICE_ID), value)
+
+        value = envelope()
+        value["snapshot"]["today"]["averageTimeToFirstTokenMs"] = 875.5
+        with self.assertRaisesRegex(ValidationError, "inconsistent first-token metrics"):
+            validate_envelope(value, path_device_id=DEVICE_ID)
+
         value = envelope()
         value["snapshot"]["today"] = {}
         with self.assertRaisesRegex(ValidationError, "snapshot.today.tokens"):

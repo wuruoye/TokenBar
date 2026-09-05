@@ -55,6 +55,18 @@ struct SessionMenuTests {
             workspaceLabel: "workspace",
             requests: [Self.request(id: "first", startedAtMs: 1, prompt: "first prompt", isSubagent: false)])
         #expect(promptFallback.menuTitle == "first prompt")
+
+        let remote = SessionSummary(
+            id: "sync:11111111-1111-4111-8111-111111111111:session",
+            workspaceLabel: "Windows Workstation",
+            startedAtMs: 0,
+            endedAtMs: 3,
+            tokens: .zero,
+            costUsd: 0,
+            models: ["gpt-test"],
+            requests: [],
+            title: "Remote task")
+        #expect(remote.menuDisplayTitle == "Windows Workstation · Remote task")
     }
 
     private static func snapshot(sessions: [SessionSummary]) -> ActivitySnapshot {

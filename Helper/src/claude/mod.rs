@@ -62,6 +62,7 @@ pub fn parse_local_claude_messages(
             {
                 continue;
             }
+            split_thinking_from_output(&mut message.tokens);
             if let Some(costs) = pricing.calculate_token_costs_with_cache_writes(
                 &message.model_id,
                 &message.tokens,
@@ -227,11 +228,11 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         };
 
-        if entry
+        let is_sidechain = entry
             .get("isSidechain")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if is_sidechain {
             is_subagent = true;
             if let Some(parent) = entry
                 .get("sessionId")
@@ -243,6 +244,14 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             if agent.is_none() {
                 agent = resolve_agent_name(path, &entry);
             }
+        }
+        if !is_sidechain
+            && entry
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|session_id| session_id != physical_session_id)
+        {
+            continue;
         }
         if let Some(cwd) = entry
             .get("cwd")
@@ -289,28 +298,30 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         let provider = canonical_provider(explicit_provider.as_deref(), &raw_model);
         let model = canonical_model(&raw_model);
         let timestamp = entry_timestamp_ms(&entry).unwrap_or(fallback_timestamp);
+        let request_id = entry.get("requestId").and_then(Value::as_str);
+        let message_id = message.get("id").and_then(Value::as_str);
+        let time_to_first_token_ms = request_started_at
+            .zip(message_id)
+            .and_then(|(request_started_at, message_id)| {
+                claude_time_to_first_token_ms(request_started_at, message_id)
+            });
         let tokens = TokenBreakdown {
             input: integer(usage.get("input_tokens")).max(0),
             output: integer(usage.get("output_tokens")).max(0),
             cache_read: integer(usage.get("cache_read_input_tokens")).max(0),
             cache_write: integer(usage.get("cache_creation_input_tokens")).max(0),
-            reasoning: 0,
+            reasoning: thinking_tokens(usage),
         };
         let cache_write_breakdown = cache_write_breakdown(usage);
         if tokens.total() == 0 {
             continue;
         }
 
-        let dedup_key = message
-            .get("id")
-            .and_then(Value::as_str)
-            .map(|message_id| {
-                entry
-                    .get("requestId")
-                    .and_then(Value::as_str)
-                    .map(|request_id| format!("claude:{message_id}:{request_id}"))
-                    .unwrap_or_else(|| format!("claude:message:{message_id}"))
-            });
+        let dedup_key = message_id.map(|message_id| {
+            request_id
+                .map(|request_id| format!("claude:{message_id}:{request_id}"))
+                .unwrap_or_else(|| format!("claude:message:{message_id}"))
+        });
         if let Some(index) = dedup_key
             .as_ref()
             .and_then(|key| dedup_indices.get(key))
@@ -345,6 +356,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
         unified.model_duration_ms = unified.duration_ms;
+        unified.time_to_first_token_ms = time_to_first_token_ms;
         unified.is_turn_start = pending_turn_start;
         unified.set_content_preview(pending_prompt.take());
         unified.set_output_preview(
@@ -374,6 +386,7 @@ fn merge_streaming_duplicate(
     existing.tokens.output = existing.tokens.output.max(tokens.output);
     existing.tokens.cache_read = existing.tokens.cache_read.max(tokens.cache_read);
     existing.tokens.cache_write = existing.tokens.cache_write.max(tokens.cache_write);
+    existing.tokens.reasoning = existing.tokens.reasoning.max(tokens.reasoning);
     if let Some(incoming) = cache_write_breakdown {
         let existing = existing
             .cache_write_breakdown
@@ -398,6 +411,37 @@ fn merge_streaming_duplicate(
             existing.set_output_preview(Some(preview));
         }
     }
+}
+
+/// Reads Claude's thinking-token count from an assistant `usage` object.
+fn thinking_tokens(usage: &Value) -> i64 {
+    integer(
+        usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("thinking_tokens")),
+    )
+    .max(0)
+}
+
+/// Moves Claude's thinking tokens out of the raw output total.
+///
+/// Anthropic reports `output_tokens_details.thinking_tokens` as a subset of the
+/// billed `output_tokens`, while TokenBar presents output and reasoning as
+/// disjoint buckets. Both are billed at the output rate, so splitting them
+/// leaves the estimate unchanged and keeps the token rows summing to the raw
+/// output total exactly once. Streaming snapshots are merged before this runs,
+/// so it sees each request's final counts.
+fn split_thinking_from_output(tokens: &mut TokenBreakdown) {
+    let reasoning = tokens.reasoning.max(0);
+    if reasoning > 0 && reasoning <= tokens.output {
+        tokens.output -= reasoning;
+        tokens.reasoning = reasoning;
+        return;
+    }
+    // An inconsistent breakdown cannot be split into disjoint buckets without
+    // inflating the request. Keep the raw output total and drop the unusable
+    // reasoning detail.
+    tokens.reasoning = 0;
 }
 
 fn cache_write_breakdown(usage: &Value) -> Option<CacheWriteBreakdown> {
@@ -476,6 +520,33 @@ fn entry_timestamp_ms(entry: &Value) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|timestamp| timestamp.timestamp_millis())
+}
+
+fn claude_time_to_first_token_ms(request_started_at: i64, message_id: &str) -> Option<i64> {
+    let message_timestamp = prefixed_uuid_v7_timestamp_ms(message_id, "msg_01")?;
+    message_timestamp
+        .checked_sub(request_started_at)
+        .filter(|duration| *duration >= 0)
+}
+
+fn prefixed_uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<i64> {
+    const BASE58: &[u8; 58] =
+        b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    let encoded = id.strip_prefix(prefix)?;
+    if encoded.len() != 22 {
+        return None;
+    }
+    let value = encoded.bytes().try_fold(0_u128, |value, byte| {
+        let digit = BASE58.iter().position(|candidate| *candidate == byte)? as u128;
+        value.checked_mul(58)?.checked_add(digit)
+    })?;
+    let version = (value >> 76) & 0x0f;
+    let variant = (value >> 62) & 0x03;
+    if version != 7 || variant != 2 {
+        return None;
+    }
+    i64::try_from(value >> 80).ok()
 }
 
 fn integer(value: Option<&Value>) -> i64 {
@@ -611,6 +682,8 @@ fn file_modified_timestamp_ms(path: &Path) -> i64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    const TOKENS_PER_MILLION_IN_TEST: f64 = 1_000_000.0;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temporary_path(name: &str) -> PathBuf {
@@ -633,12 +706,12 @@ mod tests {
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:01Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":20,"output_tokens_details":{{"thinking_tokens":8}},"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10}}}},"content":[{{"type":"text","text":"Working"}}]}}}}"#
         )
         .unwrap();
         writeln!(
             file,
-            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{{"id":"message-1","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"cache_read_input_tokens":45,"cache_creation_input_tokens":12,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":12}}}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{{"input_tokens":110,"output_tokens":25,"output_tokens_details":{{"thinking_tokens":10}},"cache_read_input_tokens":45,"cache_creation_input_tokens":12,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":12}}}},"content":[{{"type":"text","text":"Done"}}]}}}}"#
         )
         .unwrap();
 
@@ -650,6 +723,7 @@ mod tests {
         assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
         assert_eq!(messages[0].tokens.input, 110);
         assert_eq!(messages[0].tokens.output, 25);
+        assert_eq!(messages[0].tokens.reasoning, 10);
         assert_eq!(messages[0].tokens.cache_write, 12);
         assert_eq!(
             messages[0]
@@ -660,10 +734,160 @@ mod tests {
         );
         assert_eq!(messages[0].duration_ms, Some(2_000));
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(800));
         assert_eq!(messages[0].content_preview.as_deref(), Some("Add Claude support"));
         assert_eq!(messages[0].output_preview.as_deref(), Some("Done"));
         assert!(messages[0].is_turn_start);
         assert!(!messages[0].is_subagent);
+    }
+
+    #[test]
+    fn main_fork_skips_parent_replay() {
+        let directory = temporary_path("main-fork");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("child.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:00Z\",\"message\":{\"content\":\"Parent prompt\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:01Z\",\"requestId\":\"parent-request\",\"message\":{\"id\":\"parent-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"child\",\"timestamp\":\"2026-07-24T10:01:00Z\",\"message\":{\"content\":\"Child prompt\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"child\",\"timestamp\":\"2026-07-24T10:01:01Z\",\"requestId\":\"child-request\",\"message\":{\"id\":\"child-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_claude_file(&path);
+        fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "child");
+        assert_eq!(messages[0].physical_session_id.as_deref(), Some("child"));
+        assert_eq!(messages[0].tokens.input, 20);
+        assert_eq!(messages[0].content_preview.as_deref(), Some("Child prompt"));
+        assert!(!messages[0].is_subagent);
+    }
+
+    #[test]
+    fn multiple_forks_keep_only_their_own_usage() {
+        let home = temporary_path("fork-family");
+        let directory = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&directory).unwrap();
+        let parent_turn = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:00Z\",\"message\":{\"content\":\"Parent prompt\"}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"parent\",\"timestamp\":\"2026-07-24T10:00:01Z\",\"requestId\":\"parent-request\",\"message\":{\"id\":\"parent-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n"
+        );
+        fs::write(directory.join("parent.jsonl"), parent_turn).unwrap();
+        fs::write(
+            directory.join("child-a.jsonl"),
+            format!(
+                "{parent_turn}{child_turn}",
+                child_turn = concat!(
+                    "{\"type\":\"user\",\"sessionId\":\"child-a\",\"timestamp\":\"2026-07-24T10:01:00Z\",\"message\":{\"content\":\"Child A prompt\"}}\n",
+                    "{\"type\":\"assistant\",\"sessionId\":\"child-a\",\"timestamp\":\"2026-07-24T10:01:01Z\",\"requestId\":\"child-a-request\",\"message\":{\"id\":\"child-a-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2}}}\n"
+                )
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("child-b.jsonl"),
+            format!(
+                "{parent_turn}{child_turn}",
+                child_turn = concat!(
+                    "{\"type\":\"user\",\"sessionId\":\"child-b\",\"timestamp\":\"2026-07-24T10:02:00Z\",\"message\":{\"content\":\"Child B prompt\"}}\n",
+                    "{\"type\":\"assistant\",\"sessionId\":\"child-b\",\"timestamp\":\"2026-07-24T10:02:01Z\",\"requestId\":\"child-b-request\",\"message\":{\"id\":\"child-b-message\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":30,\"output_tokens\":3}}}\n"
+                )
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_local_claude_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                ..Default::default()
+            },
+            &AnthropicPricing::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(home).unwrap();
+
+        assert_eq!(messages.len(), 3);
+        let inputs = messages
+            .iter()
+            .map(|message| (message.session_id.as_str(), message.tokens.input))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(inputs.get("parent"), Some(&10));
+        assert_eq!(inputs.get("child-a"), Some(&20));
+        assert_eq!(inputs.get("child-b"), Some(&30));
+        assert!(messages.iter().all(|message| {
+            message.physical_session_id.as_deref() == Some(message.session_id.as_str())
+                && !message.is_subagent
+        }));
+    }
+
+    #[test]
+    fn splits_thinking_out_of_output_without_changing_the_estimate() {
+        let home = temporary_path("thinking");
+        let directory = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("session.jsonl"),
+            r#"{"type":"user","timestamp":"2026-09-01T10:00:00Z","message":{"content":"Plan the change"}}
+{"type":"assistant","timestamp":"2026-09-01T10:00:01Z","requestId":"request-1","message":{"id":"message-1","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":200,"output_tokens_details":{"thinking_tokens":80},"cache_read_input_tokens":400,"cache_creation_input_tokens":40}}}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_local_claude_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                use_env_roots: false,
+                ..Default::default()
+            },
+            &AnthropicPricing::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(home).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.tokens.output, 120);
+        assert_eq!(message.tokens.reasoning, 80);
+        assert_eq!(message.tokens.total(), 100 + 200 + 400 + 40);
+
+        let costs = message.token_costs.unwrap();
+        let undivided = AnthropicPricing::default()
+            .calculate_token_costs(
+                "claude-opus-5",
+                &TokenBreakdown {
+                    input: 100,
+                    output: 200,
+                    cache_read: 400,
+                    cache_write: 40,
+                    reasoning: 0,
+                },
+            )
+            .unwrap();
+        assert!((costs.output - 120.0 * 25.0 / TOKENS_PER_MILLION_IN_TEST).abs() < 1e-12);
+        assert!((costs.reasoning - 80.0 * 25.0 / TOKENS_PER_MILLION_IN_TEST).abs() < 1e-12);
+        assert!((costs.total() - undivided.total()).abs() < 1e-12);
+        assert!((message.cost - undivided.total()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn drops_a_thinking_count_that_exceeds_its_output_total() {
+        let mut tokens = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 9,
+        };
+        split_thinking_from_output(&mut tokens);
+
+        assert_eq!(tokens.output, 5);
+        assert_eq!(tokens.reasoning, 0);
     }
 
     #[test]
@@ -672,9 +896,9 @@ mod tests {
         fs::write(
             &path,
             r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"content":"Run the command"}}
-{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"request-1","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","timestamp":"2026-07-24T10:00:02Z","requestId":"req_011CdLgpfz8ktFeHGLvsS2at","message":{"id":"msg_011CdLgpiYvHSmP4zgYLrnZn","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}
 {"type":"user","timestamp":"2026-07-24T10:01:02Z","message":{"content":[{"type":"tool_result","content":"done"}]}}
-{"type":"assistant","timestamp":"2026-07-24T10:01:05Z","requestId":"request-2","message":{"id":"message-2","model":"claude-sonnet-4-6","usage":{"input_tokens":110,"output_tokens":30}}}
+{"type":"assistant","timestamp":"2026-07-24T10:01:05Z","requestId":"req_011CdLguF4aY9EYRMx8QD3xC","message":{"id":"msg_011CdLguJGZSqsiQXNeEzVvp","model":"claude-sonnet-4-6","usage":{"input_tokens":110,"output_tokens":30}}}
 "#,
         )
         .unwrap();
@@ -685,8 +909,29 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].model_duration_ms, Some(2_000));
         assert_eq!(messages[1].model_duration_ms, Some(3_000));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(800));
+        assert_eq!(messages[1].time_to_first_token_ms, Some(950));
         assert!(messages[0].is_turn_start);
         assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn does_not_use_completed_assistant_block_timestamp_as_ttft() {
+        let path = temporary_path("completed-block.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"content":"Think carefully"}}
+{"type":"assistant","timestamp":"2026-07-24T10:01:14Z","requestId":"request-1","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20},"content":[{"type":"thinking","thinking":"Done thinking"}]}}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_claude_file(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].duration_ms, Some(74_000));
+        assert_eq!(messages[0].time_to_first_token_ms, None);
     }
 
     #[test]

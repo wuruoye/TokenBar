@@ -36,6 +36,26 @@ private actor RecordingActivityHelperRunner: ActivityHelperRunning {
     }
 }
 
+private actor SequencedActivityHelperRunner: ActivityHelperRunning {
+    private var outputs: [Data]
+    private(set) var argumentHistory: [[String]] = []
+
+    init(outputs: [Data]) {
+        self.outputs = outputs
+    }
+
+    func run(
+        executableURL _: URL,
+        arguments: [String],
+        environment _: [String: String],
+        timeout _: TimeInterval) throws -> Data
+    {
+        self.argumentHistory.append(arguments)
+        guard !self.outputs.isEmpty else { throw ActivityServiceError.emptyOutput }
+        return self.outputs.removeFirst()
+    }
+}
+
 private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
     let fileURL: URL?
 
@@ -45,6 +65,70 @@ private actor StubAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
 
     func refreshIfNeeded() -> URL? {
         self.fileURL
+    }
+}
+
+private actor RefreshingAnthropicPricingCatalog: AnthropicPricingCatalogUpdating {
+    let cachedURL: URL
+    let refreshedURL: URL
+    private(set) var forcedRefreshCount = 0
+
+    init(cachedURL: URL, refreshedURL: URL) {
+        self.cachedURL = cachedURL
+        self.refreshedURL = refreshedURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.cachedURL
+    }
+
+    func refreshNowIfAllowed() -> URL? {
+        self.forcedRefreshCount += 1
+        return self.refreshedURL
+    }
+}
+
+private actor RefreshingOpenRouterPricingCatalog: OpenRouterPricingCatalogUpdating {
+    let cachedURL: URL
+    let refreshedURL: URL
+    private(set) var forcedRefreshCount = 0
+
+    init(cachedURL: URL, refreshedURL: URL) {
+        self.cachedURL = cachedURL
+        self.refreshedURL = refreshedURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.cachedURL
+    }
+
+    func refreshNowIfAllowed() -> URL? {
+        self.forcedRefreshCount += 1
+        return self.refreshedURL
+    }
+}
+
+private actor StubOpenAIPricingCatalog: OpenAIPricingCatalogUpdating {
+    let fileURL: URL?
+
+    init(fileURL: URL?) {
+        self.fileURL = fileURL
+    }
+
+    func refreshIfNeeded() -> URL? {
+        self.fileURL
+    }
+}
+
+private actor MemoryDatabaseURLPreference {
+    var value: URL?
+
+    init(value: URL?) {
+        self.value = value
+    }
+
+    func update(_ value: URL?) {
+        self.value = value
     }
 }
 
@@ -65,17 +149,23 @@ struct ActivityServiceTests {
         #expect(snapshot.today.tokenCosts?.displayedCache == 0.03)
         #expect(abs((snapshot.today.tokenCosts?.total ?? 0) - 0.25) < 0.000_000_001)
         #expect(snapshot.today.averageGenerationTokensPerSecond == 6)
+        #expect(snapshot.today.averageTimeToFirstTokenMs == 900)
+        #expect(snapshot.today.firstTokenSampleCount == 1)
         #expect(snapshot.rangeTotals?.tokens.total == 84)
         #expect(snapshot.rangeTotals?.averageGenerationTokensPerSecond == 7.5)
+        #expect(snapshot.rangeTotals?.averageTimeToFirstTokenMs == 1_200)
         #expect(snapshot.weeklySinceReset?.totals.tokens.total == 84)
         #expect(snapshot.weeklySinceReset?.totals.averageGenerationTokensPerSecond == 7.5)
         #expect(snapshot.sessions.first?.requests.first?.model == "gpt-test")
         #expect(snapshot.sessions.first?.requests.first?.promptPreview == "private prompt")
         #expect(snapshot.sessions.first?.requests.first?.sessionPath == "/tmp/private-session.jsonl")
         #expect(snapshot.sessions.first?.requests.first?.serviceTier == .fast)
+        #expect(snapshot.sessions.first?.requests.first?.timeToFirstTokenMs == 900)
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.physicalSessionId == "physical-1")
         #expect(snapshot.sessions.first?.requests.first?.physicalRequests.first?.serviceTier == .fast)
         #expect(snapshot.days.first?.models.first?.model == "gpt-test")
+        #expect(snapshot.days.first?.averageGenerationTokensPerSecond == 6)
+        #expect(snapshot.days.first?.averageTimeToFirstTokenMs == 900)
     }
 
     @Test("passes the exact weekly reset timestamp to the helper")
@@ -110,6 +200,7 @@ struct ActivityServiceTests {
                 .codex: Date(timeIntervalSince1970: 1_720_000_000.125),
                 .claude: Date(timeIntervalSince1970: 1_730_000_000.5),
                 .grok: Date(timeIntervalSince1970: 1_740_000_000.75),
+                .antigravity: Date(timeIntervalSince1970: 1_750_000_000.25),
             ],
             statisticsTimeZone: .utc)
 
@@ -119,6 +210,7 @@ struct ActivityServiceTests {
             "--weekly-reset-ms", "1720000000125",
             "--claude-weekly-reset-ms", "1730000000500",
             "--grok-weekly-reset-ms", "1740000000750",
+            "--antigravity-weekly-reset-ms", "1750000000250",
         ])
     }
 
@@ -144,6 +236,29 @@ struct ActivityServiceTests {
         #expect(await runner.arguments == ["--statistics-timezone", "local"])
     }
 
+    @Test("loads one historical session date without the memory snapshot")
+    func loadsHistoricalSessions() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let service = ActivityService(
+            arguments: ["--days", "30"],
+            memoryDatabaseURL: URL(fileURLWithPath: "/tmp/tokenbar-memory.sqlite"),
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let sessions = try await service.fetchSessions(
+            on: "2026-08-31",
+            statisticsTimeZone: .local)
+
+        #expect(sessions.map(\.id) == ["session-1"])
+        #expect(await runner.arguments == [
+            "--days", "30",
+            "--days", "1",
+            "--end-date", "2026-08-31",
+            "--statistics-timezone", "local",
+        ])
+        #expect(await runner.environments.last?["TZ"] == TimeZone.autoupdatingCurrent.identifier)
+    }
+
     @Test("passes the TokenBar memory database to the activity snapshot helper")
     func passesMemoryDatabase() async throws {
         let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
@@ -158,6 +273,27 @@ struct ActivityServiceTests {
             "--statistics-timezone", "utc",
             "--memory-database", "/tmp/tokenbar-memory.sqlite",
         ])
+    }
+
+    @Test("omits the memory database when monitoring is turned off")
+    func followsMemoryDatabasePreference() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let preference = MemoryDatabaseURLPreference(
+            value: URL(fileURLWithPath: "/tmp/tokenbar-memory.sqlite"))
+        let service = ActivityService(
+            memoryDatabaseURLProvider: { await preference.value },
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+        #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
+            "--memory-database", "/tmp/tokenbar-memory.sqlite",
+        ])
+
+        await preference.update(nil)
+        _ = try await service.fetchActivity()
+        #expect(await runner.arguments == ["--statistics-timezone", "utc"])
     }
 
     @Test("passes the refreshed Anthropic pricing catalog to the helper")
@@ -175,6 +311,93 @@ struct ActivityServiceTests {
         #expect(await runner.arguments == [
             "--statistics-timezone", "utc",
             "--anthropic-pricing-markdown", "/tmp/anthropic-pricing.md",
+        ])
+    }
+
+    @Test("passes the refreshed OpenAI pricing catalog to the helper")
+    func passesOpenAIPricingCatalog() async throws {
+        let runner = RecordingActivityHelperRunner(output: Self.fixtureData)
+        let catalog = StubOpenAIPricingCatalog(
+            fileURL: URL(fileURLWithPath: "/tmp/openai-pricing.md"))
+        let service = ActivityService(
+            openAIPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        _ = try await service.fetchActivity()
+
+        #expect(await runner.arguments == [
+            "--statistics-timezone", "utc",
+            "--openai-pricing-markdown", "/tmp/openai-pricing.md",
+        ])
+    }
+
+    @Test("refreshes the matching catalog and reruns the helper for an unpriced model")
+    func refreshesUnpricedModel() async throws {
+        let runner = SequencedActivityHelperRunner(outputs: [
+            Self.pricingSnapshot(costSource: "unknown", costUsd: 0),
+            Self.pricingSnapshot(costSource: "estimated", costUsd: 12.5),
+        ])
+        let catalog = RefreshingAnthropicPricingCatalog(
+            cachedURL: URL(fileURLWithPath: "/tmp/anthropic-pricing-old.md"),
+            refreshedURL: URL(fileURLWithPath: "/tmp/anthropic-pricing-new.md"))
+        let service = ActivityService(
+            anthropicPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let snapshot = try await service.fetchActivity()
+
+        #expect(snapshot.sessions[0].requests[0].costSource == .estimated)
+        #expect(snapshot.sessions[0].requests[0].costUsd == 12.5)
+        #expect(await catalog.forcedRefreshCount == 1)
+        #expect(await runner.argumentHistory == [
+            [
+                "--statistics-timezone", "utc",
+                "--anthropic-pricing-markdown", "/tmp/anthropic-pricing-old.md",
+            ],
+            [
+                "--statistics-timezone", "utc",
+                "--anthropic-pricing-markdown", "/tmp/anthropic-pricing-new.md",
+            ],
+        ])
+    }
+
+    @Test("refreshes the OpenRouter catalog for an unpriced Antigravity model")
+    func refreshesUnpricedAntigravityModel() async throws {
+        let runner = SequencedActivityHelperRunner(outputs: [
+            Self.pricingSnapshot(
+                costSource: "unknown",
+                costUsd: 0,
+                platform: "antigravity",
+                model: "gemini-3.8-flash"),
+            Self.pricingSnapshot(
+                costSource: "estimated",
+                costUsd: 4.25,
+                platform: "antigravity",
+                model: "gemini-3.8-flash"),
+        ])
+        let catalog = RefreshingOpenRouterPricingCatalog(
+            cachedURL: URL(fileURLWithPath: "/tmp/openrouter-models-old.json"),
+            refreshedURL: URL(fileURLWithPath: "/tmp/openrouter-models-new.json"))
+        let service = ActivityService(
+            openRouterPricingCatalog: catalog,
+            resolveHelper: { URL(fileURLWithPath: "/fixture/tokenbar-helper") },
+            runner: runner)
+
+        let snapshot = try await service.fetchActivity()
+
+        #expect(snapshot.sessions[0].requests[0].costUsd == 4.25)
+        #expect(await catalog.forcedRefreshCount == 1)
+        #expect(await runner.argumentHistory == [
+            [
+                "--statistics-timezone", "utc",
+                "--openrouter-pricing-json", "/tmp/openrouter-models-old.json",
+            ],
+            [
+                "--statistics-timezone", "utc",
+                "--openrouter-pricing-json", "/tmp/openrouter-models-new.json",
+            ],
         ])
     }
 
@@ -198,6 +421,7 @@ struct ActivityServiceTests {
 
         #expect(day.models.isEmpty)
         #expect(day.tokens.total == 15)
+        #expect(day.averageGenerationTokensPerSecond == nil)
     }
 
     @Test("decodes legacy activity snapshots without weekly reset totals")
@@ -256,7 +480,54 @@ struct ActivityServiceTests {
         #expect(request.contributions == nil)
         #expect(request.serviceTier == nil)
         #expect(request.modelDurationMs == nil)
+        #expect(request.timeToFirstTokenMs == nil)
         #expect(request.physicalRequests.map(\.id) == ["legacy-request"])
+    }
+
+    private static func pricingSnapshot(
+        costSource: String,
+        costUsd: Double,
+        platform: String = "claude",
+        model: String = "claude-fable-5-1") -> Data
+    {
+        Data(
+            """
+            {
+              "schemaVersion": 3,
+              "generatedAtMs": 1788300000000,
+              "timezone": "UTC",
+              "today": {
+                "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                "costUsd": \(costUsd),
+                "requestCount": 1,
+                "sessionCount": 1
+              },
+              "sessions": [{
+                "id": "session-fable",
+                "platform": "\(platform)",
+                "startedAtMs": 1788300000000,
+                "endedAtMs": 1788300001000,
+                "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                "costUsd": \(costUsd),
+                "models": ["\(model)"],
+                "requests": [{
+                  "id": "request-fable",
+                  "platform": "\(platform)",
+                  "sessionId": "session-fable",
+                  "physicalSessionId": "session-fable",
+                  "isSubagent": false,
+                  "model": "\(model)",
+                  "provider": "anthropic",
+                  "startedAtMs": 1788300000000,
+                  "endedAtMs": 1788300001000,
+                  "tokens": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 2, "reasoning": 1},
+                  "costUsd": \(costUsd),
+                  "costSource": "\(costSource)"
+                }]
+              }],
+              "days": []
+            }
+            """.utf8)
     }
 
     private static let fixtureData = Data(
@@ -270,6 +541,8 @@ struct ActivityServiceTests {
             "costUsd": 0.25,
             "tokenCosts": {"input": 0.05, "output": 0.10, "cacheRead": 0.03, "cacheWrite": 0.02, "reasoning": 0.05},
             "averageGenerationTokensPerSecond": 6.0,
+            "averageTimeToFirstTokenMs": 900.0,
+            "firstTokenSampleCount": 1,
             "requestCount": 1,
             "sessionCount": 1
           },
@@ -278,6 +551,8 @@ struct ActivityServiceTests {
             "costUsd": 1.0,
             "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
             "averageGenerationTokensPerSecond": 7.5,
+            "averageTimeToFirstTokenMs": 1200.0,
+            "firstTokenSampleCount": 4,
             "requestCount": 4,
             "sessionCount": 2
           },
@@ -288,6 +563,8 @@ struct ActivityServiceTests {
               "costUsd": 1.0,
               "tokenCosts": {"input": 0.20, "output": 0.40, "cacheRead": 0.12, "cacheWrite": 0.08, "reasoning": 0.20},
               "averageGenerationTokensPerSecond": 7.5,
+              "averageTimeToFirstTokenMs": 1200.0,
+              "firstTokenSampleCount": 4,
               "requestCount": 4,
               "sessionCount": 2
             }
@@ -311,6 +588,7 @@ struct ActivityServiceTests {
               "startedAtMs": 1720000000000,
               "endedAtMs": 1720000001000,
               "durationMs": 1000,
+              "timeToFirstTokenMs": 900,
               "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
               "costUsd": 0.25,
               "costSource": "estimated",
@@ -329,6 +607,7 @@ struct ActivityServiceTests {
                 "startedAtMs": 1720000000000,
                 "endedAtMs": 1720000001000,
                 "durationMs": 1000,
+                "timeToFirstTokenMs": 900,
                 "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
                 "costUsd": 0.25,
                 "costSource": "estimated",
@@ -343,6 +622,9 @@ struct ActivityServiceTests {
             "date": "2024-07-03",
             "tokens": {"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "reasoning": 1},
             "costUsd": 0.25,
+            "averageGenerationTokensPerSecond": 6.0,
+            "averageTimeToFirstTokenMs": 900.0,
+            "firstTokenSampleCount": 1,
             "requestCount": 1,
             "sessionCount": 1,
             "models": [{

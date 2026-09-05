@@ -73,6 +73,30 @@ struct DemoGrokQuotaProvider: QuotaProviding {
     }
 }
 
+struct DemoAntigravityQuotaProvider: QuotaProviding {
+    let platform = TokenPlatform.antigravity
+
+    func fetchQuota() async throws -> QuotaSnapshot {
+        let now = Date()
+        let object: [String: Any] = [
+            "session": [
+                "usedPercent": 39,
+                "windowMinutes": 300,
+                "resetsAt": now.addingTimeInterval(3.2 * 3_600).timeIntervalSinceReferenceDate,
+            ],
+            "weekly": [
+                "usedPercent": 17,
+                "windowMinutes": 10_080,
+                "resetsAt": now.addingTimeInterval(1.5 * 86_400).timeIntervalSinceReferenceDate,
+            ],
+            "updatedAt": now.timeIntervalSinceReferenceDate,
+        ]
+        return try JSONDecoder().decode(
+            QuotaSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object))
+    }
+}
+
 struct DemoActivityProvider: ActivityProviding {
     func fetchActivity(
         sinceWeeklyResetAt: Date?,
@@ -116,9 +140,14 @@ struct DemoActivityProvider: ActivityProviding {
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
             .grok: DemoTokenCounter(),
+            .antigravity: DemoTokenCounter(),
         ]
-        var requestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
-        var sessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var requestCountByPlatform: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
+        var sessionCountByPlatform: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
         var requestCount = 0
         for (sessionIndex, prompt) in prompts.enumerated() {
             let platform = sessionIndex.isMultiple(of: 2)
@@ -161,6 +190,7 @@ struct DemoActivityProvider: ActivityProviding {
                     "endedAtMs": startedAtMs + 82_000,
                     "durationMs": 82_000,
                     "modelDurationMs": 12_000,
+                    "timeToFirstTokenMs": 4_800 + requestIndex * 650,
                     "tokens": tokens.object,
                     "costUsd": Double(tokens.total) / 1_000_000 * 4.2,
                     "costSource": "estimated",
@@ -189,6 +219,7 @@ struct DemoActivityProvider: ActivityProviding {
                             "endedAtMs": startedAtMs + 48_000,
                             "durationMs": 48_000,
                             "modelDurationMs": 7_500,
+                            "timeToFirstTokenMs": 4_800 + requestIndex * 650,
                             "tokens": mainTokens.object,
                             "costUsd": Double(mainTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
@@ -209,6 +240,7 @@ struct DemoActivityProvider: ActivityProviding {
                             "endedAtMs": startedAtMs + 82_000,
                             "durationMs": 66_000,
                             "modelDurationMs": 9_000,
+                            "timeToFirstTokenMs": 6_200 + requestIndex * 700,
                             "tokens": childTokens.object,
                             "costUsd": Double(childTokens.total) / 1_000_000 * 4.2,
                             "costSource": "estimated",
@@ -240,24 +272,36 @@ struct DemoActivityProvider: ActivityProviding {
         formatter.dateFormat = "yyyy-MM-dd"
         let calendar = Calendar(identifier: .gregorian)
         var days: [[String: Any]] = []
-        var sourceDays: [TokenPlatform: [[String: Any]]] = [.codex: [], .claude: [], .grok: []]
+        var sourceDays: [TokenPlatform: [[String: Any]]] = [
+            .codex: [], .claude: [], .grok: [], .antigravity: [],
+        ]
         var range = DemoTokenCounter()
         var rangeByPlatform: [TokenPlatform: DemoTokenCounter] = [
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
             .grok: DemoTokenCounter(),
+            .antigravity: DemoTokenCounter(),
         ]
         var rangeRequestCount = 0
         var rangeSessionCount = 0
-        var rangeRequestCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
-        var rangeSessionCountByPlatform: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var rangeRequestCountByPlatform: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
+        var rangeSessionCountByPlatform: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
         var weeklyByPlatform: [TokenPlatform: DemoTokenCounter] = [
             .codex: DemoTokenCounter(),
             .claude: DemoTokenCounter(),
             .grok: DemoTokenCounter(),
+            .antigravity: DemoTokenCounter(),
         ]
-        var weeklyRequestCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
-        var weeklySessionCount: [TokenPlatform: Int] = [.codex: 0, .claude: 0, .grok: 0]
+        var weeklyRequestCount: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
+        var weeklySessionCount: [TokenPlatform: Int] = [
+            .codex: 0, .claude: 0, .grok: 0, .antigravity: 0,
+        ]
         for offset in (0 ..< 30).reversed() {
             let date = calendar.date(byAdding: .day, value: -offset, to: now) ?? now
             let wave = Int64((29 - offset) % 7)
@@ -270,6 +314,7 @@ struct DemoActivityProvider: ActivityProviding {
             let primaryModel = tokens.scaled(numerator: 2, denominator: 3)
             let secondaryModel = tokens.subtracting(primaryModel)
             let dayCost = Double(tokens.total) / 1_000_000 * 4.2
+            let dayAverageTPS = 24.5 + Double(wave) * 1.2
             let dayRequestCount = 12 + Int(wave)
             let daySessionCount = 4 + Int(wave % 3)
             let codexRequestCount = 8 + Int(wave / 2)
@@ -321,6 +366,11 @@ struct DemoActivityProvider: ActivityProviding {
                     "date": formatter.string(from: date),
                     "tokens": platformTokens.object,
                     "costUsd": platformCost,
+                    "averageGenerationTokensPerSecond": platform == .codex
+                        ? dayAverageTPS + 3
+                        : dayAverageTPS - 3,
+                    "averageTimeToFirstTokenMs": platform == .codex ? 5_400 : 7_200,
+                    "firstTokenSampleCount": platformRequestCount,
                     "requestCount": platformRequestCount,
                     "sessionCount": platformSessionCount,
                     "models": [[
@@ -338,6 +388,9 @@ struct DemoActivityProvider: ActivityProviding {
                 "date": formatter.string(from: date),
                 "tokens": tokens.object,
                 "costUsd": dayCost,
+                "averageGenerationTokensPerSecond": dayAverageTPS,
+                "averageTimeToFirstTokenMs": 6_300,
+                "firstTokenSampleCount": dayRequestCount,
                 "requestCount": dayRequestCount,
                 "sessionCount": daySessionCount,
                 "models": [
@@ -364,13 +417,14 @@ struct DemoActivityProvider: ActivityProviding {
         }
 
         var sources: [[String: Any]] = []
-        for platform in [TokenPlatform.codex, .claude, .grok] {
+        for platform in [TokenPlatform.codex, .claude, .grok, .antigravity] {
             let platformToday = todayByPlatform[platform] ?? DemoTokenCounter()
             let platformRange = rangeByPlatform[platform] ?? DemoTokenCounter()
             let averageTPS = switch platform {
             case .codex: 31.2
             case .claude: 23.4
             case .grok: 28.7
+            case .antigravity: 26.5
             default: 0.0
             }
             var source: [String: Any] = [
@@ -379,6 +433,8 @@ struct DemoActivityProvider: ActivityProviding {
                     "tokens": platformToday.object,
                     "costUsd": Double(platformToday.total) / 1_000_000 * 4.2,
                     "tokenCosts": platformToday.costObject,
+                    "averageTimeToFirstTokenMs": 5_900,
+                    "firstTokenSampleCount": requestCountByPlatform[platform] ?? 0,
                     "requestCount": requestCountByPlatform[platform] ?? 0,
                     "sessionCount": sessionCountByPlatform[platform] ?? 0,
                 ],
@@ -387,6 +443,8 @@ struct DemoActivityProvider: ActivityProviding {
                     "costUsd": Double(platformRange.total) / 1_000_000 * 4.2,
                     "tokenCosts": platformRange.costObject,
                     "averageGenerationTokensPerSecond": averageTPS,
+                    "averageTimeToFirstTokenMs": 6_100,
+                    "firstTokenSampleCount": rangeRequestCountByPlatform[platform] ?? 0,
                     "requestCount": rangeRequestCountByPlatform[platform] ?? 0,
                     "sessionCount": rangeSessionCountByPlatform[platform] ?? 0,
                 ],
@@ -401,6 +459,8 @@ struct DemoActivityProvider: ActivityProviding {
                         "costUsd": Double(weekly.total) / 1_000_000 * 4.2,
                         "tokenCosts": weekly.costObject,
                         "averageGenerationTokensPerSecond": averageTPS,
+                        "averageTimeToFirstTokenMs": 6_100,
+                        "firstTokenSampleCount": weeklyRequestCount[platform] ?? 0,
                         "requestCount": weeklyRequestCount[platform] ?? 0,
                         "sessionCount": weeklySessionCount[platform] ?? 0,
                     ],
@@ -416,13 +476,15 @@ struct DemoActivityProvider: ActivityProviding {
         let memoryHasOtlpConnection = memoryIncludesData
             || demoEnvironment["TOKENBAR_DEMO_MEMORY_WAITING"] == "1"
         let object: [String: Any] = [
-            "schemaVersion": 9,
+            "schemaVersion": 11,
             "generatedAtMs": nowMs,
             "timezone": TimeZone.current.identifier,
             "today": [
                 "tokens": today.object,
                 "costUsd": Double(today.total) / 1_000_000 * 4.2,
                 "tokenCosts": today.costObject,
+                "averageTimeToFirstTokenMs": 5_900,
+                "firstTokenSampleCount": requestCount,
                 "requestCount": requestCount,
                 "sessionCount": sessions.count,
             ],
@@ -431,6 +493,8 @@ struct DemoActivityProvider: ActivityProviding {
                 "costUsd": Double(range.total) / 1_000_000 * 4.2,
                 "tokenCosts": range.costObject,
                 "averageGenerationTokensPerSecond": 27.3,
+                "averageTimeToFirstTokenMs": 6_300,
+                "firstTokenSampleCount": rangeRequestCount,
                 "requestCount": rangeRequestCount,
                 "sessionCount": rangeSessionCount,
             ],
@@ -634,20 +698,27 @@ enum DemoPreviewRenderer {
         }
         let showsClaude = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_CLAUDE"] != "0"
         let showsGrok = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_GROK"] != "0"
+        let showsAntigravity = ProcessInfo.processInfo
+            .environment["TOKENBAR_DEMO_SHOWS_ANTIGRAVITY"] != "0"
         let visibleScopes = DashboardScope.visibleScopes(
             showsClaude: showsClaude,
-            showsGrok: showsGrok)
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
         if !visibleScopes.contains(model.scope) {
             model.scope = .codex
         }
         let height = DashboardSummaryView.preferredHeight(
             quota: model.quotaState(for: model.scope.platform).value,
+            providesQuota: model.providesQuota(for: model.scope.platform),
             showsClaude: showsClaude,
-            showsGrok: showsGrok)
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
         let content = DashboardSummaryView(
             model: model,
             showsClaude: showsClaude,
             showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity,
+            usesWeekdayWeeklyPacing: false,
             accentColor: .purple)
             .frame(width: 384, height: height, alignment: .top)
             .background(Color.white)
@@ -680,7 +751,7 @@ enum DemoPreviewRenderer {
                 height: TokenMenuRowView.rowHeight * CGFloat(rowCount)))
         let sessionRow = TokenMenuRowView(width: width)
         sessionRow.configure(
-            title: session.menuTitle,
+            title: session.menuDisplayTitle,
             cost: session.menuCostText,
             detail: session.menuDetail,
             trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
@@ -735,7 +806,10 @@ enum DemoPreviewRenderer {
     }
 
     static func renderActivityDetail(model: DashboardModel, path: String) throws {
-        let content = ActivityDetailView(model: model, accentColor: .purple)
+        let content = ActivityDetailView(
+            model: model,
+            usesWeekdayWeeklyPacing: false,
+            accentColor: .purple)
             .frame(
                 width: ActivityDetailView.preferredWidth,
                 height: ActivityDetailView.preferredHeight)
@@ -833,8 +907,10 @@ enum DemoPreviewRenderer {
         let activitySync = ActivitySyncController(
             settings: .shared,
             credentials: DemoActivitySyncCredentialStore())
+        let loginItem = LoginItemController(service: DemoLoginItemService())
         let content = TokenBarSettingsView(
             settings: .shared,
+            loginItem: loginItem,
             activitySync: activitySync)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .light)
@@ -931,5 +1007,20 @@ private extension Date {
         let components = Calendar.current.dateComponents([.hour, .minute], from: self)
         return String(format: "%02d:%02d", components.hour ?? 0, components.minute ?? 0)
     }
+}
+
+@MainActor
+private final class DemoLoginItemService: LoginItemServicing {
+    var status = LoginItemServiceStatus.notRegistered
+
+    func register() {
+        self.status = .enabled
+    }
+
+    func unregister() {
+        self.status = .notRegistered
+    }
+
+    func openSystemSettings() {}
 }
 #endif

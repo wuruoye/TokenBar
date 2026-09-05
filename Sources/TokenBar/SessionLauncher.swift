@@ -6,11 +6,14 @@ enum SessionLauncherError: LocalizedError {
     case invalidSessionID
     case unsupportedPlatform(TokenPlatform)
     case applicationUnavailable(TokenPlatform)
+    case workspaceUnavailable(TokenPlatform)
 
     var errorDescription: String? {
         switch self {
         case .invalidSessionID:
             "The session does not have a valid identifier."
+        case let .workspaceUnavailable(platform):
+            "This \(platform.displayName) session did not record a workspace folder to open."
         case let .unsupportedPlatform(platform):
             "Opening \(platform.displayName) sessions is not supported."
         case let .applicationUnavailable(platform):
@@ -24,6 +27,7 @@ struct SessionLauncher {
     private let openURL: (URL) -> Bool
     private let resolveClaudeDesktopSessionID: (String) -> String?
     private let launchGrokSession: (SessionSummary) -> Bool
+    private let launchAntigravityWorkspace: (String) -> Bool
 
     init(
         openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
@@ -32,17 +36,35 @@ struct SessionLauncher {
         },
         launchGrokSession: @escaping (SessionSummary) -> Bool = {
             GrokTerminalSessionLauncher().open($0)
+        },
+        launchAntigravityWorkspace: @escaping (String) -> Bool = {
+            AntigravityWorkspaceLauncher().open(workspacePath: $0)
         })
     {
         self.openURL = openURL
         self.resolveClaudeDesktopSessionID = resolveClaudeDesktopSessionID
         self.launchGrokSession = launchGrokSession
+        self.launchAntigravityWorkspace = launchAntigravityWorkspace
     }
 
     func open(_ session: SessionSummary) throws {
         if session.platformID == .grok {
             guard self.launchGrokSession(session) else {
                 throw SessionLauncherError.applicationUnavailable(.grok)
+            }
+            return
+        }
+        // Antigravity exposes no per-conversation deep link, so reopen the
+        // workspace the conversation was recorded against.
+        if session.platformID == .antigravity {
+            guard let workspacePath = session.workspacePath?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !workspacePath.isEmpty
+            else {
+                throw SessionLauncherError.workspaceUnavailable(.antigravity)
+            }
+            guard self.launchAntigravityWorkspace(workspacePath) else {
+                throw SessionLauncherError.applicationUnavailable(.antigravity)
             }
             return
         }
@@ -289,5 +311,33 @@ struct ClaudeDesktopSessionResolver {
         return base
             .appendingPathComponent("Claude", isDirectory: true)
             .appendingPathComponent("claude-code-sessions", isDirectory: true)
+    }
+}
+
+@MainActor
+private struct AntigravityWorkspaceLauncher {
+    private let bundleIdentifier = "com.google.antigravity"
+
+    func open(workspacePath: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: workspacePath,
+            isDirectory: &isDirectory)
+        else {
+            return false
+        }
+        guard let application = NSWorkspace.shared
+            .urlForApplication(withBundleIdentifier: self.bundleIdentifier)
+        else {
+            return false
+        }
+        let target = URL(
+            fileURLWithPath: workspacePath,
+            isDirectory: isDirectory.boolValue)
+        NSWorkspace.shared.open(
+            [target],
+            withApplicationAt: application,
+            configuration: NSWorkspace.OpenConfiguration())
+        return true
     }
 }

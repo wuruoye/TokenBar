@@ -1,17 +1,18 @@
-use crate::openrouter::Catalog;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::openrouter::Catalog;
+
 use chrono::{Local, NaiveDate};
 
-use crate::usage::{CacheWriteBreakdown, ServiceTier, TokenBreakdown, TokenCostBreakdown};
+use crate::usage::{
+    CacheWriteBreakdown, ServiceTier, TokenBreakdown, TokenCostBreakdown,
+};
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 const LONG_CONTEXT_INPUT_THRESHOLD: i64 = 272_000;
-const LONG_CONTEXT_INPUT_MULTIPLIER: f64 = 2.0;
-const LONG_CONTEXT_OUTPUT_MULTIPLIER: f64 = 1.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ModelRate {
@@ -19,7 +20,16 @@ struct ModelRate {
     cached_input_per_million: f64,
     output_per_million: f64,
     cache_write_per_million: Option<f64>,
-    long_context_pricing: bool,
+    long_context: Option<LongContextRate>,
+    long_context_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LongContextRate {
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+    cache_write_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,25 +44,23 @@ struct AnthropicModelRate {
 /// TokenBar's bundled Codex pricing catalog.
 ///
 /// Rates are standard API text-token prices in USD per million tokens, last
-/// reviewed 2026-09-05 against the official OpenAI model pages. A validated
-/// OpenRouter catalog supplies current token quotes when available; bundled
-/// official rates remain the offline fallback. A model without a rate returns
-/// `None`; callers must keep
-/// that request's cost source unknown instead of presenting a fabricated $0.
+/// reviewed 2026-09-05 against OpenAI's official pricing table. TokenBar can
+/// overlay a strictly validated daily copy of that table. A model without an
+/// official, OpenRouter, or bundled rate returns `None`; callers must keep that request's
+/// cost source unknown instead of presenting a fabricated $0.
 /// These values are compatibility estimates for activity comparison, not an
 /// OpenAI invoice. In particular, the Codex research-preview
 /// `gpt-5.3-codex-spark` id has no public per-token API rate, so it uses
 /// GPT-5.3-Codex's public rate. Recognized OpenAI model ids keep their estimate
 /// even when a local Codex gateway records a custom provider name.
 ///
-/// GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra apply long-context pricing to each request
-/// whose raw input exceeds 272K tokens: 2x for uncached input, cached input,
-/// and cache writes, plus 1.5x for output and reasoning output.
+/// GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra apply their explicit long-context table row
+/// to each request whose raw input exceeds 272K tokens.
 ///
 /// Sources:
 /// - https://developers.openai.com/api/docs/models/gpt-6-astra
-/// - https://developers.openai.com/api/docs/pricing
 /// - https://openrouter.ai/docs/guides/overview/models
+/// - https://developers.openai.com/api/docs/pricing.md
 /// - https://openai.com/index/introducing-gpt-5-3-codex-spark/
 /// - https://developers.openai.com/api/docs/models/codex-mini-latest
 /// - https://developers.openai.com/api/docs/models/gpt-5
@@ -80,19 +88,50 @@ pub enum FastPricingBasis {
 #[derive(Debug, Clone, Default)]
 pub struct CodexPricing {
     fast_pricing_basis: FastPricingBasis,
+    standard_overrides: HashMap<String, ModelRate>,
+    fast_overrides: HashMap<String, ModelRate>,
     openrouter: Option<Arc<Catalog>>,
 }
 
 impl CodexPricing {
-    pub const fn bundled() -> Self {
+    pub fn bundled() -> Self {
         Self::with_fast_pricing(FastPricingBasis::ApiPriority)
     }
 
-    pub const fn with_fast_pricing(fast_pricing_basis: FastPricingBasis) -> Self {
+    pub fn with_fast_pricing(fast_pricing_basis: FastPricingBasis) -> Self {
         Self {
             fast_pricing_basis,
+            standard_overrides: HashMap::new(),
+            fast_overrides: HashMap::new(),
             openrouter: None,
         }
+    }
+
+    pub fn from_official_markdown(
+        markdown: &str,
+        fast_pricing_basis: FastPricingBasis,
+    ) -> Result<Self, String> {
+        let (standard_overrides, fast_overrides) = parse_official_openai_rates(markdown)?;
+        Ok(Self {
+            fast_pricing_basis,
+            standard_overrides,
+            fast_overrides,
+            openrouter: None,
+        })
+    }
+
+    pub fn from_official_markdown_file(
+        path: &Path,
+        fast_pricing_basis: FastPricingBasis,
+    ) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("could not inspect OpenAI pricing catalog: {error}"))?;
+        if metadata.len() < 1_024 || metadata.len() > 2_000_000 {
+            return Err("OpenAI pricing catalog has an invalid size".to_string());
+        }
+        let markdown = fs::read_to_string(path)
+            .map_err(|error| format!("could not read OpenAI pricing catalog: {error}"))?;
+        Self::from_official_markdown(&markdown, fast_pricing_basis)
     }
 
     pub fn with_openrouter_catalog(mut self, catalog: Option<Arc<Catalog>>) -> Self {
@@ -116,58 +155,30 @@ impl CodexPricing {
         _provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> Option<TokenCostBreakdown> {
-        let bundled = rate_for_model(model_id);
-        if let Some(costs) = self.openrouter.as_ref().and_then(|catalog| {
-            catalog.costs(
-                "openai",
-                model_id,
-                usage,
-                None,
-                bundled.is_some_and(|r| r.long_context_pricing),
-            )
-        }) {
-            return Some(costs);
+        // Explicit official tables retain priority; automatic quotes cover other models.
+        if !self.standard_overrides.contains_key(&normalize_pricing_model_id(model_id)) {
+            let known_long_context = bundled_rate_for_model(model_id)
+                .is_some_and(|rate| rate.long_context.is_some());
+            if let Some(costs) = self.openrouter.as_ref().and_then(|catalog|
+                catalog.costs("openai", model_id, usage, None, known_long_context)) {
+                return Some(costs);
+            }
         }
-        let rate = bundled?;
-        if usage.cache_write > 0 && rate.cache_write_per_million.is_none() {
-            return None;
-        }
+        let rate = self.rate_for_model(model_id)?;
+        calculate_token_costs(rate, usage)
+    }
 
-        let raw_input_tokens = usage
-            .input
-            .max(0)
-            .saturating_add(usage.cache_read.max(0))
-            .saturating_add(usage.cache_write.max(0));
-        let long_context =
-            rate.long_context_pricing && raw_input_tokens > LONG_CONTEXT_INPUT_THRESHOLD;
-        let input_multiplier = if long_context {
-            LONG_CONTEXT_INPUT_MULTIPLIER
-        } else {
-            1.0
-        };
-        let output_multiplier = if long_context {
-            LONG_CONTEXT_OUTPUT_MULTIPLIER
-        } else {
-            1.0
-        };
+    fn rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
+        let normalized = normalize_pricing_model_id(model_id);
+        self.standard_overrides
+            .get(&normalized)
+            .copied()
+            .or_else(|| bundled_rate_for_model(&normalized))
+    }
 
-        let costs = TokenCostBreakdown {
-            input: usage.input.max(0) as f64 * rate.input_per_million * input_multiplier
-                / TOKENS_PER_MILLION,
-            output: usage.output.max(0) as f64 * rate.output_per_million * output_multiplier
-                / TOKENS_PER_MILLION,
-            cache_read: usage.cache_read.max(0) as f64
-                * rate.cached_input_per_million
-                * input_multiplier
-                / TOKENS_PER_MILLION,
-            cache_write: usage.cache_write.max(0) as f64
-                * rate.cache_write_per_million.unwrap_or_default()
-                * input_multiplier
-                / TOKENS_PER_MILLION,
-            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million * output_multiplier
-                / TOKENS_PER_MILLION,
-        };
-        costs.total().is_finite().then_some(costs)
+    fn fast_rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
+        let normalized = normalize_pricing_model_id(model_id);
+        self.fast_overrides.get(&normalized).copied()
     }
 
     /// Applies the Fast multiplier for the active Codex login type to the
@@ -181,8 +192,13 @@ impl CodexPricing {
         usage: &TokenBreakdown,
         service_tier: ServiceTier,
     ) -> Option<f64> {
-        self.calculate_token_costs_with_service_tier(model_id, provider_id, usage, service_tier)
-            .map(|costs| costs.total())
+        self.calculate_token_costs_with_service_tier(
+            model_id,
+            provider_id,
+            usage,
+            service_tier,
+        )
+        .map(|costs| costs.total())
     }
 
     pub fn calculate_token_costs_with_service_tier(
@@ -192,6 +208,14 @@ impl CodexPricing {
         usage: &TokenBreakdown,
         service_tier: ServiceTier,
     ) -> Option<TokenCostBreakdown> {
+        if service_tier == ServiceTier::Fast
+            && self.fast_pricing_basis == FastPricingBasis::ApiPriority
+        {
+            if let Some(rate) = self.fast_rate_for_model(model_id) {
+                return calculate_token_costs(rate, usage);
+            }
+        }
+
         let base = self.calculate_token_costs_with_provider(model_id, provider_id, usage)?;
         let multiplier = if service_tier == ServiceTier::Fast {
             fast_cost_multiplier(model_id, self.fast_pricing_basis).unwrap_or(1.0)
@@ -200,6 +224,244 @@ impl CodexPricing {
         };
         base.scaled(multiplier)
     }
+}
+
+fn calculate_token_costs(
+    rate: ModelRate,
+    usage: &TokenBreakdown,
+) -> Option<TokenCostBreakdown> {
+    let raw_input_tokens = usage
+        .input
+        .max(0)
+        .saturating_add(usage.cache_read.max(0))
+        .saturating_add(usage.cache_write.max(0));
+    let effective_rate = if raw_input_tokens > LONG_CONTEXT_INPUT_THRESHOLD {
+        match rate.long_context {
+            Some(long_context) => long_context,
+            None if rate.long_context_available => short_context_rate(rate),
+            None => return None,
+        }
+    } else {
+        short_context_rate(rate)
+    };
+    if usage.cache_write > 0 && effective_rate.cache_write_per_million.is_none() {
+        return None;
+    }
+
+    let costs = TokenCostBreakdown {
+        input: usage.input.max(0) as f64 * effective_rate.input_per_million
+            / TOKENS_PER_MILLION,
+        output: usage.output.max(0) as f64 * effective_rate.output_per_million
+            / TOKENS_PER_MILLION,
+        cache_read: usage.cache_read.max(0) as f64
+            * effective_rate.cached_input_per_million
+            / TOKENS_PER_MILLION,
+        cache_write: usage.cache_write.max(0) as f64
+            * effective_rate.cache_write_per_million.unwrap_or_default()
+            / TOKENS_PER_MILLION,
+        reasoning: usage.reasoning.max(0) as f64 * effective_rate.output_per_million
+            / TOKENS_PER_MILLION,
+    };
+    costs.total().is_finite().then_some(costs)
+}
+
+fn short_context_rate(rate: ModelRate) -> LongContextRate {
+    LongContextRate {
+        input_per_million: rate.input_per_million,
+        cached_input_per_million: rate.cached_input_per_million,
+        output_per_million: rate.output_per_million,
+        cache_write_per_million: rate.cache_write_per_million,
+    }
+}
+
+type OpenAiRateTables = (HashMap<String, ModelRate>, HashMap<String, ModelRate>);
+
+fn parse_official_openai_rates(
+    markdown: &str,
+) -> Result<OpenAiRateTables, String> {
+    if !markdown.lines().any(|line| line.trim() == "# Pricing") {
+        return Err("official OpenAI pricing title was not found".to_string());
+    }
+
+    let mut standard = parse_openai_rate_table(markdown, "### Standard pricing data")?;
+    let mut fast = parse_openai_rate_table(markdown, "### Fast pricing data")?;
+    for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        if !standard.contains_key(model) || !fast.contains_key(model) {
+            return Err(format!("official OpenAI pricing is missing {model}"));
+        }
+    }
+    if standard.len() < 8 || fast.len() < 8 {
+        return Err("official OpenAI pricing contained too few valid models".to_string());
+    }
+
+    if let Some(rate) = standard.get("gpt-5.6-sol").copied() {
+        standard.insert("gpt-5.6".to_string(), rate);
+    }
+    if let Some(rate) = fast.get("gpt-5.6-sol").copied() {
+        fast.insert("gpt-5.6".to_string(), rate);
+    }
+    Ok((standard, fast))
+}
+
+fn parse_openai_rate_table(
+    markdown: &str,
+    heading: &str,
+) -> Result<HashMap<String, ModelRate>, String> {
+    const EXPECTED_HEADER: [&str; 9] = [
+        "Model",
+        "Short context input",
+        "Short context cached input",
+        "Short context cache writes",
+        "Short context output",
+        "Long context input",
+        "Long context cached input",
+        "Long context cache writes",
+        "Long context output",
+    ];
+
+    let mut lines = markdown.lines();
+    if !lines.any(|line| line.trim() == heading) {
+        return Err(format!("official OpenAI pricing section was not found: {heading}"));
+    }
+    let header = lines
+        .find(|line| line.trim_start().starts_with("| Model |"))
+        .ok_or_else(|| format!("official OpenAI pricing header was not found: {heading}"))?;
+    let header_cells = markdown_table_cells(header);
+    if header_cells.as_slice() != EXPECTED_HEADER {
+        return Err(format!("official OpenAI pricing has an unexpected schema: {heading}"));
+    }
+    let separator = lines
+        .next()
+        .ok_or_else(|| format!("official OpenAI pricing separator was not found: {heading}"))?;
+    if markdown_table_cells(separator).len() != EXPECTED_HEADER.len() {
+        return Err(format!("official OpenAI pricing separator is invalid: {heading}"));
+    }
+
+    let mut rates = HashMap::new();
+    for line in lines {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        let cells = markdown_table_cells(line);
+        if cells.len() != EXPECTED_HEADER.len() {
+            return Err(format!("official OpenAI pricing row is invalid: {heading}"));
+        }
+        if let Some((model, rate)) = openai_rate_from_cells(&cells)? {
+            rates.insert(model, rate);
+        }
+    }
+    Ok(rates)
+}
+
+fn openai_rate_from_cells(cells: &[&str]) -> Result<Option<(String, ModelRate)>, String> {
+    let Some(raw_model) = cells.first().copied() else {
+        return Err("official OpenAI pricing row has no model".to_string());
+    };
+    let model = raw_model
+        .split_once(" (")
+        .map(|(model, _)| model)
+        .unwrap_or(raw_model)
+        .trim()
+        .to_ascii_lowercase();
+    if !model.starts_with("gpt-") && !model.starts_with("codex-") {
+        return Ok(None);
+    }
+    if !model
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    {
+        return Err(format!("official OpenAI pricing model is invalid: {raw_model}"));
+    }
+
+    let Some(input_per_million) = parse_openai_price_cell(cells[1])? else {
+        return Ok(None);
+    };
+    let Some(cached_input_per_million) = parse_openai_price_cell(cells[2])? else {
+        return Ok(None);
+    };
+    let cache_write_per_million = parse_openai_price_cell(cells[3])?;
+    let Some(output_per_million) = parse_openai_price_cell(cells[4])? else {
+        return Ok(None);
+    };
+
+    let long_input = parse_openai_price_cell(cells[5])?;
+    let long_cached = parse_openai_price_cell(cells[6])?;
+    let long_cache_write = parse_openai_price_cell(cells[7])?;
+    let long_output = parse_openai_price_cell(cells[8])?;
+    let long_context = match (long_input, long_cached, long_output) {
+        (Some(input), Some(cached), Some(output)) => Some(LongContextRate {
+            input_per_million: input,
+            cached_input_per_million: cached,
+            output_per_million: output,
+            cache_write_per_million: long_cache_write,
+        }),
+        (None, None, None) if long_cache_write.is_none() => None,
+        _ => {
+            return Err(format!(
+                "official OpenAI long-context pricing is incomplete: {raw_model}"
+            ));
+        }
+    };
+    let rate = ModelRate {
+        input_per_million,
+        cached_input_per_million,
+        output_per_million,
+        cache_write_per_million,
+        long_context,
+        long_context_available: long_context.is_some()
+            || !raw_model.contains("(<272K context length)"),
+    };
+    if !valid_openai_rate(rate) {
+        return Err(format!("official OpenAI pricing row is invalid: {raw_model}"));
+    }
+    Ok(Some((model, rate)))
+}
+
+fn parse_openai_price_cell(value: &str) -> Result<Option<f64>, String> {
+    let value = value.trim();
+    if value == "-" {
+        return Ok(None);
+    }
+    let price = value
+        .strip_prefix('$')
+        .and_then(|number| number.replace(',', "").parse::<f64>().ok())
+        .filter(|price| price.is_finite() && *price > 0.0 && *price <= 1_000.0)
+        .ok_or_else(|| format!("official OpenAI price is invalid: {value}"))?;
+    Ok(Some(price))
+}
+
+fn valid_openai_rate(rate: ModelRate) -> bool {
+    let short = short_context_rate(rate);
+    valid_openai_context_rate(short)
+        && rate.long_context.is_none_or(|long| {
+            valid_openai_context_rate(long)
+                && long.input_per_million >= short.input_per_million
+                && long.cached_input_per_million >= short.cached_input_per_million
+                && long.output_per_million >= short.output_per_million
+                && match (
+                    short.cache_write_per_million,
+                    long.cache_write_per_million,
+                ) {
+                    (None, None) => true,
+                    (Some(short), Some(long)) => long >= short,
+                    _ => false,
+                }
+        })
+}
+
+fn valid_openai_context_rate(rate: LongContextRate) -> bool {
+    rate.input_per_million.is_finite()
+        && rate.cached_input_per_million.is_finite()
+        && rate.output_per_million.is_finite()
+        && rate.input_per_million > 0.0
+        && rate.input_per_million <= 1_000.0
+        && rate.cached_input_per_million > 0.0
+        && rate.cached_input_per_million <= rate.input_per_million
+        && rate.output_per_million >= rate.input_per_million
+        && rate.output_per_million <= 1_000.0
+        && rate.cache_write_per_million.is_none_or(|price| {
+            price.is_finite() && price >= rate.input_per_million && price <= 1_000.0
+        })
 }
 
 /// Anthropic pricing used for Claude Code compatibility estimates.
@@ -271,12 +533,11 @@ impl AnthropicPricing {
         usage: &TokenBreakdown,
         cache_writes: Option<&CacheWriteBreakdown>,
     ) -> Option<TokenCostBreakdown> {
-        if let Some(costs) = self
-            .openrouter
-            .as_ref()
-            .and_then(|catalog| catalog.costs("anthropic", model_id, usage, cache_writes, false))
-        {
-            return Some(costs);
+        if !self.official_rates.contains_key(&normalize_anthropic_model_id(model_id)) {
+            if let Some(costs) = self.openrouter.as_ref().and_then(|catalog|
+                catalog.costs("anthropic", model_id, usage, cache_writes, false)) {
+                return Some(costs);
+            }
         }
         let rate = self.rate_for_model(model_id)?;
         let cache_write = anthropic_cache_write_cost(usage.cache_write, cache_writes, rate);
@@ -286,7 +547,8 @@ impl AnthropicPricing {
             cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
                 / TOKENS_PER_MILLION,
             cache_write,
-            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                / TOKENS_PER_MILLION,
         };
         costs.total().is_finite().then_some(costs)
     }
@@ -304,16 +566,23 @@ fn bundled_anthropic_rate(
     normalized_model_id: &str,
     effective_date: NaiveDate,
 ) -> Option<AnthropicModelRate> {
-    let (input, cache_write_5m, cache_write_1h, cache_read, output) = match normalized_model_id {
+    let (input, cache_write_5m, cache_write_1h, cache_read, output) =
+        match normalized_model_id {
         "claude-fable-5" | "claude-mythos-5" => (10.0, 12.5, 20.0, 1.0, 50.0),
-        "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7"
-        | "claude-opus-4-8" => (5.0, 6.25, 10.0, 0.5, 25.0),
-        "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => (15.0, 18.75, 30.0, 1.5, 75.0),
-        "claude-sonnet-5" if effective_date <= NaiveDate::from_ymd_opt(2026, 8, 31).unwrap() => {
+        "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6"
+        | "claude-opus-4-7" | "claude-opus-4-8" => (5.0, 6.25, 10.0, 0.5, 25.0),
+        "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => {
+            (15.0, 18.75, 30.0, 1.5, 75.0)
+        }
+        "claude-sonnet-5"
+            if effective_date <= NaiveDate::from_ymd_opt(2026, 8, 31).unwrap() =>
+        {
             (2.0, 2.5, 4.0, 0.2, 10.0)
         }
-        "claude-sonnet-5" | "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6"
-        | "claude-3-7-sonnet" | "claude-3-5-sonnet" => (3.0, 3.75, 6.0, 0.3, 15.0),
+        "claude-sonnet-5" | "claude-sonnet-4" | "claude-sonnet-4-5"
+        | "claude-sonnet-4-6" | "claude-3-7-sonnet" | "claude-3-5-sonnet" => {
+            (3.0, 3.75, 6.0, 0.3, 15.0)
+        }
         "claude-haiku-4-5" | "claude-haiku-4-6" => (1.0, 1.25, 2.0, 0.1, 5.0),
         "claude-3-5-haiku" => (0.8, 1.0, 1.6, 0.08, 4.0),
         "claude-3-haiku" => (0.25, 0.3, 0.5, 0.03, 1.25),
@@ -343,7 +612,8 @@ fn anthropic_cache_write_cost(
         .unwrap_or(0);
     let unclassified = remaining.saturating_sub(five_minute);
     (one_hour as f64 * rate.cache_write_1h_per_million
-        + five_minute.saturating_add(unclassified) as f64 * rate.cache_write_5m_per_million)
+        + five_minute.saturating_add(unclassified) as f64
+            * rate.cache_write_5m_per_million)
         / TOKENS_PER_MILLION
 }
 
@@ -353,12 +623,14 @@ fn parse_official_anthropic_rates(
 ) -> Result<HashMap<String, AnthropicModelRate>, String> {
     let mut lines = markdown.lines();
     let Some(header) = lines.find(|line| {
-        line.trim_start().starts_with("| Model")
-            && line.contains("Base Input Tokens")
-            && line.contains("5m Cache Writes")
-            && line.contains("1h Cache Writes")
-            && line.contains("Cache Hits & Refreshes")
-            && line.contains("Output Tokens")
+        let header = line.trim_start().to_ascii_lowercase();
+        header.starts_with("| model")
+            && header.contains("base input tokens")
+            && header.contains("5m cache writes")
+            && header.contains("1h cache writes")
+            && (header.contains("cache hits and refreshes")
+                || header.contains("cache hits & refreshes"))
+            && header.contains("output tokens")
     }) else {
         return Err("official Anthropic pricing table header was not found".to_string());
     };
@@ -390,9 +662,7 @@ fn parse_official_anthropic_rates(
             continue;
         };
         let Some(rate) = official_rate_from_cells(&cells) else {
-            return Err(format!(
-                "official Anthropic pricing row is invalid: {label}"
-            ));
+            return Err(format!("official Anthropic pricing row is invalid: {label}"));
         };
         rates.insert(model_id, rate);
     }
@@ -417,15 +687,12 @@ fn official_model_id(label: &str) -> Option<String> {
         return None;
     }
     let family = words.next()?.to_ascii_lowercase();
-    if !matches!(
-        family.as_str(),
-        "fable" | "mythos" | "opus" | "sonnet" | "haiku"
-    ) {
+    if !matches!(family.as_str(), "fable" | "mythos" | "opus" | "sonnet" | "haiku") {
         return None;
     }
-    let version = words
-        .next()?
-        .trim_matches(|character: char| !character.is_ascii_digit() && character != '.');
+    let version = words.next()?.trim_matches(|character: char| {
+        !character.is_ascii_digit() && character != '.'
+    });
     if version.is_empty()
         || !version
             .chars()
@@ -475,10 +742,15 @@ fn official_rate_from_cells(cells: &[&str]) -> Option<AnthropicModelRate> {
 
 fn parse_usd_per_mtok(value: &str) -> Option<f64> {
     let value = value.trim();
-    if !value.ends_with("/ MTok") {
+    let (price, footnote) = value.split_once("/ MTok")?;
+    if !footnote.chars().all(|character| {
+        character.is_ascii_digit()
+            || matches!(character, '^' | '{' | '}' | '[' | ']')
+            || matches!(character, '¹' | '²' | '³')
+    }) {
         return None;
     }
-    let number = value.strip_prefix('$')?.split_whitespace().next()?;
+    let number = price.trim().strip_prefix('$')?.trim();
     let price = number.replace(',', "").parse::<f64>().ok()?;
     (price.is_finite() && price > 0.0 && price <= 1_000.0).then_some(price)
 }
@@ -513,6 +785,8 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
     }
 
     for (alias, canonical) in [
+        ("claude-5-1-fable", "claude-fable-5-1"),
+        ("claude-5-1-mythos", "claude-mythos-5-1"),
         ("claude-5-fable", "claude-fable-5"),
         ("claude-5-mythos", "claude-mythos-5"),
         ("claude-5-opus", "claude-opus-5"),
@@ -525,6 +799,8 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
         ("claude-4-5-sonnet", "claude-sonnet-4-5"),
         ("claude-4-6-haiku", "claude-haiku-4-6"),
         ("claude-4-5-haiku", "claude-haiku-4-5"),
+        ("fable-5-1", "claude-fable-5-1"),
+        ("mythos-5-1", "claude-mythos-5-1"),
         ("fable-5", "claude-fable-5"),
         ("mythos-5", "claude-mythos-5"),
         ("opus-5", "claude-opus-5"),
@@ -568,7 +844,7 @@ fn fast_cost_multiplier(model_id: &str, basis: FastPricingBasis) -> Option<f64> 
     }
 }
 
-fn rate_for_model(model_id: &str) -> Option<ModelRate> {
+fn bundled_rate_for_model(model_id: &str) -> Option<ModelRate> {
     let normalized = normalize_pricing_model_id(model_id);
     match normalized.as_str() {
         "gpt-6-astra" => Some(ModelRate {
@@ -576,14 +852,21 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
             cached_input_per_million: 1.0,
             output_per_million: 50.0,
             cache_write_per_million: Some(12.5),
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 20.0,
+                cached_input_per_million: 2.0,
+                output_per_million: 75.0,
+                cache_write_per_million: Some(25.0),
+            }),
+            long_context_available: true,
         }),
         "codex-mini-latest" => Some(ModelRate {
             input_per_million: 1.5,
             cached_input_per_million: 0.375,
             output_per_million: 6.0,
             cache_write_per_million: None,
-            long_context_pricing: false,
+            long_context: None,
+            long_context_available: true,
         }),
         "gpt-5" | "gpt-5-codex" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.1-codex-max" => {
             Some(ModelRate {
@@ -591,7 +874,8 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
                 cached_input_per_million: 0.125,
                 output_per_million: 10.0,
                 cache_write_per_million: None,
-                long_context_pricing: false,
+                long_context: None,
+                long_context_available: true,
             })
         }
         "gpt-5-mini" | "gpt-5.1-codex-mini" => Some(ModelRate {
@@ -599,56 +883,89 @@ fn rate_for_model(model_id: &str) -> Option<ModelRate> {
             cached_input_per_million: 0.025,
             output_per_million: 2.0,
             cache_write_per_million: None,
-            long_context_pricing: false,
+            long_context: None,
+            long_context_available: true,
         }),
         "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" | "gpt-5.3-codex-spark" => Some(ModelRate {
             input_per_million: 1.75,
             cached_input_per_million: 0.175,
             output_per_million: 14.0,
             cache_write_per_million: None,
-            long_context_pricing: false,
+            long_context: None,
+            long_context_available: true,
         }),
         "gpt-5.4" => Some(ModelRate {
             input_per_million: 2.5,
             cached_input_per_million: 0.25,
             output_per_million: 15.0,
             cache_write_per_million: None,
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 5.0,
+                cached_input_per_million: 0.5,
+                output_per_million: 22.5,
+                cache_write_per_million: None,
+            }),
+            long_context_available: true,
         }),
         "gpt-5.4-mini" => Some(ModelRate {
             input_per_million: 0.75,
             cached_input_per_million: 0.075,
             output_per_million: 4.5,
             cache_write_per_million: None,
-            long_context_pricing: false,
+            long_context: None,
+            long_context_available: true,
         }),
         "gpt-5.5" => Some(ModelRate {
             input_per_million: 5.0,
             cached_input_per_million: 0.5,
             output_per_million: 30.0,
             cache_write_per_million: None,
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 10.0,
+                cached_input_per_million: 1.0,
+                output_per_million: 45.0,
+                cache_write_per_million: None,
+            }),
+            long_context_available: true,
         }),
         "gpt-5.6" | "gpt-5.6-sol" => Some(ModelRate {
             input_per_million: 4.0,
             cached_input_per_million: 0.4,
             output_per_million: 20.0,
             cache_write_per_million: Some(5.0),
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 8.0,
+                cached_input_per_million: 0.8,
+                output_per_million: 30.0,
+                cache_write_per_million: Some(10.0),
+            }),
+            long_context_available: true,
         }),
         "gpt-5.6-terra" => Some(ModelRate {
             input_per_million: 2.0,
             cached_input_per_million: 0.2,
             output_per_million: 12.0,
             cache_write_per_million: Some(2.5),
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 4.0,
+                cached_input_per_million: 0.4,
+                output_per_million: 18.0,
+                cache_write_per_million: Some(5.0),
+            }),
+            long_context_available: true,
         }),
         "gpt-5.6-luna" => Some(ModelRate {
             input_per_million: 0.2,
             cached_input_per_million: 0.02,
             output_per_million: 1.2,
             cache_write_per_million: Some(0.25),
-            long_context_pricing: true,
+            long_context: Some(LongContextRate {
+                input_per_million: 0.4,
+                cached_input_per_million: 0.04,
+                output_per_million: 1.8,
+                cache_write_per_million: Some(0.5),
+            }),
+            long_context_available: true,
         }),
         _ => None,
     }
@@ -727,9 +1044,311 @@ fn is_snapshot_of(model_id: &str, base: &str) -> bool {
     compact.len() == 8 && compact.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Google Gemini pricing used for Antigravity estimates.
+///
+/// Google publishes no machine-readable rate table, so TokenBar reads
+/// OpenRouter's public model catalog, which lists the same per-token Gemini
+/// rates as structured JSON including the long-context override. A reviewed
+/// fallback table covers the catalog being unavailable or changing shape.
+/// Rates are standard paid-tier text prices in USD per million tokens. Gemini
+/// bills thinking tokens at the output rate and cached input at the
+/// context-caching rate. Unknown or future model versions stay unpriced instead
+/// of inheriting a nearby model's rate.
+///
+/// Sources:
+/// - https://openrouter.ai/api/v1/models
+/// - https://ai.google.dev/gemini-api/docs/pricing
+#[derive(Debug, Clone)]
+pub struct GooglePricing {
+    effective_date: NaiveDate,
+    catalog_rates: HashMap<String, GoogleRateRow>,
+}
+
+impl Default for GooglePricing {
+    fn default() -> Self {
+        Self::bundled_for_date(Local::now().date_naive())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GoogleModelRate {
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GoogleRateRow {
+    standard: GoogleModelRate,
+    long_context: Option<GoogleModelRate>,
+    long_context_min_prompt_tokens: i64,
+}
+
+/// Gemini Pro switches to a long-context rate above this prompt size. The
+/// catalog carries its own threshold; this is the reviewed fallback.
+const GOOGLE_LONG_CONTEXT_THRESHOLD: i64 = 200_000;
+
+/// Minimum number of priced Gemini models before the catalog is trusted.
+const GOOGLE_MINIMUM_CATALOG_MODELS: usize = 8;
+
+impl GooglePricing {
+    pub fn bundled_for_date(effective_date: NaiveDate) -> Self {
+        Self {
+            effective_date,
+            catalog_rates: HashMap::new(),
+        }
+    }
+
+    pub fn from_openrouter_catalog(
+        json: &str,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            effective_date,
+            catalog_rates: parse_openrouter_gemini_rates(json)?,
+        })
+    }
+
+    pub fn from_openrouter_catalog_file(
+        path: &Path,
+        effective_date: NaiveDate,
+    ) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("could not inspect OpenRouter catalog: {error}"))?;
+        if metadata.len() < 4_096 || metadata.len() > 16_000_000 {
+            return Err("OpenRouter catalog has an invalid size".to_string());
+        }
+        let json = fs::read_to_string(path)
+            .map_err(|error| format!("could not read OpenRouter catalog: {error}"))?;
+        Self::from_openrouter_catalog(&json, effective_date)
+    }
+
+    pub fn calculate_token_costs(
+        &self,
+        model_id: &str,
+        usage: &TokenBreakdown,
+    ) -> Option<TokenCostBreakdown> {
+        let prompt_tokens = usage
+            .input
+            .max(0)
+            .saturating_add(usage.cache_read.max(0))
+            .saturating_add(usage.cache_write.max(0));
+        let row = self.row_for_model(model_id)?;
+        let rate = match row.long_context {
+            Some(long) if prompt_tokens > row.long_context_min_prompt_tokens => long,
+            _ => row.standard,
+        };
+        let costs = TokenCostBreakdown {
+            input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
+            output: usage.output.max(0) as f64 * rate.output_per_million / TOKENS_PER_MILLION,
+            cache_read: usage.cache_read.max(0) as f64 * rate.cached_input_per_million
+                / TOKENS_PER_MILLION,
+            cache_write: usage.cache_write.max(0) as f64 * rate.input_per_million
+                / TOKENS_PER_MILLION,
+            reasoning: usage.reasoning.max(0) as f64 * rate.output_per_million
+                / TOKENS_PER_MILLION,
+        };
+        costs.total().is_finite().then_some(costs)
+    }
+
+    fn row_for_model(&self, model_id: &str) -> Option<GoogleRateRow> {
+        let normalized = normalize_google_model_id(model_id);
+        self.catalog_rates
+            .get(&normalized)
+            .copied()
+            .or_else(|| bundled_google_row(&normalized, self.effective_date))
+    }
+}
+
+/// Reviewed fallback rates, last checked 2026-09-03 against Google's pricing
+/// page. Google publishes the scheduled 2027-01-01 increase alongside the
+/// current price, so both are recorded here and selected by `effective_date`.
+fn bundled_google_row(
+    normalized_model_id: &str,
+    effective_date: NaiveDate,
+) -> Option<GoogleRateRow> {
+    let raised = effective_date >= NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+    let rate = |input: f64, cached_input: f64, output: f64| GoogleModelRate {
+        input_per_million: input,
+        cached_input_per_million: cached_input,
+        output_per_million: output,
+    };
+    let flat = |input: f64, cached_input: f64, output: f64| GoogleRateRow {
+        standard: rate(input, cached_input, output),
+        long_context: None,
+        long_context_min_prompt_tokens: GOOGLE_LONG_CONTEXT_THRESHOLD,
+    };
+    let tiered = |standard: (f64, f64, f64), long: (f64, f64, f64)| GoogleRateRow {
+        standard: rate(standard.0, standard.1, standard.2),
+        long_context: Some(rate(long.0, long.1, long.2)),
+        long_context_min_prompt_tokens: GOOGLE_LONG_CONTEXT_THRESHOLD,
+    };
+    Some(match normalized_model_id {
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" if raised => {
+            flat(1.5, 0.15, 7.5)
+        }
+        "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" => flat(0.75, 0.075, 3.75),
+        "gemini-3.5-flash" => flat(1.5, 0.15, 9.0),
+        "gemini-3.5-flash-lite" => flat(0.3, 0.03, 2.5),
+        "gemini-3.1-flash-lite" => flat(0.25, 0.025, 1.5),
+        "gemini-3.1-pro" => tiered((2.0, 0.2, 12.0), (4.0, 0.4, 18.0)),
+        "gemini-2.5-pro" => tiered((1.25, 0.125, 10.0), (2.5, 0.25, 15.0)),
+        "gemini-2.5-flash" => flat(0.3, 0.03, 2.5),
+        "gemini-2.5-flash-lite" => flat(0.1, 0.01, 0.4),
+        _ => return None,
+    })
+}
+
+fn normalize_google_model_id(model_id: &str) -> String {
+    let mut normalized = model_id.trim().to_ascii_lowercase();
+    for prefix in ["models/", "google/", "gemini/", "vertex_ai/", "vertex/"] {
+        if let Some(model) = normalized.strip_prefix(prefix) {
+            normalized = model.to_string();
+            break;
+        }
+    }
+    if let Some(index) = normalized.find("-preview") {
+        normalized.truncate(index);
+    }
+    for suffix in ["-latest", "-thinking", "-exp"] {
+        if let Some(model) = normalized.strip_suffix(suffix) {
+            normalized = model.to_string();
+        }
+    }
+    normalized
+}
+
+/// Reads the Gemini rows of OpenRouter's model catalog.
+///
+/// Prices are USD per token, and an `overrides` entry carries the long-context
+/// tier. Discounted variants such as `:batch` are ignored so a Gemini request
+/// never inherits a cheaper delivery mode.
+fn parse_openrouter_gemini_rates(
+    json: &str,
+) -> Result<HashMap<String, GoogleRateRow>, String> {
+    let catalog: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("OpenRouter catalog is not valid JSON: {error}"))?;
+    let models = catalog
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("OpenRouter catalog has no model list")?;
+
+    let mut rates: HashMap<String, (usize, GoogleRateRow)> = HashMap::new();
+    for model in models {
+        let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !id.starts_with("google/gemini") || id.contains(':') {
+            continue;
+        }
+        let Some(pricing) = model.get("pricing") else {
+            continue;
+        };
+        let Some(standard) = openrouter_rate(pricing) else {
+            continue;
+        };
+        let override_entry = pricing
+            .get("overrides")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry
+                        .get("min_prompt_tokens")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|threshold| threshold > 0)
+                })
+            });
+        let long_context_min_prompt_tokens = override_entry
+            .and_then(|entry| entry.get("min_prompt_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(GOOGLE_LONG_CONTEXT_THRESHOLD);
+        let long_context = override_entry.and_then(|entry| {
+            Some(GoogleModelRate {
+                input_per_million: openrouter_price(entry.get("prompt"))
+                    .unwrap_or(standard.input_per_million),
+                cached_input_per_million: openrouter_price(entry.get("input_cache_read"))
+                    .unwrap_or(standard.cached_input_per_million),
+                output_per_million: openrouter_price(entry.get("completion"))?,
+            })
+        });
+
+        let key = normalize_google_model_id(id);
+        let row = GoogleRateRow {
+            standard,
+            long_context,
+            long_context_min_prompt_tokens,
+        };
+        // Several catalog ids normalize to one model; keep the plainest one.
+        match rates.get(&key) {
+            Some((length, _)) if *length <= id.len() => {}
+            _ => {
+                rates.insert(key, (id.len(), row));
+            }
+        }
+    }
+
+    if rates.len() < GOOGLE_MINIMUM_CATALOG_MODELS {
+        return Err(format!(
+            "OpenRouter catalog listed only {} priced Gemini models",
+            rates.len()
+        ));
+    }
+    Ok(rates.into_iter().map(|(key, (_, row))| (key, row)).collect())
+}
+
+fn openrouter_rate(pricing: &serde_json::Value) -> Option<GoogleModelRate> {
+    let input = openrouter_price(pricing.get("prompt"))?;
+    let output = openrouter_price(pricing.get("completion"))?;
+    if output <= 0.0 {
+        return None;
+    }
+    Some(GoogleModelRate {
+        input_per_million: input,
+        cached_input_per_million: openrouter_price(pricing.get("input_cache_read"))
+            .unwrap_or(input),
+        output_per_million: output,
+    })
+}
+
+/// OpenRouter quotes USD per token, usually as a string.
+fn openrouter_price(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    let per_token = match value {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+        serde_json::Value::Number(number) => number.as_f64()?,
+        _ => return None,
+    };
+    let per_million = per_token * TOKENS_PER_MILLION;
+    (per_million.is_finite() && per_million >= 0.0).then_some(per_million)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_official_tables_keep_priority_over_automatic_quotes() {
+        let catalog = Arc::new(Catalog::from_json(br#"{"data":[
+            {"id":"openai/gpt-5.6-sol","pricing":{"prompt":"0","completion":"0","input_cache_read":"0","input_cache_write":"0"}},
+            {"id":"openai/gpt-6-astra","pricing":{"prompt":"0.000005","completion":"0.000025"}}
+        ]}"#).unwrap());
+        let usage = TokenBreakdown { input: 100_000, output: 1_000, ..Default::default() };
+        for basis in [FastPricingBasis::ApiPriority, FastPricingBasis::ChatGptSubscription] {
+            let official = CodexPricing::from_official_markdown(official_openai_markdown(), basis).unwrap();
+            let combined = official.clone().with_openrouter_catalog(Some(catalog.clone()));
+            for tier in [ServiceTier::Standard, ServiceTier::Fast] {
+                assert_eq!(
+                    combined.calculate_token_costs_with_service_tier("gpt-5.6-sol", None, &usage, tier),
+                    official.calculate_token_costs_with_service_tier("gpt-5.6-sol", None, &usage, tier),
+                );
+            }
+            // New models absent from the supplied official table still use automatic quotes.
+            let astra = combined.calculate_token_costs_with_provider("gpt-6-astra", None, &usage).unwrap();
+            assert!((astra.total() - 0.525).abs() < 1e-9);
+        }
+    }
+
+
     #[test]
     fn remote_quotes_take_priority_and_incomplete_quotes_fall_back_as_a_whole() {
         let catalog = Catalog::from_json(br#"{"data":[
@@ -869,17 +1488,143 @@ mod tests {
     }
 
     #[test]
+    fn overlays_validated_official_standard_fast_and_long_context_rates() {
+        let pricing = CodexPricing::from_official_markdown(
+            official_openai_markdown(),
+            FastPricingBasis::ApiPriority,
+        )
+        .unwrap();
+        let short_usage = TokenBreakdown {
+            input: 100_000,
+            output: 100_000,
+            cache_read: 100_000,
+            cache_write: 50_000,
+            ..Default::default()
+        };
+
+        let standard = pricing
+            .calculate_token_costs_with_service_tier(
+                "gpt-5.6",
+                Some("openai"),
+                &short_usage,
+                ServiceTier::Standard,
+            )
+            .unwrap();
+        assert!((standard.input - 0.375).abs() < 1e-9);
+        assert!((standard.cache_read - 0.035).abs() < 1e-9);
+        assert!((standard.cache_write - 0.2375).abs() < 1e-9);
+        assert!((standard.output - 1.9).abs() < 1e-9);
+
+        let fast = pricing
+            .calculate_token_costs_with_service_tier(
+                "gpt-5.6-sol",
+                Some("openai"),
+                &short_usage,
+                ServiceTier::Fast,
+            )
+            .unwrap();
+        assert!((fast.input - 0.9).abs() < 1e-9);
+        assert!((fast.cache_read - 0.09).abs() < 1e-9);
+        assert!((fast.cache_write - 0.5625).abs() < 1e-9);
+        assert!((fast.output - 4.5).abs() < 1e-9);
+
+        let long_usage = TokenBreakdown {
+            input: 273_000,
+            output: 100_000,
+            ..Default::default()
+        };
+        let long = pricing
+            .calculate_token_costs_with_provider(
+                "gpt-5.6-sol",
+                Some("openai"),
+                &long_usage,
+            )
+            .unwrap();
+        assert!((long.input - 1.97925).abs() < 1e-9);
+        assert!((long.output - 2.8).abs() < 1e-9);
+        assert!(pricing
+            .calculate_token_costs_with_service_tier(
+                "gpt-5.5",
+                Some("openai"),
+                &long_usage,
+                ServiceTier::Fast,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn chatgpt_fast_uses_credit_multiplier_with_refreshed_standard_rates() {
+        let pricing = CodexPricing::from_official_markdown(
+            official_openai_markdown(),
+            FastPricingBasis::ChatGptSubscription,
+        )
+        .unwrap();
+        let usage = TokenBreakdown {
+            input: 100_000,
+            output: 100_000,
+            ..Default::default()
+        };
+
+        let standard = pricing
+            .calculate_cost_with_service_tier(
+                "gpt-5.6-sol",
+                Some("openai"),
+                &usage,
+                ServiceTier::Standard,
+            )
+            .unwrap();
+        let fast = pricing
+            .calculate_cost_with_service_tier(
+                "gpt-5.6-sol",
+                Some("openai"),
+                &usage,
+                ServiceTier::Fast,
+            )
+            .unwrap();
+
+        assert!((standard - 2.275).abs() < 1e-9);
+        assert!((fast - standard * 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_changed_official_openai_tables() {
+        let changed_header = official_openai_markdown().replace(
+            "Short context cached input",
+            "Cached prompt",
+        );
+        assert!(CodexPricing::from_official_markdown(
+            &changed_header,
+            FastPricingBasis::ApiPriority,
+        )
+        .is_err());
+
+        let incomplete = official_openai_markdown().replace(
+            "$7.25 | $0.70 | $9.50 | $28.00",
+            "$7.25 | - | $9.50 | $28.00",
+        );
+        assert!(CodexPricing::from_official_markdown(
+            &incomplete,
+            FastPricingBasis::ApiPriority,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn applies_long_context_rates_only_above_272k_raw_input_tokens() {
         let at_threshold = TokenBreakdown {
             input: 100_000,
             cache_read: 100_000,
             cache_write: 72_000,
             output: 100_000,
-            reasoning: 100_000,
+            reasoning: 100_000
         };
         let pricing = CodexPricing::bundled();
         let short = pricing
-            .calculate_token_costs_with_provider("gpt-5.6-terra", Some("openai"), &at_threshold)
+            .calculate_token_costs_with_provider(
+                "gpt-5.6-terra",
+                Some("openai"),
+                &at_threshold,
+            )
             .unwrap();
         assert!((short.input - 0.2).abs() < 1e-9);
         assert!((short.cache_read - 0.02).abs() < 1e-9);
@@ -892,7 +1637,11 @@ mod tests {
             ..at_threshold
         };
         let long = pricing
-            .calculate_token_costs_with_provider("gpt-5.6-terra", Some("openai"), &above_threshold)
+            .calculate_token_costs_with_provider(
+                "gpt-5.6-terra",
+                Some("openai"),
+                &above_threshold,
+            )
             .unwrap();
         assert!((long.input - 0.4).abs() < 1e-9);
         assert!((long.cache_read - 0.04).abs() < 1e-9);
@@ -1096,8 +1845,9 @@ mod tests {
             cache_write: 1_000_000,
             ..Default::default()
         };
-        let pricing =
-            AnthropicPricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+        let pricing = AnthropicPricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+        );
         let costs = pricing
             .calculate_token_costs("anthropic/claude-sonnet-4-5-20250929", &usage)
             .unwrap();
@@ -1113,8 +1863,9 @@ mod tests {
 
     #[test]
     fn estimates_claude_five_models_and_cache_write_ttls() {
-        let pricing =
-            AnthropicPricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+        let pricing = AnthropicPricing::bundled_for_date(
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+        );
         let usage = TokenBreakdown {
             input: 1_000_000,
             output: 1_000_000,
@@ -1128,7 +1879,11 @@ mod tests {
         };
 
         let opus = pricing
-            .calculate_token_costs_with_cache_writes("claude-opus-5", &usage, Some(&cache_writes))
+            .calculate_token_costs_with_cache_writes(
+                "claude-opus-5",
+                &usage,
+                Some(&cache_writes),
+            )
             .unwrap();
         assert!((opus.input - 5.0).abs() < 1e-9);
         assert!((opus.output - 25.0).abs() < 1e-9);
@@ -1136,7 +1891,11 @@ mod tests {
         assert!((opus.cache_write - 9.0625).abs() < 1e-9);
 
         let fable = pricing
-            .calculate_token_costs_with_cache_writes("claude-fable-5", &usage, Some(&cache_writes))
+            .calculate_token_costs_with_cache_writes(
+                "claude-fable-5",
+                &usage,
+                Some(&cache_writes),
+            )
             .unwrap();
         assert!((fable.input - 10.0).abs() < 1e-9);
         assert!((fable.output - 50.0).abs() < 1e-9);
@@ -1149,8 +1908,9 @@ mod tests {
         const MARKDOWN: &str = r#"
 ## Model pricing
 
-| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
 | --- | --- | --- | --- | --- | --- |
+| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok1 | $50 / MTok |
 | Claude Fable 5 | $10 / MTok | $12.50 / MTok | $20 / MTok | $1 / MTok | $50 / MTok |
 | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
 | Claude Sonnet 5 [through August 31, 2026](/pricing) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
@@ -1188,10 +1948,174 @@ mod tests {
                 .input,
             3.0
         );
+        let fable = standard
+            .calculate_token_costs("claude-fable-5-1", &TokenBreakdown {
+                cache_read: 1_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(fable.cache_read, 0.25);
         assert!(AnthropicPricing::from_official_markdown(
             "# Pricing without a table",
             NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
         )
         .is_err());
+    }
+
+    fn official_openai_markdown() -> &'static str {
+        r#"
+# Pricing
+
+### Standard pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-5.6-sol | $3.75 | $0.35 | $4.75 | $19.00 | $7.25 | $0.70 | $9.50 | $28.00 |
+| gpt-5.6-terra | $2.00 | $0.20 | $2.50 | $12.00 | $4.00 | $0.40 | $5.00 | $18.00 |
+| gpt-5.6-luna | $0.20 | $0.02 | $0.25 | $1.20 | $0.40 | $0.04 | $0.50 | $1.80 |
+| gpt-5.5 (<272K context length) | $5.00 | $0.50 | - | $30.00 | $10.00 | $1.00 | - | $45.00 |
+| gpt-5.4 (<272K context length) | $2.50 | $0.25 | - | $15.00 | $5.00 | $0.50 | - | $22.50 |
+| gpt-5.4-mini | $0.75 | $0.075 | - | $4.50 | - | - | - | - |
+| gpt-5.2 | $1.75 | $0.175 | - | $14.00 | - | - | - | - |
+| gpt-5.1 | $1.25 | $0.125 | - | $10.00 | - | - | - | - |
+
+### Fast pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-5.6-sol | $9.00 | $0.90 | $11.25 | $45.00 | $18.00 | $1.80 | $22.50 | $67.50 |
+| gpt-5.6-terra | $4.00 | $0.40 | $5.00 | $24.00 | $8.00 | $0.80 | $10.00 | $36.00 |
+| gpt-5.6-luna | $0.40 | $0.04 | $0.50 | $2.40 | $0.80 | $0.08 | $1.00 | $3.60 |
+| gpt-5.5 (<272K context length) | $12.50 | $1.25 | - | $75.00 | - | - | - | - |
+| gpt-5.4 (<272K context length) | $5.00 | $0.50 | - | $30.00 | - | - | - | - |
+| gpt-5.4-mini | $1.50 | $0.15 | - | $9.00 | - | - | - | - |
+| gpt-5.2 | $3.50 | $0.35 | - | $28.00 | - | - | - | - |
+| gpt-5.1 | $2.50 | $0.25 | - | $20.00 | - | - | - | - |
+"#
+    }
+
+    fn openrouter_catalog() -> String {
+        r#"{"data":[
+          {"id":"google/gemini-3.8-flash","pricing":{
+            "prompt":"0.00000075","completion":"0.00000375","input_cache_read":"0.000000075"}},
+          {"id":"google/gemini-3.8-flash:batch","pricing":{
+            "prompt":"0.000000375","completion":"0.000001875"}},
+          {"id":"google/gemini-3.7-flash","pricing":{
+            "prompt":"0.00000075","completion":"0.00000375","input_cache_read":"0.000000075"}},
+          {"id":"google/gemini-3.5-flash","pricing":{
+            "prompt":"0.0000015","completion":"0.000009","input_cache_read":"0.00000015"}},
+          {"id":"google/gemini-3.5-flash-lite","pricing":{
+            "prompt":"0.0000003","completion":"0.0000025","input_cache_read":"0.00000003"}},
+          {"id":"google/gemini-3.1-flash-lite","pricing":{
+            "prompt":"0.00000025","completion":"0.0000015","input_cache_read":"0.000000025"}},
+          {"id":"google/gemini-2.5-flash","pricing":{
+            "prompt":"0.0000003","completion":"0.0000025","input_cache_read":"0.00000003"}},
+          {"id":"google/gemini-2.5-flash-lite","pricing":{
+            "prompt":"0.0000001","completion":"0.0000004","input_cache_read":"0.00000001"}},
+          {"id":"google/gemini-2.5-pro-preview-05-06","pricing":{
+            "prompt":"0.0000099","completion":"0.0000099"}},
+          {"id":"google/gemini-2.5-pro","pricing":{
+            "prompt":"0.00000125","completion":"0.00001","input_cache_read":"0.000000125",
+            "overrides":[{"min_prompt_tokens":200000,"prompt":"0.0000025",
+              "completion":"0.000015","input_cache_read":"0.00000025"}]}},
+          {"id":"anthropic/claude-opus-4.6","pricing":{
+            "prompt":"0.000005","completion":"0.000025"}}
+        ]}"#
+        .to_string()
+    }
+
+    fn million(input: i64, output: i64, cache_read: i64) -> TokenBreakdown {
+        TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write: 0,
+            reasoning: 0,
+        }
+    }
+
+    fn catalog_pricing() -> GooglePricing {
+        GooglePricing::from_openrouter_catalog(
+            &openrouter_catalog(),
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn openrouter_catalog_converts_per_token_rates_to_per_million() {
+        let costs = catalog_pricing()
+            .calculate_token_costs("gemini-3.8-flash", &million(1_000_000, 1_000_000, 1_000_000))
+            .unwrap();
+
+        assert_eq!(costs.input, 0.75);
+        assert_eq!(costs.output, 3.75);
+        assert_eq!(costs.cache_read, 0.075);
+    }
+
+    #[test]
+    fn openrouter_catalog_applies_the_long_context_override() {
+        let pricing = catalog_pricing();
+        let short = pricing
+            .calculate_token_costs("gemini-2.5-pro", &million(200_000, 0, 0))
+            .unwrap();
+        let long = pricing
+            .calculate_token_costs("gemini-2.5-pro", &million(200_001, 0, 0))
+            .unwrap();
+
+        assert!((short.input - 0.25).abs() < 1e-12);
+        assert!((long.input - 0.5000025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn openrouter_catalog_ignores_batch_variants_and_other_providers() {
+        let pricing = catalog_pricing();
+        // The `:batch` row is half price; the standard row must win.
+        assert_eq!(
+            pricing
+                .calculate_token_costs("gemini-3.8-flash", &million(1_000_000, 0, 0))
+                .unwrap()
+                .input,
+            0.75
+        );
+        // Claude models stay with the Anthropic catalog.
+        assert!(pricing
+            .calculate_token_costs("claude-opus-4-6", &million(1_000_000, 0, 0))
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_an_openrouter_catalog_without_gemini_prices() {
+        let thin = r#"{"data":[{"id":"google/gemini-3.8-flash","pricing":{"prompt":"0.00000075"}}]}"#;
+        assert!(GooglePricing::from_openrouter_catalog(
+            thin,
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap()
+        )
+        .is_err());
+        assert!(GooglePricing::from_openrouter_catalog(
+            "not json",
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bundled_google_rates_cover_the_scheduled_increase() {
+        let usage = million(1_000_000, 1_000_000, 0);
+        let current =
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap())
+                .calculate_token_costs("gemini-3.8-flash", &usage)
+                .unwrap();
+        let raised =
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap())
+                .calculate_token_costs("gemini-3.8-flash", &usage)
+                .unwrap();
+        assert_eq!(current.input, 0.75);
+        assert_eq!(raised.input, 1.5);
+        assert!(
+            GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap())
+                .calculate_token_costs("gemini-9.9-flash", &usage)
+                .is_none()
+        );
     }
 }

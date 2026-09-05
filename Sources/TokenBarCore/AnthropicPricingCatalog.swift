@@ -2,6 +2,11 @@ import Foundation
 
 public protocol AnthropicPricingCatalogUpdating: Sendable {
     func refreshIfNeeded() async -> URL?
+    func refreshNowIfAllowed() async -> URL?
+}
+
+public extension AnthropicPricingCatalogUpdating {
+    func refreshNowIfAllowed() async -> URL? { nil }
 }
 
 public actor AnthropicPricingCatalogUpdater: AnthropicPricingCatalogUpdating {
@@ -35,21 +40,29 @@ public actor AnthropicPricingCatalogUpdater: AnthropicPricingCatalogUpdating {
     }
 
     public func refreshIfNeeded() async -> URL? {
+        await self.refresh(force: false)
+    }
+
+    public func refreshNowIfAllowed() async -> URL? {
+        await self.refresh(force: true)
+    }
+
+    private func refresh(force: Bool) async -> URL? {
         let now = self.now()
-        if self.isFresh(at: now) {
+        if !force, self.isFresh(at: now) {
             return self.fileURL
         }
         if let lastAttemptAt,
            now.timeIntervalSince(lastAttemptAt) < self.retryInterval
         {
-            return self.existingURL
+            return force ? nil : self.existingURL
         }
         self.lastAttemptAt = now
 
         do {
             let data = try await self.fetch(self.sourceURL)
             guard Self.isValidOfficialMarkdown(data) else {
-                return self.existingURL
+                return force ? nil : self.existingURL
             }
             let directory = self.fileURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(
@@ -61,7 +74,7 @@ public actor AnthropicPricingCatalogUpdater: AnthropicPricingCatalogUpdating {
                 ofItemAtPath: self.fileURL.path)
             return self.fileURL
         } catch {
-            return self.existingURL
+            return force ? nil : self.existingURL
         }
     }
 
@@ -93,18 +106,32 @@ public actor AnthropicPricingCatalogUpdater: AnthropicPricingCatalogUpdating {
               data.count <= 2_000_000,
               let markdown = String(data: data, encoding: .utf8),
               markdown.contains("## Model pricing"),
-              markdown.contains("| Model"),
-              markdown.contains("Base Input Tokens"),
-              markdown.contains("5m Cache Writes"),
-              markdown.contains("1h Cache Writes"),
-              markdown.contains("Cache Hits & Refreshes"),
-              markdown.contains("Output Tokens")
+              let header = markdown.split(separator: "\n").first(where: {
+                  Self.isOfficialPricingHeader(String($0))
+              }),
+              Self.tableCells(String(header)).count == 6
         else {
             return false
         }
         return markdown.split(separator: "\n")
             .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("| Claude ") }
             .count >= 5
+    }
+
+    private nonisolated static func isOfficialPricingHeader(_ line: String) -> Bool {
+        let header = line.trimmingCharacters(in: .whitespaces).lowercased()
+        return header.hasPrefix("| model")
+            && header.contains("base input tokens")
+            && header.contains("5m cache writes")
+            && header.contains("1h cache writes")
+            && (header.contains("cache hits and refreshes")
+                || header.contains("cache hits & refreshes"))
+            && header.contains("output tokens")
+    }
+
+    private nonisolated static func tableCells(_ line: String) -> [String] {
+        line.split(separator: "|", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     private nonisolated static func download(_ url: URL) async throws -> Data {

@@ -23,6 +23,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .codex: "Codex"
         case .claude: "Claude"
         case .grok: "Grok"
+        case .antigravity: "Antigravity"
         default: self.rawValue.capitalized
         }
     }
@@ -32,6 +33,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .codex: "C"
         case .claude: "A"
         case .grok: "G"
+        case .antigravity: "AG"
         default: String(self.displayName.prefix(1))
         }
     }
@@ -39,12 +41,14 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
     public static let codex = TokenPlatform(rawValue: "codex")
     public static let claude = TokenPlatform(rawValue: "claude")
     public static let grok = TokenPlatform(rawValue: "grok")
+    public static let antigravity = TokenPlatform(rawValue: "antigravity")
 }
 
 public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
     case codex
     case claude
     case grok
+    case antigravity
 
     public var id: String { self.rawValue }
 
@@ -53,6 +57,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .codex: TokenPlatform.codex.displayName
         case .claude: TokenPlatform.claude.displayName
         case .grok: TokenPlatform.grok.displayName
+        case .antigravity: TokenPlatform.antigravity.displayName
         }
     }
 
@@ -61,6 +66,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .codex: .codex
         case .claude: .claude
         case .grok: .grok
+        case .antigravity: .antigravity
         }
     }
 
@@ -68,12 +74,17 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         self == .codex
     }
 
-    public static func visibleScopes(showsClaude: Bool, showsGrok: Bool) -> [Self] {
+    public static func visibleScopes(
+        showsClaude: Bool,
+        showsGrok: Bool,
+        showsAntigravity: Bool) -> [Self]
+    {
         Self.allCases.filter { scope in
             switch scope {
             case .codex: true
             case .claude: showsClaude
             case .grok: showsGrok
+            case .antigravity: showsAntigravity
             }
         }
     }
@@ -239,6 +250,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let endedAtMs: Int64
     public let durationMs: Int64?
     public let modelDurationMs: Int64?
+    public let timeToFirstTokenMs: Int64?
     public let tokens: TokenBreakdown
     public let costUsd: Double
     public let costSource: ActivityCostSource
@@ -260,6 +272,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         endedAtMs: Int64,
         durationMs: Int64?,
         modelDurationMs: Int64? = nil,
+        timeToFirstTokenMs: Int64? = nil,
         tokens: TokenBreakdown,
         costUsd: Double,
         costSource: ActivityCostSource,
@@ -282,6 +295,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         self.endedAtMs = endedAtMs
         self.durationMs = durationMs
         self.modelDurationMs = modelDurationMs
+        self.timeToFirstTokenMs = timeToFirstTokenMs
         self.tokens = tokens
         self.costUsd = costUsd
         self.costSource = costSource
@@ -334,6 +348,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
             endedAtMs: self.endedAtMs,
             durationMs: self.durationMs,
             modelDurationMs: self.modelDurationMs,
+            timeToFirstTokenMs: self.timeToFirstTokenMs,
             tokens: self.tokens,
             costUsd: self.costUsd,
             costSource: self.costSource,
@@ -444,6 +459,8 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
     public let costUsd: Double
     public let tokenCosts: TokenCostBreakdown?
     public let averageGenerationTokensPerSecond: Double?
+    public let averageTimeToFirstTokenMs: Double?
+    public let firstTokenSampleCount: Int?
     public let requestCount: Int
     public let sessionCount: Int
 
@@ -453,12 +470,16 @@ public struct ActivityTotals: Codable, Equatable, Sendable {
         requestCount: Int,
         sessionCount: Int,
         tokenCosts: TokenCostBreakdown? = nil,
-        averageGenerationTokensPerSecond: Double? = nil)
+        averageGenerationTokensPerSecond: Double? = nil,
+        averageTimeToFirstTokenMs: Double? = nil,
+        firstTokenSampleCount: Int? = nil)
     {
         self.tokens = tokens
         self.costUsd = costUsd
         self.tokenCosts = tokenCosts
         self.averageGenerationTokensPerSecond = averageGenerationTokensPerSecond
+        self.averageTimeToFirstTokenMs = averageTimeToFirstTokenMs
+        self.firstTokenSampleCount = firstTokenSampleCount
         self.requestCount = requestCount
         self.sessionCount = sessionCount
     }
@@ -518,6 +539,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
     public let date: String
     public let tokens: TokenBreakdown
     public let costUsd: Double
+    public let averageGenerationTokensPerSecond: Double?
+    public let averageTimeToFirstTokenMs: Double?
+    public let firstTokenSampleCount: Int?
     public let requestCount: Int
     public let sessionCount: Int
     public let models: [DailyModelSummary]
@@ -528,11 +552,17 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         costUsd: Double,
         requestCount: Int,
         sessionCount: Int,
+        averageGenerationTokensPerSecond: Double? = nil,
+        averageTimeToFirstTokenMs: Double? = nil,
+        firstTokenSampleCount: Int? = nil,
         models: [DailyModelSummary] = [])
     {
         self.date = date
         self.tokens = tokens
         self.costUsd = costUsd
+        self.averageGenerationTokensPerSecond = averageGenerationTokensPerSecond
+        self.averageTimeToFirstTokenMs = averageTimeToFirstTokenMs
+        self.firstTokenSampleCount = firstTokenSampleCount
         self.requestCount = requestCount
         self.sessionCount = sessionCount
         self.models = models
@@ -542,6 +572,9 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         case date
         case tokens
         case costUsd
+        case averageGenerationTokensPerSecond
+        case averageTimeToFirstTokenMs
+        case firstTokenSampleCount
         case requestCount
         case sessionCount
         case models
@@ -552,6 +585,15 @@ public struct DailySummary: Codable, Equatable, Identifiable, Sendable {
         self.date = try container.decode(String.self, forKey: .date)
         self.tokens = try container.decode(TokenBreakdown.self, forKey: .tokens)
         self.costUsd = try container.decode(Double.self, forKey: .costUsd)
+        self.averageGenerationTokensPerSecond = try container.decodeIfPresent(
+            Double.self,
+            forKey: .averageGenerationTokensPerSecond)
+        self.averageTimeToFirstTokenMs = try container.decodeIfPresent(
+            Double.self,
+            forKey: .averageTimeToFirstTokenMs)
+        self.firstTokenSampleCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .firstTokenSampleCount)
         self.requestCount = try container.decode(Int.self, forKey: .requestCount)
         self.sessionCount = try container.decode(Int.self, forKey: .sessionCount)
         self.models = try container.decodeIfPresent([DailyModelSummary].self, forKey: .models) ?? []

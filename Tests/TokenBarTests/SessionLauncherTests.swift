@@ -132,6 +132,41 @@ struct SessionLauncherTests {
         #expect(launchedSession == session)
     }
 
+    @Test("opening Antigravity reopens the recorded workspace folder")
+    func opensAntigravityWorkspace() throws {
+        var openedWorkspace: String?
+        let launcher = SessionLauncher(
+            launchAntigravityWorkspace: {
+                openedWorkspace = $0
+                return true
+            })
+
+        try launcher.open(SessionSummary(
+            id: "96d309be-7ede-4c0d-8b01-f2b6bf6fd48e",
+            workspaceLabel: "TokenBar",
+            startedAtMs: 0,
+            endedAtMs: 1,
+            tokens: .zero,
+            costUsd: 0,
+            models: [],
+            requests: [],
+            workspacePath: "/tmp/TokenBar",
+            platform: .antigravity))
+
+        #expect(openedWorkspace == "/tmp/TokenBar")
+    }
+
+    @Test("an Antigravity session without a workspace reports why it cannot open")
+    func antigravitySessionWithoutWorkspace() {
+        let launcher = SessionLauncher(launchAntigravityWorkspace: { _ in true })
+
+        #expect(throws: SessionLauncherError.self) {
+            try launcher.open(self.session(
+                id: "96d309be-7ede-4c0d-8b01-f2b6bf6fd48e",
+                platform: .antigravity))
+        }
+    }
+
     private func session(
         id: String,
         platform: TokenPlatform) -> SessionSummary

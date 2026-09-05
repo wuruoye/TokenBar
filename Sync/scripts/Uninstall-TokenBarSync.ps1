@@ -11,6 +11,11 @@ $MarkerPath = Join-Path $InstallRoot '.tokenbar-sync-install.json'
 $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserSid = $CurrentIdentity.User.Value
 $CurrentUserName = $CurrentIdentity.Name
+$LegacyPowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$InvokeScript = Join-Path $InstallRoot 'Invoke-TokenBarSync.ps1'
+$LegacyTaskArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $InvokeScript
+$LegacyHiddenTaskArguments = '-WindowStyle Hidden {0}' -f $LegacyTaskArguments
+$TaskRunner = Join-Path $InstallRoot 'tokenbar-sync-task.exe'
 
 function Test-CurrentUserPrincipal {
     param([string] $UserId)
@@ -44,23 +49,43 @@ try {
     throw 'TokenBar Sync install marker is invalid.'
 }
 $parsedInstallId = [Guid]::Empty
-if ([int] $marker.schemaVersion -ne 1 -or
+$schemaVersion = [int] $marker.schemaVersion
+if (($schemaVersion -ne 1 -and $schemaVersion -ne 2) -or
     -not [Guid]::TryParse([string] $marker.installId, [ref] $parsedInstallId) -or
     [string] $marker.userSid -ne $CurrentUserSid -or
     [IO.Path]::GetFullPath([string] $marker.installRoot) -ne $InstallRoot -or
     [string] $marker.taskName -ne $TaskName) {
     throw 'TokenBar Sync install marker does not belong to this user, path, and task.'
 }
+if ($schemaVersion -eq 1) {
+    if ([IO.Path]::GetFullPath([string] $marker.powerShellExe) -ne $LegacyPowerShellExe -or
+        [string] $marker.taskArguments -ne $LegacyTaskArguments) {
+        throw 'Legacy TokenBar Sync install marker is invalid.'
+    }
+} elseif (
+    [IO.Path]::GetFullPath([string] $marker.taskExecutable) -ne $TaskRunner -or
+    [string] $marker.taskArguments -ne ''
+) {
+    throw 'TokenBar Sync native task marker is invalid.'
+}
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $task) {
     if ($task.Actions.Count -ne 1 -or
-        [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
-            [string] $task.Actions[0].Execute)) -ne
-            [IO.Path]::GetFullPath([string] $marker.powerShellExe) -or
-        [string] $task.Actions[0].Arguments -ne [string] $marker.taskArguments -or
         -not (Test-CurrentUserPrincipal ([string] $task.Principal.UserId))) {
         throw "Scheduled Task '$TaskName' is not owned by this TokenBar Sync install."
+    }
+    $taskExecute = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables(
+        [string] $task.Actions[0].Execute))
+    $taskArguments = [string] $task.Actions[0].Arguments
+    if ($schemaVersion -eq 1) {
+        if ($taskExecute -ne $LegacyPowerShellExe -or
+            ($taskArguments -ne $LegacyTaskArguments -and
+             $taskArguments -ne $LegacyHiddenTaskArguments)) {
+            throw "Scheduled Task '$TaskName' does not match its legacy TokenBar Sync marker."
+        }
+    } elseif ($taskExecute -ne $TaskRunner -or $taskArguments -ne '') {
+        throw "Scheduled Task '$TaskName' does not match its native TokenBar Sync marker."
     }
 }
 
@@ -74,7 +99,10 @@ if ($null -ne $task) {
 
 $ownedFiles = @(
     'tokenbar-sync.exe',
+    'tokenbar-sync-background.exe',
+    'tokenbar-sync-task.exe',
     'tokenbar-helper.exe',
+    'tokenbar-helper-background.exe',
     'LICENSE.txt',
     'ThirdPartyLicenses.html',
     'Invoke-TokenBarSync.ps1',
@@ -83,6 +111,7 @@ $ownedFiles = @(
     'config.json',
     'device.json',
     'last-run.json',
+    'incremental-upload-v2.json',
     'snapshot.json',
     'remote-snapshots.json',
     'token.protected',

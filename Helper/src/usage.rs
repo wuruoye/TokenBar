@@ -193,6 +193,10 @@ pub struct UnifiedMessage {
     pub duration_ms: Option<i64>,
     #[serde(default)]
     pub model_duration_ms: Option<i64>,
+    #[serde(default)]
+    pub time_to_first_token_ms: Option<i64>,
+    #[serde(default, skip_serializing)]
+    pub source_turn_id: Option<String>,
     #[serde(default = "default_message_count")]
     pub message_count: i32,
     pub agent: Option<String>,
@@ -241,6 +245,8 @@ impl UnifiedMessage {
             service_tier: ServiceTier::Unknown,
             duration_ms: None,
             model_duration_ms: None,
+            time_to_first_token_ms: None,
+            source_turn_id: None,
             message_count: 1,
             agent,
             dedup_key: None,

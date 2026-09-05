@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 import TokenBarCore
 
 struct TokenBarSettingsView: View {
     @Bindable var settings: TokenBarSettings
+    @Bindable var loginItem: LoginItemController
     let memoryTelemetry: MemoryTelemetryController?
     let activitySync: ActivitySyncController?
     let syncNow: () -> Void
@@ -10,12 +12,14 @@ struct TokenBarSettingsView: View {
 
     init(
         settings: TokenBarSettings,
+        loginItem: LoginItemController = .shared,
         memoryTelemetry: MemoryTelemetryController? = nil,
         activitySync: ActivitySyncController? = nil,
         syncNow: @escaping () -> Void = {},
         testResetAnimation: @escaping () -> Void = {})
     {
         self.settings = settings
+        self.loginItem = loginItem
         self.memoryTelemetry = memoryTelemetry
         self.activitySync = activitySync
         self.syncNow = syncNow
@@ -39,9 +43,35 @@ struct TokenBarSettingsView: View {
                 }
             }
 
+            Section("Startup") {
+                Toggle(
+                    "Launch TokenBar at login",
+                    isOn: Binding(
+                        get: { self.loginItem.isEnabled },
+                        set: { self.loginItem.setEnabled($0) }))
+                    .disabled(!self.loginItem.isAvailable)
+
+                Text(self.loginItem.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if self.loginItem.requiresApproval {
+                    Button("Open Login Items") {
+                        self.loginItem.openSystemSettings()
+                    }
+                }
+
+                if let errorMessage = self.loginItem.errorMessage {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
             Section("Platforms") {
                 Toggle("Show Claude Code", isOn: self.$settings.showsClaude)
                 Toggle("Show Grok Build", isOn: self.$settings.showsGrok)
+                Toggle("Show Antigravity", isOn: self.$settings.showsAntigravity)
 
                 Text("Adds each provider's T/W section and dashboard tab. Changes take effect immediately.")
                     .font(.caption)
@@ -68,6 +98,16 @@ struct TokenBarSettingsView: View {
                 Toggle(
                     "Show full request content on hover",
                     isOn: self.$settings.showsFullRequestContentOnHover)
+            }
+
+            Section("Quota") {
+                Toggle(
+                    "Use weekdays only for weekly pace",
+                    isOn: self.$settings.usesWeekdayWeeklyPacing)
+
+                Text("Splits weekly pace into five workdays. Saturday and Sunday do not advance expected usage.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let activitySync = self.activitySync {
@@ -122,7 +162,7 @@ struct TokenBarSettingsView: View {
                                     : Color.red)
                     }
 
-                    Text("Uploads token counts, models, timing, and coarse workspace labels. Prompt/output text, session titles, absolute paths, and provider credentials are removed before transmission. Sync failures never replace local activity data.")
+                    Text("Uploads session names and IDs with token counts, models, and timing so synced sessions can be identified and copied. Prompt/output text, workspace details, absolute paths, and provider credentials are removed before transmission. Sync failures never replace local activity data.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -130,46 +170,56 @@ struct TokenBarSettingsView: View {
 
             if let memoryTelemetry = self.memoryTelemetry {
                 Section("Codex Memory") {
-                    LabeledContent("Receiver") {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(memoryTelemetry.receiverState.isListening ? Color.green : Color.orange)
-                                .frame(width: 7, height: 7)
-                            Text(memoryTelemetry.receiverState.title)
-                        }
-                    }
+                    Toggle(
+                        "Monitor Codex Memory usage",
+                        isOn: self.$settings.monitorsCodexMemory)
 
-                    Text(memoryTelemetry.receiverState.detail ?? "")
+                    Text("When off, TokenBar stops its local receiver, hides Memory usage, and excludes Memory telemetry from multi-device sync. This does not change Codex's memory setting.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    LabeledContent("Codex config") {
-                        Text(memoryTelemetry.configurationState.title)
-                    }
-
-                    Text(memoryTelemetry.configurationState.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    if memoryTelemetry.configurationState.canInstall {
-                        Button(
-                            memoryTelemetry.configurationState == .needsAnalytics
-                                ? "Enable Codex Analytics"
-                                : "Enable Memory Metrics")
-                        {
-                            memoryTelemetry.installConfiguration()
+                    if self.settings.monitorsCodexMemory {
+                        LabeledContent("Receiver") {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(memoryTelemetry.receiverState.isListening ? Color.green : Color.orange)
+                                    .frame(width: 7, height: 7)
+                                Text(memoryTelemetry.receiverState.title)
+                            }
                         }
-                    }
 
-                    if let message = memoryTelemetry.configurationErrorMessage {
-                        Text(message)
+                        Text(memoryTelemetry.receiverState.detail ?? "")
                             .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+                            .foregroundStyle(.secondary)
 
-                    Text("Codex loads this setting when its local process starts. Restart Codex or ChatGPT once after enabling. Logs, traces, and prompt text stay disabled.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        LabeledContent("Codex config") {
+                            Text(memoryTelemetry.configurationState.title)
+                        }
+
+                        Text(memoryTelemetry.configurationState.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if memoryTelemetry.configurationState.canInstall {
+                            Button(
+                                memoryTelemetry.configurationState == .needsAnalytics
+                                    ? "Enable Codex Analytics"
+                                    : "Enable Memory Metrics")
+                            {
+                                memoryTelemetry.installConfiguration()
+                            }
+                        }
+
+                        if let message = memoryTelemetry.configurationErrorMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+
+                        Text("Codex loads this setting when its local process starts. Restart Codex or ChatGPT once after enabling. Logs, traces, and prompt text stay disabled.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -206,6 +256,7 @@ struct TokenBarSettingsView: View {
                 Spacer()
                 Button("Restore Defaults") {
                     self.settings.resetToDefaults()
+                    self.loginItem.setEnabled(false)
                 }
             }
         }
@@ -215,6 +266,14 @@ struct TokenBarSettingsView: View {
             height: self.activitySync == nil
                 ? (self.memoryTelemetry == nil ? 620 : 760)
                 : 820)
+        .onAppear {
+            self.loginItem.refresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification))
+        { _ in
+            self.loginItem.refresh()
+        }
     }
 
     private func syncStatusTitle(_ report: ActivitySyncReport) -> String {

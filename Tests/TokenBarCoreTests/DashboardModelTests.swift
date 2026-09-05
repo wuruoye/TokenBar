@@ -7,9 +7,14 @@ private enum StubFailure: Error {
 }
 
 private actor QueueQuotaProvider: QuotaProviding {
+    let platform: TokenPlatform
     private var results: [Result<QuotaSnapshot, StubFailure>]
 
-    init(_ results: [Result<QuotaSnapshot, StubFailure>]) {
+    init(
+        _ results: [Result<QuotaSnapshot, StubFailure>],
+        platform: TokenPlatform = .codex)
+    {
+        self.platform = platform
         self.results = results
     }
 
@@ -107,6 +112,24 @@ private actor MemoryQuotaCache: QuotaSnapshotCaching {
 
     func saveQuotas(_ snapshots: [TokenPlatform: QuotaSnapshot]) async throws {
         self.snapshots = snapshots
+    }
+}
+
+private actor MemoryWeeklyQuotaUsageCache: WeeklyQuotaUsageCaching {
+    var histories: [TokenPlatform: WeeklyQuotaUsageHistory]
+
+    init(histories: [TokenPlatform: WeeklyQuotaUsageHistory] = [:]) {
+        self.histories = histories
+    }
+
+    func loadWeeklyQuotaUsage() async throws -> [TokenPlatform: WeeklyQuotaUsageHistory] {
+        self.histories
+    }
+
+    func saveWeeklyQuotaUsage(
+        _ histories: [TokenPlatform: WeeklyQuotaUsageHistory]) async throws
+    {
+        self.histories = histories
     }
 }
 
@@ -264,6 +287,46 @@ struct DashboardModelTests {
         #expect(!model.activity.isRefreshing)
     }
 
+    @Test("quota refresh records and persists daily weekly usage")
+    @MainActor
+    func recordsDailyWeeklyUsage() async {
+        let windowStart = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = windowStart.addingTimeInterval(7 * 86_400)
+        let latestSampleAt = windowStart.addingTimeInterval(2 * 86_400 + 300)
+        func quota(usedPercent: Double, offset: TimeInterval) -> QuotaSnapshot {
+            QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: usedPercent,
+                    windowMinutes: 10_080,
+                    resetsAt: reset),
+                resetCredits: nil,
+                updatedAt: windowStart.addingTimeInterval(offset))
+        }
+        let usageCache = MemoryWeeklyQuotaUsageCache()
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider([
+                .success(quota(usedPercent: 32, offset: 2 * 86_400)),
+                .success(quota(usedPercent: 39, offset: 2 * 86_400 + 300)),
+            ]),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            weeklyQuotaUsageCache: usageCache,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { latestSampleAt })
+
+        await model.refreshQuota()
+        await model.refreshQuota()
+
+        #expect(model.weeklyQuotaUsage(for: .codex)?.usage(
+            at: latestSampleAt,
+            statisticsTimeZone: .utc)?.usedPercentagePoints == 7)
+        #expect(model.weeklyQuotaUsageToday(for: .codex)?.usedPercentagePoints == 7)
+        #expect(await usageCache.histories[.codex] == model.weeklyQuotaUsage(for: .codex))
+    }
+
     @Test("missing reset metadata does not inherit an expired reset date")
     @MainActor
     func rejectsExpiredInheritedReset() async {
@@ -326,6 +389,104 @@ struct DashboardModelTests {
 
         #expect(model.quota.value?.weekly?.resetsAt == reset)
         #expect(model.quota.value?.origin == .claudeDesktop)
+    }
+
+    @Test("Claude weekly reset falls back to Sunday evening and reanchors on refill")
+    @MainActor
+    func infersClaudeWeeklyReset() async throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Taipei"))
+        let firstObservedAt = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 8,
+            day: 24,
+            hour: 10)))
+        let refillObservedAt = firstObservedAt.addingTimeInterval(24 * 60 * 60)
+        let expectedInitialReset = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 8,
+            day: 30,
+            hour: 20)))
+        let provider = QueueQuotaProvider([
+            .success(QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: 20,
+                    windowMinutes: 10_080,
+                    resetsAt: nil),
+                resetCredits: nil,
+                updatedAt: firstObservedAt,
+                origin: .claudeDesktop)),
+            .success(QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: 0,
+                    windowMinutes: 10_080,
+                    resetsAt: nil),
+                resetCredits: nil,
+                updatedAt: refillObservedAt,
+                origin: .claudeDesktop)),
+        ], platform: .claude)
+        let quotaCache = MemoryQuotaCache()
+        let model = DashboardModel(
+            quotaService: provider,
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaCache: quotaCache,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { refillObservedAt },
+            calendar: calendar)
+
+        await model.refreshQuota(for: .claude)
+        #expect(model.quotaState(for: .claude).value?.weekly?.resetsAt == expectedInitialReset)
+
+        await model.refreshQuota(for: .claude)
+        let reanchoredReset = refillObservedAt.addingTimeInterval(7 * 24 * 60 * 60)
+        #expect(model.quotaState(for: .claude).value?.weekly?.resetsAt == reanchoredReset)
+        #expect(await quotaCache.snapshots[.claude]?.weekly?.resetsAt == reanchoredReset)
+    }
+
+    @Test("Claude fallback anchor advances by whole weekly windows")
+    @MainActor
+    func advancesClaudeWeeklyAnchor() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiredReset = now.addingTimeInterval(-6 * 24 * 60 * 60)
+        let expectedReset = expiredReset.addingTimeInterval(7 * 24 * 60 * 60)
+        let provider = QueueQuotaProvider([
+            .success(QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: 20,
+                    windowMinutes: 10_080,
+                    resetsAt: expiredReset),
+                resetCredits: nil,
+                updatedAt: now.addingTimeInterval(-7 * 24 * 60 * 60),
+                origin: .claudeDesktop)),
+            .success(QuotaSnapshot(
+                session: nil,
+                weekly: QuotaWindowSnapshot(
+                    usedPercent: 30,
+                    windowMinutes: 10_080,
+                    resetsAt: nil),
+                resetCredits: nil,
+                updatedAt: now,
+                origin: .claudeDesktop)),
+        ], platform: .claude)
+        let model = DashboardModel(
+            quotaService: provider,
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.refreshQuota(for: .claude)
+        await model.refreshQuota(for: .claude)
+
+        #expect(model.quotaState(for: .claude).value?.weekly?.resetsAt == expectedReset)
     }
 
     @Test("refresh passes the current weekly window start to activity")

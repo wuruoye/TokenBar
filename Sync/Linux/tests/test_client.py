@@ -11,14 +11,17 @@ from tokenbar_sync.client import (
     MAX_WEEKLY_RESET_AGE_MS,
     SyncHTTPError,
     _base_url,
+    _full_calibration_due,
     build_envelope,
     command_upload,
     collect_helper_snapshot,
     download_snapshots,
+    extract_reset_metadata,
     extract_weekly_resets,
     fetch_weekly_resets,
     load_or_create_device_id,
     load_snapshot,
+    upload_incremental_snapshot,
 )
 from tokenbar_sync.common import ValidationError
 def zero_tokens():
@@ -46,6 +49,15 @@ def minimal_snapshot(generated=123, timezone="UTC"):
 
 
 class ClientTests(unittest.TestCase):
+    def test_future_calibration_timestamp_is_treated_as_corrupt(self):
+        self.assertTrue(
+            _full_calibration_due(
+                {"lastFullAtMs": 2_000},
+                device_id="11111111-1111-4111-8111-111111111111",
+                now_ms=1_000,
+            )
+        )
+
     def test_device_id_is_created_once_with_private_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config" / "device-id"
@@ -98,7 +110,7 @@ class ClientTests(unittest.TestCase):
             snapshot = load_snapshot(path)
             self.assertEqual(snapshot["schemaVersion"], 8)
             session = snapshot["sessions"][0]
-            self.assertIsNone(session["title"])
+            self.assertEqual(session["title"], "private")
             self.assertIsNone(session["workspacePath"])
             self.assertIsNone(session["workspaceLabel"])
             self.assertIsNone(session["requests"][0]["promptPreview"])
@@ -152,7 +164,7 @@ class ClientTests(unittest.TestCase):
 
     @patch("tokenbar_sync.client._common_values")
     @patch("tokenbar_sync.client.fetch_weekly_resets", return_value={})
-    @patch("tokenbar_sync.client.upload_envelope")
+    @patch("tokenbar_sync.client.upload_incremental_snapshot")
     def test_conflict_collects_fresh_again_on_the_next_invocation(
         self, upload, _fetch_resets, common_values
     ):
@@ -174,6 +186,144 @@ class ClientTests(unittest.TestCase):
                     command_upload(args)
 
             self.assertEqual(common_values.call_count, 2)
+
+    def test_incremental_upload_uses_delta_then_periodic_full(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_snapshot = minimal_snapshot(generated=100)
+            first_snapshot["sessions"] = [{
+                "id": f"session-{index}",
+                "platform": "codex",
+                "startedAtMs": 1,
+                "endedAtMs": index + 2,
+                "tokens": zero_tokens(),
+                "costUsd": 0,
+                "models": ["gpt-test"],
+                "requests": [],
+            } for index in range(20)]
+            first = build_envelope(
+                first_snapshot,
+                device_id="11111111-1111-4111-8111-111111111111",
+                device_name="Linux",
+            )
+            second_snapshot = minimal_snapshot(generated=101)
+            second_snapshot["sessions"] = first_snapshot["sessions"][:-1]
+            second = build_envelope(
+                second_snapshot,
+                device_id="11111111-1111-4111-8111-111111111111",
+                device_name="Linux",
+            )
+            responses = [
+                (
+                    201,
+                    {
+                        "protocolVersion": 2,
+                        "revision": 1,
+                        "status": "created",
+                        "receivedAtMs": 1,
+                    },
+                ),
+                (
+                    200,
+                    {
+                        "protocolVersion": 2,
+                        "revision": 2,
+                        "status": "updated",
+                        "receivedAtMs": 2,
+                    },
+                ),
+                (
+                    200,
+                    {
+                        "protocolVersion": 2,
+                        "revision": 3,
+                        "status": "updated",
+                        "receivedAtMs": 3,
+                    },
+                ),
+            ]
+            with patch("tokenbar_sync.client._upload_v2", side_effect=responses) as upload:
+                self.assertEqual(
+                    upload_incremental_snapshot(
+                        "https://sync.example.com",
+                        "test-token",
+                        first,
+                        state_dir=directory,
+                        now_ms=1_000,
+                    )[2],
+                    "v2-full",
+                )
+                self.assertEqual(
+                    upload_incremental_snapshot(
+                        "https://sync.example.com",
+                        "test-token",
+                        second,
+                        state_dir=directory,
+                        now_ms=2_000,
+                    )[2],
+                    "v2-delta",
+                )
+                self.assertEqual(upload.call_args_list[1].args[2]["baseRevision"], 1)
+                self.assertEqual(upload.call_args_list[1].args[2]["mode"], "delta")
+                self.assertEqual(
+                    upload_incremental_snapshot(
+                        "https://sync.example.com",
+                        "test-token",
+                        {**second, "generatedAtMs": 102, "snapshot": {
+                            **second["snapshot"], "generatedAtMs": 102,
+                        }},
+                        state_dir=directory,
+                        now_ms=2_000 + 26 * 60 * 60 * 1000,
+                    )[2],
+                    "v2-full",
+                )
+            state_path = Path(directory) / "incremental-upload-v2.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["revision"], 3)
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("snapshot", state)
+
+    def test_reset_metadata_parser_contains_only_known_positive_platforms(self):
+        self.assertEqual(
+            extract_reset_metadata({
+                "protocolVersion": 2,
+                "resets": {"codex": 1, "claude": -1, "unknown": 2},
+            }),
+            {"codex": 1},
+        )
+
+    @patch("tokenbar_sync.client.download_snapshots")
+    @patch("tokenbar_sync.client.download_reset_metadata")
+    def test_reset_metadata_404_falls_back_to_protocol_v1(self, metadata, snapshots):
+        metadata.side_effect = SyncHTTPError(404)
+        snapshots.return_value = {"protocolVersion": 1, "snapshots": []}
+
+        self.assertEqual(fetch_weekly_resets("https://sync.invalid", "test-token"), {})
+        snapshots.assert_called_once()
+
+    def test_v2_404_upload_falls_back_without_persisting_payload_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = build_envelope(
+                minimal_snapshot(generated=100),
+                device_id="11111111-1111-4111-8111-111111111111",
+                device_name="Linux",
+            )
+            with patch(
+                "tokenbar_sync.client._upload_v2",
+                side_effect=SyncHTTPError(404),
+            ), patch(
+                "tokenbar_sync.client.upload_envelope",
+                return_value=(201, {"status": "created"}),
+            ):
+                result = upload_incremental_snapshot(
+                    "https://sync.example.com",
+                    "test-token",
+                    value,
+                    state_dir=directory,
+                    now_ms=1_000,
+                )
+
+            self.assertEqual(result[2], "v1-full")
+            self.assertFalse((Path(directory) / "incremental-upload-v2.json").exists())
 
     @patch("tokenbar_sync.client.subprocess.run")
     def test_helper_maps_all_three_platform_weekly_resets(self, run):

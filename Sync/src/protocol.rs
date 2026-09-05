@@ -10,11 +10,10 @@ use crate::config::tokenbar_sync_device_name;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_DEPTH: usize = 100;
-const PRIVACY_NULL_FIELDS: [&str; 17] = [
+const PRIVACY_NULL_FIELDS: [&str; 16] = [
     "promptPreview",
     "outputPreview",
     "sessionPath",
-    "title",
     "workspacePath",
     "workspaceLabel",
     "promptText",
@@ -234,6 +233,7 @@ fn sanitize_value(value: &mut Value, depth: usize) -> Result<()> {
     }
     match value {
         Value::Object(map) => {
+            let is_session = is_activity_session(map);
             let keys = map.keys().cloned().collect::<Vec<_>>();
             for key in keys {
                 if is_credential_key(&key) {
@@ -243,7 +243,11 @@ fn sanitize_value(value: &mut Value, depth: usize) -> Result<()> {
                 let Some(child) = map.get_mut(&key) else {
                     continue;
                 };
-                if PRIVACY_NULL_FIELDS.contains(&key.as_str()) {
+                if key == "title" && is_session {
+                    if !is_valid_session_title(child) {
+                        *child = Value::Null;
+                    }
+                } else if key == "title" || PRIVACY_NULL_FIELDS.contains(&key.as_str()) {
                     *child = Value::Null;
                 } else {
                     sanitize_value(child, depth + 1)?;
@@ -276,11 +280,18 @@ fn verify_privacy_boundary(value: &Value, depth: usize) -> Result<()> {
     }
     match value {
         Value::Object(map) => {
+            let is_session = is_activity_session(map);
             for (key, child) in map {
                 if is_credential_key(key) {
                     bail!("sanitization failed for a credential-bearing property");
                 }
-                if PRIVACY_NULL_FIELDS.contains(&key.as_str()) && !child.is_null() {
+                if key == "title" && is_session {
+                    if !child.is_null() && !is_valid_session_title(child) {
+                        bail!("sanitization failed for a session title");
+                    }
+                } else if (key == "title" || PRIVACY_NULL_FIELDS.contains(&key.as_str()))
+                    && !child.is_null()
+                {
                     bail!("sanitization failed for a sensitive ActivitySnapshot field");
                 }
                 verify_privacy_boundary(child, depth + 1)?;
@@ -315,6 +326,20 @@ fn is_credential_key(key: &str) -> bool {
     CREDENTIAL_KEYS.contains(&normalized.as_str())
 }
 
+fn is_activity_session(map: &serde_json::Map<String, Value>) -> bool {
+    ["id", "startedAtMs", "endedAtMs", "tokens", "models", "requests"]
+        .iter()
+        .all(|key| map.contains_key(*key))
+}
+
+fn is_valid_session_title(value: &Value) -> bool {
+    value.as_str().is_some_and(|title| {
+        !title.is_empty()
+            && title.len() <= 512
+            && !title.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    })
+}
+
 fn looks_like_absolute_local_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     value.starts_with('/')
@@ -338,9 +363,14 @@ mod tests {
         let input = json!({
             "schemaVersion": 91,
             "sessions": [{
+                "id": "session-1",
                 "title": "private title",
                 "workspacePath": "C:\\private\\repo",
                 "workspaceLabel": "repo",
+                "startedAtMs": 1,
+                "endedAtMs": 2,
+                "tokens": {},
+                "models": [],
                 "accessToken": "credential",
                 "futureAbsolutePath": "D:\\private\\future.json",
                 "requests": [{
@@ -358,7 +388,7 @@ mod tests {
 
         let output = sanitize_snapshot(input).unwrap();
         let session = &output["sessions"][0];
-        assert!(session["title"].is_null());
+        assert_eq!(session["title"], "private title");
         assert!(session["workspacePath"].is_null());
         assert!(session["workspaceLabel"].is_null());
         assert!(session.get("accessToken").is_none());
@@ -371,6 +401,18 @@ mod tests {
         assert!(nested["promptPreview"].is_null());
         assert!(nested["outputPreview"].is_null());
         assert!(nested["sessionPath"].is_null());
+
+        let invalid_title = sanitize_snapshot(json!({
+            "id": "session-2",
+            "title": "line one\nline two",
+            "startedAtMs": 1,
+            "endedAtMs": 2,
+            "tokens": {},
+            "models": [],
+            "requests": []
+        }))
+        .unwrap();
+        assert!(invalid_title["title"].is_null());
     }
 
     #[test]

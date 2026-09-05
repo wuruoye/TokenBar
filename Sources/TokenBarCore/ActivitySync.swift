@@ -226,20 +226,27 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
     static let maximumUploadBytes = 16 * 1024 * 1024
     static let maximumDownloadBytes = 64 * 1024 * 1024
 
-    private let transport: any TokenBarHTTPTransport
-    private let timeout: TimeInterval
+    let transport: any TokenBarHTTPTransport
+    let timeout: TimeInterval
+    let incrementalStore: ActivitySyncIncrementalStore
 
     public init(timeout: TimeInterval = 15) {
         self.init(
             transport: EphemeralHTTPTransport(
                 allowsSameOriginRedirects: false,
                 bypassesProxy: true),
-            timeout: timeout)
+            timeout: timeout,
+            incrementalStore: ActivitySyncIncrementalStore())
     }
 
-    init(transport: any TokenBarHTTPTransport, timeout: TimeInterval = 15) {
+    init(
+        transport: any TokenBarHTTPTransport,
+        timeout: TimeInterval = 15,
+        incrementalStore: ActivitySyncIncrementalStore = ActivitySyncIncrementalStore())
+    {
         self.transport = transport
         self.timeout = timeout
+        self.incrementalStore = incrementalStore
     }
 
     public func upload(
@@ -358,13 +365,13 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         }
     }
 
-    private static func endpoint(baseURL: URL, components: [String]) -> URL {
+    static func endpoint(baseURL: URL, components: [String]) -> URL {
         components.reduce(baseURL) { url, component in
             url.appendingPathComponent(component, isDirectory: false)
         }
     }
 
-    private func perform(
+    func perform(
         _ request: URLRequest,
         maximumBodyBytes: Int) async throws -> TokenBarHTTPResponse
     {
@@ -384,7 +391,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         }
     }
 
-    private static func validate(
+    static func validate(
         device: ActivitySyncDevice,
         generatedAtMs: Int64,
         receivedAtMs: Int64?,
@@ -442,7 +449,13 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
             }
             try Self.validate(day: day)
         }
+        var sessionIDs = Set<String>()
         for session in snapshot.sessions {
+            let identity = "\(session.platformID.rawValue)\u{0}\(session.id)"
+            guard sessionIDs.insert(identity).inserted else {
+                throw ActivitySyncError.invalidResponse(
+                    "snapshot sessions contain duplicate identities")
+            }
             try Self.validate(session: session)
         }
         var sourcePlatforms = Set<TokenPlatform>()
@@ -479,8 +492,9 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
             }
             try Self.validate(memory: memory.today)
             try Self.validate(memory: memory.rangeTotals)
+            var memoryDayIDs = Set<String>()
             for day in memory.days {
-                guard !day.date.isEmpty else {
+                guard !day.date.isEmpty, memoryDayIDs.insert(day.date).inserted else {
                     throw ActivitySyncError.invalidResponse("snapshot memory day is invalid")
                 }
                 try Self.validate(memory: day.totals)
@@ -493,7 +507,12 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         guard Self.isNonnegativeFinite(totals.costUsd),
               totals.requestCount >= 0,
               totals.sessionCount >= 0,
-              totals.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true
+              totals.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              totals.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
+              totals.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
+              Self.hasConsistentFirstTokenAverage(
+                  totals.averageTimeToFirstTokenMs,
+                  sampleCount: totals.firstTokenSampleCount)
         else {
             throw ActivitySyncError.invalidResponse("\(label) contains invalid totals")
         }
@@ -523,6 +542,12 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
     private static func validate(day: DailySummary) throws {
         guard !day.date.isEmpty,
               Self.isNonnegativeFinite(day.costUsd),
+              day.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              day.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
+              day.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
+              Self.hasConsistentFirstTokenAverage(
+                  day.averageTimeToFirstTokenMs,
+                  sampleCount: day.firstTokenSampleCount),
               day.requestCount >= 0,
               day.sessionCount >= 0
         else {
@@ -545,7 +570,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               session.startedAtMs > 0,
               session.endedAtMs >= session.startedAtMs,
               Self.isNonnegativeFinite(session.costUsd),
-              session.title == nil,
+              session.title.map(isValidActivitySyncSessionTitle) ?? true,
               session.workspacePath == nil,
               session.workspaceLabel == nil
         else {
@@ -566,6 +591,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               request.endedAtMs >= request.startedAtMs,
               request.durationMs.map({ $0 >= 0 }) ?? true,
               request.modelDurationMs.map({ $0 >= 0 }) ?? true,
+              request.timeToFirstTokenMs.map({ $0 >= 0 }) ?? true,
               Self.isNonnegativeFinite(request.costUsd),
               request.promptPreview == nil,
               request.outputPreview == nil,
@@ -596,6 +622,16 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
 
     private static func isNonnegativeFinite(_ value: Double) -> Bool {
         value.isFinite && value >= 0
+    }
+
+    private static func hasConsistentFirstTokenAverage(
+        _ average: Double?,
+        sampleCount: Int?) -> Bool
+    {
+        if average == nil {
+            return sampleCount == nil || sampleCount == 0
+        }
+        return sampleCount.map { $0 > 0 } ?? false
     }
 }
 
@@ -674,6 +710,15 @@ public struct SynchronizedActivityService: ActivityProviding, Sendable {
         return await self.synchronize(local)
     }
 
+    public func fetchSessions(
+        on date: String,
+        statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> [SessionSummary]
+    {
+        try await self.local.fetchSessions(
+            on: date,
+            statisticsTimeZone: statisticsTimeZone)
+    }
+
     private func synchronize(_ local: ActivitySnapshot) async -> ActivitySnapshot {
         guard let configuration = await self.configuration() else {
             return local
@@ -684,6 +729,76 @@ public struct SynchronizedActivityService: ActivityProviding, Sendable {
             device: configuration.device,
             generatedAtMs: local.generatedAtMs,
             snapshot: local.redactedForSync())
+        if let incremental = self.networking as? any ActivitySyncIncrementalNetworking {
+            do {
+                let outcome = try await incremental.synchronizeIncrementally(
+                    envelope,
+                    configuration: configuration)
+                guard await self.configuration() == configuration else {
+                    return local
+                }
+                guard let response = outcome.response else {
+                    let messages = [
+                        outcome.uploadErrorDescription,
+                        outcome.downloadErrorDescription,
+                    ].compactMap { $0 }.filter { !$0.isEmpty }
+                    await self.report(ActivitySyncReport(
+                        phase: outcome.uploadErrorDescription == nil ? .partial : .failure,
+                        attemptedAt: attemptedAt,
+                        succeededAt: outcome.uploadErrorDescription == nil ? self.now() : nil,
+                        deviceCount: 1,
+                        message: messages.isEmpty ? nil : messages.joined(separator: " ")))
+                    return local
+                }
+                let merged = ActivitySnapshotMerger.merge(
+                    local: local,
+                    localDevice: configuration.device,
+                    remote: response.snapshots)
+                let localDeviceID = configuration.device.id.lowercased()
+                let remoteDeviceIDs = Set(response.snapshots.compactMap { record -> String? in
+                    let deviceID = record.device.id.lowercased()
+                    return deviceID == localDeviceID ? nil : deviceID
+                })
+                let compatibleDeviceIDs = Set(response.snapshots.compactMap { record -> String? in
+                    let deviceID = record.device.id.lowercased()
+                    guard deviceID != localDeviceID,
+                          record.snapshot.timezone == local.timezone
+                    else {
+                        return nil
+                    }
+                    return deviceID
+                })
+                let incompatibleDeviceCount = remoteDeviceIDs
+                    .subtracting(compatibleDeviceIDs).count
+                var messages = [
+                    outcome.uploadErrorDescription,
+                    outcome.downloadErrorDescription,
+                ].compactMap { $0 }.filter { !$0.isEmpty }
+                if incompatibleDeviceCount > 0 {
+                    messages.append(
+                        incompatibleDeviceCount == 1
+                            ? "1 device uses a different statistics timezone."
+                            : "\(incompatibleDeviceCount) devices use a different statistics timezone.")
+                }
+                await self.report(ActivitySyncReport(
+                    phase: messages.isEmpty ? .success : .partial,
+                    attemptedAt: attemptedAt,
+                    succeededAt: self.now(),
+                    deviceCount: compatibleDeviceIDs.count + 1,
+                    message: messages.isEmpty ? nil : messages.joined(separator: " ")))
+                return merged
+            } catch is CancellationError {
+                await self.report(.ready)
+                return local
+            } catch {
+                await self.report(ActivitySyncReport(
+                    phase: .failure,
+                    attemptedAt: attemptedAt,
+                    deviceCount: 1,
+                    message: error.localizedDescription))
+                return local
+            }
+        }
         var uploadError: Error?
         do {
             try await self.networking.upload(envelope, configuration: configuration)
@@ -891,6 +1006,10 @@ public enum ActivitySnapshotMerger {
     {
         Dictionary(grouping: days.filter { allowedDates.contains($0.date) }, by: \.date)
             .map { date, values in
+                let firstToken = self.weightedAverageTimeToFirstToken(
+                    values,
+                    average: { $0.averageTimeToFirstTokenMs },
+                    sampleCount: { $0.firstTokenSampleCount })
                 let models = Dictionary(
                     grouping: values.flatMap(\.models),
                     by: {
@@ -930,6 +1049,12 @@ public enum ActivitySnapshotMerger {
                     sessionCount: values.reduce(0) {
                         $0.saturatingAddForSync($1.sessionCount)
                     },
+                    averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                        values,
+                        tokens: { $0.tokens },
+                        rate: { $0.averageGenerationTokensPerSecond }),
+                    averageTimeToFirstTokenMs: firstToken.average,
+                    firstTokenSampleCount: firstToken.sampleCount,
                     models: models)
             }
             .sorted { $0.date < $1.date }
@@ -948,11 +1073,21 @@ public enum ActivitySnapshotMerger {
     }
 
     private static func totals(from days: [DailySummary]) -> ActivityTotals {
-        ActivityTotals(
+        let firstToken = self.weightedAverageTimeToFirstToken(
+            days,
+            average: { $0.averageTimeToFirstTokenMs },
+            sampleCount: { $0.firstTokenSampleCount })
+        return ActivityTotals(
             tokens: self.sumTokens(days.map(\.tokens)),
             costUsd: self.sumFinite(days.map(\.costUsd)),
             requestCount: days.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
-            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) })
+            sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
+            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                days,
+                tokens: { $0.tokens },
+                rate: { $0.averageGenerationTokensPerSecond }),
+            averageTimeToFirstTokenMs: firstToken.average,
+            firstTokenSampleCount: firstToken.sampleCount)
     }
 
     private static func sumTotals(_ totals: [ActivityTotals]) -> ActivityTotals {
@@ -964,21 +1099,60 @@ public enum ActivitySnapshotMerger {
                 cacheWrite: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.cacheWrite)),
                 reasoning: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.reasoning)))
             : nil
-        var generatedTokens = 0.0
-        var modeledSeconds = 0.0
-        for total in totals {
-            guard let rate = total.averageGenerationTokensPerSecond, rate > 0 else { continue }
-            let tokens = Double(total.tokens.output.saturatingAddForSync(total.tokens.reasoning))
-            generatedTokens = generatedTokens.saturatingAddForSync(tokens)
-            modeledSeconds = modeledSeconds.saturatingAddForSync(tokens / rate)
-        }
+        let firstToken = self.weightedAverageTimeToFirstToken(
+            totals,
+            average: { $0.averageTimeToFirstTokenMs },
+            sampleCount: { $0.firstTokenSampleCount })
         return ActivityTotals(
             tokens: self.sumTokens(totals.map(\.tokens)),
             costUsd: self.sumFinite(totals.map(\.costUsd)),
             requestCount: totals.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
             sessionCount: totals.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
             tokenCosts: tokenCosts,
-            averageGenerationTokensPerSecond: modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil)
+            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
+                totals,
+                tokens: { $0.tokens },
+                rate: { $0.averageGenerationTokensPerSecond }),
+            averageTimeToFirstTokenMs: firstToken.average,
+            firstTokenSampleCount: firstToken.sampleCount)
+    }
+
+    private static func weightedAverageTimeToFirstToken<Value>(
+        _ values: [Value],
+        average: (Value) -> Double?,
+        sampleCount: (Value) -> Int?) -> (average: Double?, sampleCount: Int?)
+    {
+        var totalMs = 0.0
+        var totalSamples = 0
+        for value in values {
+            guard let average = average(value),
+                  let sampleCount = sampleCount(value),
+                  sampleCount > 0
+            else {
+                continue
+            }
+            totalMs = totalMs.saturatingAddForSync(average * Double(sampleCount))
+            totalSamples = totalSamples.saturatingAddForSync(sampleCount)
+        }
+        guard totalSamples > 0 else { return (nil, nil) }
+        return (totalMs / Double(totalSamples), totalSamples)
+    }
+
+    private static func weightedAverageGenerationTokensPerSecond<Value>(
+        _ values: [Value],
+        tokens: (Value) -> TokenBreakdown,
+        rate: (Value) -> Double?) -> Double?
+    {
+        var generatedTokens = 0.0
+        var modeledSeconds = 0.0
+        for value in values {
+            guard let rate = rate(value), rate > 0 else { continue }
+            let tokens = tokens(value)
+            let count = Double(tokens.output.saturatingAddForSync(tokens.reasoning))
+            generatedTokens = generatedTokens.saturatingAddForSync(count)
+            modeledSeconds = modeledSeconds.saturatingAddForSync(count / rate)
+        }
+        return modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil
     }
 
     private static func sumTokens(_ values: [TokenBreakdown]) -> TokenBreakdown {
@@ -1009,7 +1183,7 @@ public enum ActivitySnapshotMerger {
             costUsd: session.costUsd,
             models: session.models,
             requests: session.requests.map { self.namespaced($0, for: device) },
-            title: nil,
+            title: session.title,
             workspacePath: nil,
             platform: session.platform)
     }
@@ -1030,6 +1204,7 @@ public enum ActivitySnapshotMerger {
             endedAtMs: request.endedAtMs,
             durationMs: request.durationMs,
             modelDurationMs: request.modelDurationMs,
+            timeToFirstTokenMs: request.timeToFirstTokenMs,
             tokens: request.tokens,
             costUsd: request.costUsd,
             costSource: request.costSource,
@@ -1070,13 +1245,17 @@ public extension SessionSummary {
             costUsd: redacted.costUsd,
             models: redacted.models,
             requests: redacted.requests,
-            title: nil,
+            title: sanitizedActivitySyncSessionTitle(self.title),
             workspacePath: nil,
             platform: redacted.platform)
     }
 
     var synchronizedDeviceID: String? {
         synchronizedDeviceIDForActivitySync(from: self.id)
+    }
+
+    var synchronizedOriginalSessionID: String? {
+        synchronizedIdentityForActivitySync(from: self.id)?.originalID
     }
 
     var isSynchronizedRemote: Bool {
@@ -1310,9 +1489,32 @@ private extension Double {
 }
 
 private func synchronizedDeviceIDForActivitySync(from value: String) -> String? {
+    synchronizedIdentityForActivitySync(from: value)?.deviceID
+}
+
+private func synchronizedIdentityForActivitySync(
+    from value: String) -> (deviceID: String, originalID: String)?
+{
     guard value.hasPrefix("sync:") else { return nil }
     let remainder = value.dropFirst("sync:".count)
     guard let separator = remainder.firstIndex(of: ":") else { return nil }
     let candidate = String(remainder[..<separator])
-    return UUID(uuidString: candidate)?.uuidString.lowercased()
+    let originalID = String(remainder[remainder.index(after: separator)...])
+    guard !originalID.isEmpty,
+          let deviceID = UUID(uuidString: candidate)?.uuidString.lowercased()
+    else {
+        return nil
+    }
+    return (deviceID, originalID)
+}
+
+private func sanitizedActivitySyncSessionTitle(_ value: String?) -> String? {
+    guard let value, isValidActivitySyncSessionTitle(value) else { return nil }
+    return value
+}
+
+private func isValidActivitySyncSessionTitle(_ value: String) -> Bool {
+    !value.isEmpty
+        && value.utf8.count <= 512
+        && !value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
 }
