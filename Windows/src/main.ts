@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, cachePercentage, displayedBuckets,
+  remainingPercent, weeklyPacing, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails,
   type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
 
@@ -27,6 +27,11 @@ function button(label: string, action: () => unknown, className = ""): HTMLButto
   const node = el("button", className, label);
   node.type = "button";
   node.addEventListener("click", () => Promise.resolve().then(action).catch(notify));
+  return node;
+}
+function modelDetails(lines: string[], className = "model-details muted small"): HTMLElement {
+  const node = el("div", className);
+  for (const line of lines) node.append(el("div", "", line));
   return node;
 }
 function notify(error: unknown) {
@@ -231,7 +236,7 @@ function dashboard(): HTMLElement {
     usage.append(el("span", "", compact(tokenTotal(session.tokens))), price, el("span", "", "›"));
     sub.append(el("span", "", (session.deviceName || session.workspaceLabel || names[platform]) + " · " + dateTime(session.endedAtMs)),
       usage);
-    row.append(title, sub); recent.append(row);
+    row.append(title, modelDetails(sessionModelDetails(session), "session-models muted"), sub); recent.append(row);
   }
   if (!sessions.length) recent.append(el("p", "muted", "还没有会话记录。"));
   main.append(recent);
@@ -300,7 +305,7 @@ function sessionView(): HTMLElement {
   const session = sessionsFor(visibleSnapshot(), platform).find(s => sessionKey(s) === selectedSession);
   if (!session) { main.append(el("p", "notice", "该会话已不在当前统计中。")); return main; }
   main.append(el("h1", "detail-title", session.title || session.id),
-    el("p", "muted small", names[platform] + " · " + dateTime(session.startedAtMs)));
+    el("p", "muted small", names[platform] + " · " + dateTime(session.startedAtMs)), modelDetails(sessionModelDetails(session)));
   const actions = el("div", "detail-actions");
   actions.append(button("复制会话", () => copy(locator(session))));
   if (platform !== "grok" && !session.deviceId) actions.append(button(platform === "claude" ? "打开 Claude 会话列表" : "在 Codex 中打开", () =>
@@ -320,7 +325,7 @@ function sessionView(): HTMLElement {
     heading.append(name, el("strong", "cost", requestCost(request)));
     const tps = throughput(request);
     const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + tps.toFixed(1) + " tok/s" : ""));
-    summary.append(heading, metrics, el("p", "preview", request.promptPreview || request.model));
+    summary.append(heading, metrics, modelDetails(requestModelDetails(request)), el("p", "preview", request.promptPreview || request.model));
     turn.append(summary);
     let loaded = false;
     turn.addEventListener("toggle", () => {
@@ -337,7 +342,7 @@ function requestRow(session: Session, request: Request): HTMLElement {
   const row = el("div", "request");
   const meta = el("div", "request-meta");
   meta.append(el("span", "muted small", compact(tokenTotal(request.tokens)) + " tokens"), el("strong", "cost small", requestCost(request)));
-  row.append(el("strong", "small", (request.isSubagent ? request.agent || "Subagent" : "Main") + " · " + request.model),
+  row.append(el("strong", "small", (request.isSubagent ? request.agent || "Subagent" : "Main") + " · " + requestModelDetails(request).join("；")),
     meta, tokenRows(request.tokens));
   const actions = el("div", "detail-actions");
   actions.append(button("复制定位信息", () => copy(locator(session, request))));

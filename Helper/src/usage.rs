@@ -167,6 +167,8 @@ pub enum ServiceTier {
 pub struct UnifiedMessage {
     pub client: String,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub provider_id: String,
     pub session_id: String,
     #[serde(default)]
@@ -228,6 +230,7 @@ impl UnifiedMessage {
         Self {
             client: client.into(),
             model_id: model_id.into(),
+            reasoning_effort: None,
             provider_id: provider_id.into(),
             session_id: session_id.into(),
             physical_session_id: None,
@@ -369,6 +372,17 @@ pub fn workspace_label_from_key(key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    matches!(value.as_str(), "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "auto")
+        .then_some(value)
+}
+
+pub fn reasoning_effort_from_model(model_id: &str) -> Option<String> {
+    let (model, effort) = model_id.trim().strip_suffix(')')?.rsplit_once('(')?;
+    (!model.is_empty()).then(|| normalize_reasoning_effort(effort)).flatten()
+}
+
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
     let mut name = model_id.trim().to_ascii_lowercase();
     for prefix in ["openai/", "openai_codex/"] {
@@ -404,7 +418,7 @@ fn strip_reasoning_tier(model_id: &str) -> Option<&str> {
     }
     matches!(
         tier,
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "auto" | "none" | "fast"
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "auto" | "none" | "fast"
     )
     .then_some(base_model)
 }

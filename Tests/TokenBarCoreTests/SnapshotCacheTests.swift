@@ -45,7 +45,8 @@ struct SnapshotCacheTests {
             promptPreview: "nested prompt secret",
             outputPreview: "nested output secret",
             sessionPath: "/Users/private/.codex/sessions/child-session.jsonl",
-            serviceTier: .fast)
+            serviceTier: .fast,
+            reasoningEffort: "high")
         let original = TestFixtures.activity(
             promptPreview: "prompt secret",
             outputPreview: "output secret",
@@ -69,6 +70,7 @@ struct SnapshotCacheTests {
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.sessionPath == nil)
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.physicalSessionId == "child-session")
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.serviceTier == .fast)
+        #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.reasoningEffort == "high")
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.modelDurationMs == 600)
         #expect(loaded?.sessions.first?.requests.first?.contributions?.first?.timeToFirstTokenMs == 700)
         #expect(loaded?.sessions.first?.title == nil)

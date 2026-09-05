@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { locator, sessionsFor, sourceFor, throughput, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, displayedBuckets, type Session, type Snapshot, type Request } from "./model";
+  remainingPercent, weeklyPacing, displayedBuckets, sessionModelDetails, requestModelDetails, type Session, type Snapshot, type Request } from "./model";
 
 describe("provider isolation and counting", () => {
   it("keeps identical session IDs in different platforms separate", () => {
@@ -37,6 +37,25 @@ describe("provider isolation and counting", () => {
 });
 
 describe("macOS menu presentation", () => {
+  it("pairs each model with all recorded effort levels, including subagents", () => {
+    const turn = {model:"gpt-6-astra", reasoningEffort:"ultra", contributions:[
+      {model:"gpt-6-astra", reasoningEffort:"xhigh"},
+      {model:"gpt-6-astra", reasoningEffort:"high"},
+      {model:"gpt-5.6-sol", reasoningEffort:"medium", isSubagent:true},
+      {model:"gpt-6-astra", reasoningEffort:"high"}
+    ]} as Request;
+    const expected = ["gpt-6-astra · effort: high / xhigh", "gpt-5.6-sol · effort: medium"];
+    expect(requestModelDetails(turn)).toEqual(expected);
+    expect(sessionModelDetails({requests:[turn],models:["gpt-6-astra","gpt-5.6-sol"]} as Session)).toEqual(expected);
+  });
+  it("keeps missing effort distinct from none and supports older snapshots", () => {
+    const turn = {model:"gpt-6-astra", contributions:[
+      {model:"gpt-6-astra",reasoningEffort:"none"}, {model:"gpt-6-astra"}
+    ]} as Request;
+    expect(requestModelDetails(turn)).toEqual(["gpt-6-astra · effort: none / 未记录"]);
+    expect(sessionModelDetails({models:["gpt-5.6-sol"],requests:[]} as unknown as Session))
+      .toEqual(["gpt-5.6-sol · effort: 未记录"]);
+  });
   it("keeps the aggregated turn price separate from its physical request prices", () => {
     const turn = { costUsd: 4.5, costSource: "unknown", contributions: [
       { costUsd: 1.25, costSource: "estimated" }, { costUsd: 3.25, costSource: "providerReported" }

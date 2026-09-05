@@ -259,6 +259,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     public let sessionPath: String?
     public let contributions: [RequestSummary]?
     public let serviceTier: ActivityServiceTier?
+    public let reasoningEffort: String?
 
     public init(
         id: String,
@@ -281,6 +282,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         sessionPath: String?,
         contributions: [RequestSummary]? = nil,
         serviceTier: ActivityServiceTier? = nil,
+        reasoningEffort: String? = nil,
         platform: TokenPlatform? = nil)
     {
         self.id = id
@@ -304,6 +306,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
         self.sessionPath = sessionPath
         self.contributions = contributions
         self.serviceTier = serviceTier
+        self.reasoningEffort = reasoningEffort
     }
 
     public var startedAt: Date {
@@ -357,6 +360,7 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
             sessionPath: nil,
             contributions: self.contributions?.map { $0.redactedForCache() },
             serviceTier: self.serviceTier,
+            reasoningEffort: self.reasoningEffort,
             platform: self.platform)
     }
 }

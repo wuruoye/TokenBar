@@ -125,6 +125,8 @@ pub struct RequestSummary {
     pub is_subagent: bool,
     pub agent: Option<String>,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub provider: String,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
@@ -257,6 +259,7 @@ struct RequestKey {
     source: String,
     provider: String,
     model: String,
+    reasoning_effort: Option<String>,
     session_id: String,
     physical_session_id: String,
     agent: Option<String>,
@@ -269,6 +272,7 @@ struct RequestRow {
     source: String,
     provider: String,
     model: String,
+    reasoning_effort: Option<String>,
     session_id: String,
     physical_session_id: String,
     is_subagent: bool,
@@ -305,6 +309,7 @@ impl RequestRow {
             source: self.source.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             session_id: self.session_id.clone(),
             physical_session_id: self.physical_session_id.clone(),
             agent: self.agent.clone(),
@@ -990,6 +995,9 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
     }
 
     let model = normalize_model_for_grouping(&message.model_id);
+    let reasoning_effort = message.reasoning_effort.as_deref()
+        .and_then(usage::normalize_reasoning_effort)
+        .or_else(|| usage::reasoning_effort_from_model(&message.model_id));
     let physical_session_id = physical_session_id(&message);
     let is_subagent = message.is_subagent || physical_session_id != message.session_id;
     let request_start_timestamp = message
@@ -1008,6 +1016,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         source: message.client,
         provider: message.provider_id,
         model,
+        reasoning_effort,
         session_id: message.session_id,
         physical_session_id,
         is_subagent,
@@ -1151,6 +1160,9 @@ fn push_turn(
 }
 
 fn merge_request(target: &mut RequestRow, row: RequestRow) {
+    if target.reasoning_effort != row.reasoning_effort {
+        target.reasoning_effort = None;
+    }
     target.tokens.add_assign(&row.tokens);
     target.cost = add_cost(target.cost, row.cost);
     target.token_costs = merge_token_costs(target.token_costs, row.token_costs);
@@ -1413,6 +1425,7 @@ fn request_summary_with_id(
         is_subagent: row.is_subagent,
         agent: row.agent,
         model: row.model,
+        reasoning_effort: row.reasoning_effort,
         provider: row.provider,
         started_at_ms,
         ended_at_ms: row.request_end_timestamp,
@@ -1554,6 +1567,7 @@ mod tests {
         UnifiedMessage {
             client: "codex".to_string(),
             model_id: "gpt-5.4(high)".to_string(),
+            reasoning_effort: None,
             provider_id: "openai".to_string(),
             session_id: session_id.to_string(),
             physical_session_id: Some(physical_session_id.clone()),
@@ -1586,6 +1600,31 @@ mod tests {
             output_preview: None,
             is_turn_start: false,
         }
+    }
+
+    #[test]
+    fn preserves_model_effort_pairs_without_changing_turn_or_cost_totals() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut high = message("2026-07-13", 600_000, "root", "/tmp/root.jsonl", 100, 10);
+        high.reasoning_effort = Some("high".into());
+        high.is_turn_start = true;
+        let mut low = message("2026-07-13", 610_000, "root", "/tmp/root.jsonl", 50, 5);
+        low.reasoning_effort = Some("low".into());
+        let mut child = message("2026-07-13", 620_000, "root", "/tmp/child.jsonl", 20, 2);
+        child.model_id = "gpt-5.6-sol".into();
+        child.reasoning_effort = Some("medium".into());
+        let snapshot = build_snapshot(vec![high, low, child], today, 700_000, "UTC".into(), 30).unwrap();
+        let turn = &snapshot.sessions[0].requests[0];
+        assert_eq!(snapshot.today.request_count, 1);
+        assert_eq!(snapshot.today.tokens.total(), 187);
+        assert_eq!(snapshot.today.cost_usd, 0.75);
+        assert_eq!(turn.contributions.len(), 3);
+        assert_eq!(turn.reasoning_effort, None);
+        assert_eq!(turn.contributions.iter().map(|r| (r.model.as_str(), r.reasoning_effort.as_deref())).collect::<Vec<_>>(),
+            vec![("gpt-5.4", Some("high")), ("gpt-5.4", Some("low")), ("gpt-5.6-sol", Some("medium"))]);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["sessions"][0]["requests"][0]["contributions"][0]["reasoningEffort"], "high");
+        assert_eq!(serde_json::from_value::<ActivitySnapshot>(json).unwrap(), snapshot);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::usage::{
-    content_preview_from_str, content_preview_from_value, normalize_workspace_key,
+    content_preview_from_str, content_preview_from_value, normalize_reasoning_effort, normalize_workspace_key,
     workspace_label_from_key, ServiceTier, TokenBreakdown, UnifiedMessage,
 };
 
@@ -41,6 +41,8 @@ struct CodexPayload {
     content: Option<Value>,
     model: Option<String>,
     model_name: Option<String>,
+    effort: Option<Value>,
+    reasoning_effort: Option<Value>,
     model_info: Option<CodexModelInfo>,
     info: Option<CodexInfo>,
     turn_id: Option<String>,
@@ -184,6 +186,7 @@ impl CodexTotals {
 #[derive(Debug, Clone, Default)]
 struct CodexParseState {
     current_model: Option<String>,
+    current_reasoning_effort: Option<String>,
     current_service_tier: ServiceTier,
     service_tier_consensus: Option<ServiceTier>,
     service_tier_conflicted: bool,
@@ -386,6 +389,10 @@ fn parse_codex_reader<R: BufRead>(
 
                 if entry_type == "turn_context" {
                     state.current_model = payload_model.clone();
+                    state.current_reasoning_effort = payload.effort.as_ref()
+                        .or(payload.reasoning_effort.as_ref())
+                        .and_then(Value::as_str)
+                        .and_then(normalize_reasoning_effort);
                     state.current_turn_start_ms = parsed_entry_timestamp;
                     state.current_model_request_start_ms = parsed_entry_timestamp;
                     state.current_model_first_response_ms = None;
@@ -605,6 +612,7 @@ fn parse_codex_reader<R: BufRead>(
                         agent,
                     );
                     message.service_tier = state.current_service_tier;
+                    message.reasoning_effort.clone_from(&state.current_reasoning_effort);
                     message.duration_ms = duration_ms;
                     message.model_duration_ms = model_duration_ms;
                     message.time_to_first_token_ms = time_to_first_token_ms;
@@ -670,6 +678,7 @@ fn parse_codex_reader<R: BufRead>(
         }
         if let Some(mut message) = headless_message {
             message.service_tier = state.current_service_tier;
+            message.reasoning_effort.clone_from(&state.current_reasoning_effort);
             message.set_workspace(
                 state.session_workspace_key.clone(),
                 state.session_workspace_label.clone(),
@@ -721,6 +730,7 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.forked_child_task_started_turn_ids.clear();
             state.forked_child_is_user_fork = payload.thread_source.as_deref() == Some("user");
             state.current_service_tier = ServiceTier::Unknown;
+            state.current_reasoning_effort = None;
             state.service_tier_consensus = None;
             state.service_tier_conflicted = false;
             state.current_model_request_start_ms = None;
@@ -1375,6 +1385,26 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn reasoning_effort_follows_turn_context_without_filling_missing_records() {
+        let lines = [
+            r#"{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"medium"}}"#.to_string(),
+            token_line("2026-01-01T00:00:01Z", (10, 2, 0, 0), (10, 2, 0, 0)),
+            r#"{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"max"}}"#.to_string(),
+            token_line("2026-01-01T00:00:02Z", (20, 4, 0, 0), (10, 2, 0, 0)),
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#.to_string(),
+            token_line("2026-01-01T00:00:03Z", (30, 6, 0, 0), (10, 2, 0, 0)),
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","reasoning_effort":"high"}}"#.to_string(),
+            token_line("2026-01-01T00:00:04Z", (40, 8, 0, 0), (10, 2, 0, 0)),
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":42}}"#.to_string(),
+            token_line("2026-01-01T00:00:05Z", (50, 10, 0, 0), (10, 2, 0, 0)),
+        ].join("\n");
+        let messages = parse(&lines);
+        assert_eq!(messages.iter().map(|m| m.reasoning_effort.as_deref()).collect::<Vec<_>>(),
+            vec![Some("medium"), Some("max"), None, Some("high"), None]);
+        assert_eq!(messages.iter().map(|m| m.tokens.total()).sum::<i64>(), 60);
     }
 
     #[test]

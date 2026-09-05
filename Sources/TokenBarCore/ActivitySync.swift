@@ -1213,6 +1213,7 @@ public enum ActivitySnapshotMerger {
             sessionPath: nil,
             contributions: request.contributions?.map { self.namespaced($0, for: device) },
             serviceTier: request.serviceTier,
+            reasoningEffort: request.reasoningEffort,
             platform: request.platform)
     }
 }

@@ -69,6 +69,8 @@ strong { font-weight: 600; }
 .sessions { padding-bottom: 5px; }
 .session-row { width: 100%; text-align: left; border: 0; border-top: 1px solid var(--border); border-radius: 0; padding: 11px 0; }
 .session-title { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.5; }
+.session-models { font-size: 9px; line-height: 1.5; margin-top: 3px; overflow-wrap: anywhere; }
+.model-details { line-height: 1.5; margin-top: 5px; overflow-wrap: anywhere; }
 .session-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 10px; margin-top: 5px; }
 .session-meta > span:first-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .session-usage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }

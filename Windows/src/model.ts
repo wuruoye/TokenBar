@@ -12,6 +12,7 @@ export interface Day extends Totals {
 export interface Request {
   id: string; platform: string; sessionId: string; physicalSessionId: string;
   isSubagent: boolean; agent?: string; model: string; startedAtMs: number; endedAtMs: number;
+  reasoningEffort?: string | null;
   modelDurationMs?: number; tokens: Tokens; costUsd: number; costSource: string; serviceTier: string;
   sessionPath?: string; promptPreview?: string; outputPreview?: string; contributions?: Request[];
 }
@@ -102,6 +103,29 @@ export function sourceFor(snapshot: Snapshot | undefined, platform: Platform): S
 }
 export function sessionsFor(snapshot: Snapshot | undefined, platform: Platform): Session[] {
   return (snapshot?.sessions ?? []).filter(s => s.platform === platform).sort((a, b) => b.endedAtMs - a.endedAtMs);
+}
+function physicalRequests(request: Request): Request[] {
+  return request.contributions?.length ? request.contributions.flatMap(physicalRequests) : [request];
+}
+function describeModels(requests: Request[], fallbackModels: string[] = []): string[] {
+  const models = new Map<string, Set<string>>();
+  for (const request of requests) {
+    const model = request.model?.trim() || "unknown";
+    const efforts = models.get(model) ?? new Set<string>();
+    efforts.add(request.reasoningEffort?.trim() || "未记录");
+    models.set(model, efforts);
+  }
+  for (const model of fallbackModels) if (!models.has(model)) models.set(model, new Set(["未记录"]));
+  if (!models.size) models.set("unknown", new Set(["未记录"]));
+  const levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto", "未记录"];
+  return [...models].map(([model, efforts]) => (model === "unknown" ? "模型未记录" : model) + " · effort: "
+    + [...efforts].sort((a, b) => levels.indexOf(a) - levels.indexOf(b) || a.localeCompare(b)).join(" / "));
+}
+export function sessionModelDetails(session: Session): string[] {
+  return describeModels(session.requests.flatMap(physicalRequests), session.models);
+}
+export function requestModelDetails(request: Request): string[] {
+  return describeModels(physicalRequests(request));
 }
 export function locator(session: Session, request?: Request): string {
   return "platform=" + session.platform + " session_id=" + (request?.physicalSessionId ?? session.id)
