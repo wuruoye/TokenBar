@@ -70,8 +70,9 @@ strong { font-weight: 600; }
 .session-row { width: 100%; text-align: left; border: 0; border-top: 1px solid var(--border); border-radius: 0; padding: 11px 0; }
 .session-title { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.5; }
 .session-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 10px; margin-top: 5px; }
-.session-meta span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.session-meta span:last-child { flex-shrink: 0; }
+.session-meta > span:first-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.session-usage { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.session-cost-summary { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 14px; }
 .footnote { font-size: 9px; color: var(--muted); text-align: center; margin: 17px 0 2px; }
 .statusbar { height: 43px; flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; border-top: 1px solid var(--border); }
 .refresh { padding: 4px 9px; border: 0; color: var(--accent); font-size: 11px; }
@@ -86,10 +87,13 @@ strong { font-weight: 600; }
 .detail-actions button { font-size: 11px; }
 .turn { border: 1px solid var(--border); border-radius: 9px; margin: 14px 0; background: var(--card); }
 .turn-summary { cursor: pointer; padding: 12px; }
-.turn-summary > div { display: inline; }
+.turn-heading { display: inline-flex; width: calc(100% - 16px); justify-content: space-between; align-items: baseline; gap: 8px; }
+.turn-heading .cost, .request-meta .cost { white-space: nowrap; }
+.turn-metrics { margin-top: 5px; }
 .preview { font-size: 12px; margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
 .badge { display: inline-block; margin-left: 8px; padding: 2px 5px; border-radius: 4px; color: var(--accent); background: var(--hover); font-size: 8px; }
 .request { padding: 12px; border-top: 1px solid var(--border); }
+.request-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 5px; }
 .request > .token-rows { margin-top: 10px; }
 .request-text pre { font: 11px/1.7 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; user-select: text; }
 .request-text .section-title { margin-bottom: 4px; }

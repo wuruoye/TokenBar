@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { locator, sessionsFor, sourceFor, throughput, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, todayCost,
+import { locator, sessionsFor, sourceFor, throughput, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
   remainingPercent, weeklyPacing, displayedBuckets, type Session, type Snapshot, type Request } from "./model";
 
 describe("provider isolation and counting", () => {
@@ -37,6 +37,40 @@ describe("provider isolation and counting", () => {
 });
 
 describe("macOS menu presentation", () => {
+  it("keeps the aggregated turn price separate from its physical request prices", () => {
+    const turn = { costUsd: 4.5, costSource: "unknown", contributions: [
+      { costUsd: 1.25, costSource: "estimated" }, { costUsd: 3.25, costSource: "providerReported" }
+    ] } as Request;
+    expect(requestCost(turn)).toBe("~$4.50");
+    expect(turn.contributions!.map(requestCost)).toEqual(["~$1.25", "$3.25"]);
+    expect(sessionCost({ costUsd: 4.5, requests: [turn] } as Session)).toBe("~$4.50");
+  });
+  it("distinguishes unknown turn prices, reported zero, and small positive charges", () => {
+    const request = { costUsd: 0, costSource: "unknown" } as Request;
+    expect(requestCost(request)).toBe("—");
+    request.costSource = "providerReported";
+    expect(requestCost(request)).toBe("$0.00");
+    request.costUsd = 0.004;
+    expect(requestCost(request)).toBe("<$0.01");
+  });
+  it("uses the session total without adding its requests again and preserves reported pricing", () => {
+    const session = { costUsd: 12.34, requests: [
+      { costUsd: 10, costSource: "estimated" }, { costUsd: 2.34, costSource: "providerReported" }
+    ] } as Session;
+    expect(sessionCost(session)).toBe("~$12.34");
+    session.requests[0].costSource = "providerReported";
+    expect(sessionCost(session)).toBe("$12.34");
+  });
+  it("keeps unpriced sessions distinct from a reported zero and a tiny positive cost", () => {
+    const session = { costUsd: 0, requests: [{ costSource: "unknown" }] } as Session;
+    expect(sessionCost(session)).toBe("—");
+    session.requests[0].costSource = "providerReported";
+    expect(sessionCost(session)).toBe("$0.00");
+    session.costUsd = 0.004;
+    expect(sessionCost(session)).toBe("<$0.01");
+    session.costUsd = Number.NaN;
+    expect(sessionCost(session)).toBe("—");
+  });
   it("shows remaining quota while preserving used percentage for pacing", () => {
     const window = {usedPercent:78,windowMinutes:10080,resetsAtMs:7*86400000};
     expect(remainingPercent(window)).toBe(22);

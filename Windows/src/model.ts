@@ -76,6 +76,20 @@ export function displayedBuckets(tokens: Tokens) {
   ];
 }
 export function cost(value: number): string { return Number.isFinite(value) ? "~$" + value.toFixed(2) : "—"; }
+function menuCost(amount: number, reported: boolean): string {
+  if (!Number.isFinite(amount) || amount < 0 || (amount === 0 && !reported)) return "—";
+  if (amount > 0 && amount < 0.01) return "<$0.01";
+  const value = amount >= 1e6 ? (amount / 1e6).toFixed(1) + "M"
+    : amount >= 1e3 ? (amount / 1e3).toFixed(1) + "K" : amount.toFixed(2);
+  return (reported ? "$" : "~$") + value;
+}
+export function sessionCost(session: Session): string {
+  const reported = session.requests.length > 0 && session.requests.every(request => request.costSource === "providerReported");
+  return menuCost(session.costUsd, reported);
+}
+export function requestCost(request: Request): string {
+  return menuCost(request.costUsd, request.costSource === "providerReported");
+}
 export function todayCost(totals: Totals, sessions: Session[], day: string): string {
   if (totals.costUsd > 0 || tokenTotal(totals.tokens) === 0) return cost(totals.costUsd);
   const priced = sessions.some(session => session.requests.some(turn =>

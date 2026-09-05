@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, todayCost,
+import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
   remainingPercent, weeklyPacing, cachePercentage, displayedBuckets,
   type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
@@ -225,8 +225,12 @@ function dashboard(): HTMLElement {
     const row = button("", () => { selectedSession = sessionKey(session); view = "session"; render(); }, "session-row");
     const title = el("div", "session-title", session.title || session.requests[0]?.promptPreview || session.id);
     const sub = el("div", "session-meta muted");
+    const usage = el("span", "session-usage");
+    const price = el("span", "cost", sessionCost(session));
+    price.title = price.textContent === "—" ? "费用未知" : "会话费用：" + price.textContent;
+    usage.append(el("span", "", compact(tokenTotal(session.tokens))), price, el("span", "", "›"));
     sub.append(el("span", "", (session.deviceName || session.workspaceLabel || names[platform]) + " · " + dateTime(session.endedAtMs)),
-      el("span", "", compact(tokenTotal(session.tokens)) + " ›"));
+      usage);
     row.append(title, sub); recent.append(row);
   }
   if (!sessions.length) recent.append(el("p", "muted", "还没有会话记录。"));
@@ -301,18 +305,22 @@ function sessionView(): HTMLElement {
   actions.append(button("复制会话", () => copy(locator(session))));
   if (platform !== "grok" && !session.deviceId) actions.append(button(platform === "claude" ? "打开 Claude 会话列表" : "在 Codex 中打开", () =>
     invoke("open_session", { platform, sessionId: session.id })));
-  main.append(actions, tokenRows(session.tokens));
+  const costSummary = el("div", "session-cost-summary");
+  costSummary.append(el("span", "muted small", "会话费用"), el("strong", "cost", sessionCost(session)));
+  main.append(actions, costSummary, tokenRows(session.tokens));
   if (session.deviceId) main.append(el("p", "notice", "来自 " + session.deviceName + " · 远端会话只读，同步数据不包含提示词、输出和本地路径。"));
   if (platform === "grok") main.append(el("p", "muted small", "可在 Grok Build 中使用 --resume 和会话 ID 恢复。"));
   session.requests.forEach((request, index) => {
     const turn = el("details", "turn");
     const summary = el("summary", "turn-summary");
-    const text = el("div");
-    text.append(el("strong", "", "Turn " + (index + 1)), el("span", "muted small", " · " + compact(tokenTotal(request.tokens)) + " tokens"));
+    const heading = el("div", "turn-heading");
+    const name = el("span");
+    name.append(el("strong", "", "Turn " + (index + 1)));
+    if (request.serviceTier === "fast" || request.serviceTier === "mixed") name.append(el("span", "badge", request.serviceTier.toUpperCase()));
+    heading.append(name, el("strong", "cost", requestCost(request)));
     const tps = throughput(request);
-    if (tps) text.append(el("span", "muted small", " · " + tps.toFixed(1) + " tok/s"));
-    if (request.serviceTier === "fast" || request.serviceTier === "mixed") text.append(el("span", "badge", request.serviceTier.toUpperCase()));
-    summary.append(text, el("p", "preview", request.promptPreview || request.model));
+    const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + tps.toFixed(1) + " tok/s" : ""));
+    summary.append(heading, metrics, el("p", "preview", request.promptPreview || request.model));
     turn.append(summary);
     let loaded = false;
     turn.addEventListener("toggle", () => {
@@ -327,9 +335,10 @@ function sessionView(): HTMLElement {
 }
 function requestRow(session: Session, request: Request): HTMLElement {
   const row = el("div", "request");
+  const meta = el("div", "request-meta");
+  meta.append(el("span", "muted small", compact(tokenTotal(request.tokens)) + " tokens"), el("strong", "cost small", requestCost(request)));
   row.append(el("strong", "small", (request.isSubagent ? request.agent || "Subagent" : "Main") + " · " + request.model),
-    el("p", "muted small", compact(tokenTotal(request.tokens)) + " tokens · " + (request.costSource === "unknown" ? "费用未知" : cost(request.costUsd))),
-    tokenRows(request.tokens));
+    meta, tokenRows(request.tokens));
   const actions = el("div", "detail-actions");
   actions.append(button("复制定位信息", () => copy(locator(session, request))));
   const details = el("div", "request-text");
