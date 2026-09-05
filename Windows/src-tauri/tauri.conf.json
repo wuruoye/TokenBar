@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TokenBar",
+  "version": "0.1.0",
+  "identifier": "com.wuruoye.tokenbar.windows",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{
+      "label": "main", "title": "TokenBar", "width": 384, "height": 760,
+      "minWidth": 360, "minHeight": 520, "decorations": false,
+      "resizable": true, "skipTaskbar": true, "visible": true,
+      "center": true, "backgroundColor": "#101512"
+    }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true, "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png"],
+    "externalBin": ["binaries/tokenbar-helper"],
+    "resources": {"../../LICENSE": "LICENSE.txt", "../ThirdPartyLicenses.html": "ThirdPartyLicenses.html"},
+    "windows": {"nsis": {"installMode": "currentUser", "languages": ["SimpChinese", "English"], "displayLanguageSelector": false}}
+  }
+}

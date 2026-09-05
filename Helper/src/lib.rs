@@ -15,6 +15,7 @@ pub mod claude;
 pub mod grok;
 pub mod memory;
 pub mod pricing;
+pub mod openrouter;
 pub mod usage;
 
 pub use usage::StatisticsTimeZone;
@@ -221,6 +222,8 @@ pub struct ActivitySnapshot {
     pub sources: Vec<ActivitySourceSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_usage: Option<memory::MemoryUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_catalog: Option<openrouter::CatalogStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -868,6 +871,7 @@ fn build_snapshot_core(
         days,
         sources: Vec::new(),
         memory_usage: None,
+        pricing_catalog: None,
     })
 }
 

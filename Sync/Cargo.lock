@@ -1236,6 +1236,7 @@ dependencies = [
  "iana-time-zone",
  "libc",
  "rayon",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

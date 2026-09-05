@@ -4,8 +4,10 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{Days, Utc};
+use serde::Deserialize;
 use tokenbar_helper::claude::{
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
@@ -15,8 +17,9 @@ use tokenbar_helper::grok::{
     extract_request_detail as extract_grok_request_detail, load_grok_session_titles,
     parse_local_grok_messages, LocalParseOptions as GrokParseOptions,
 };
-use serde::Deserialize;
-use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
+use tokenbar_helper::memory::{
+    load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT,
+};
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, FastPricingBasis};
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
@@ -25,7 +28,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--anthropic-pricing-markdown PATH] [--memory-database PATH]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--anthropic-pricing-markdown PATH] [--memory-database PATH] [--openrouter-pricing-json PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -37,6 +40,8 @@ struct SnapshotConfig {
     grok_weekly_reset_ms: Option<i64>,
     anthropic_pricing_markdown: Option<PathBuf>,
     memory_database: Option<PathBuf>,
+    offline_pricing: bool,
+    openrouter_pricing_json: Option<PathBuf>,
 }
 
 impl Default for SnapshotConfig {
@@ -50,6 +55,8 @@ impl Default for SnapshotConfig {
             grok_weekly_reset_ms: None,
             anthropic_pricing_markdown: None,
             memory_database: None,
+            offline_pricing: false,
+            openrouter_pricing_json: None,
         }
     }
 }
@@ -79,20 +86,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Snapshot(config) => run_snapshot(config),
         Command::RequestDetail(config) => {
             let detail = match config.platform.as_str() {
-                "codex" => {
-                    extract_codex_request_detail(
-                        &config.session_path,
-                        config.start_ms,
-                        config.end_ms,
-                    )
-                }
-                "claude" => {
-                    extract_claude_request_detail(
-                        &config.session_path,
-                        config.start_ms,
-                        config.end_ms,
-                    )
-                }
+                "codex" => extract_codex_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
+                "claude" => extract_claude_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
                 "grok" => extract_grok_request_detail(
                     &config.session_path,
                     config.start_ms,
@@ -103,7 +106,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(io::Error::other)?;
             write_json(&detail)
         }
-        Command::MemoryReceiver(config) => run_receiver(config).map_err(io::Error::other).map_err(Into::into),
+        Command::MemoryReceiver(config) => run_receiver(config)
+            .map_err(io::Error::other)
+            .map_err(Into::into),
     }
 }
 
@@ -121,10 +126,10 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         config.claude_weekly_reset_ms,
         config.grok_weekly_reset_ms,
     ]
-        .into_iter()
-        .flatten()
-        .filter_map(|timestamp| config.statistics_time_zone.date_at_ms(timestamp))
-        .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
+    .into_iter()
+    .flatten()
+    .filter_map(|timestamp| config.statistics_time_zone.date_at_ms(timestamp))
+    .fold(first_day, |earliest, reset_day| earliest.min(reset_day));
     // Parsers perform an inexpensive date prefilter before returning timestamped
     // rows. Scan one boundary day on either side, then recompute every row's date
     // below so UTC and local mode stay correct even on Windows where TZ is ignored.
@@ -144,7 +149,36 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let use_env_roots = home_dir.is_none();
 
-    let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config));
+    let catalog_load = if let Some(path) = &config.openrouter_pricing_json {
+        let bytes = std::fs::read(path)?;
+        let catalog =
+            tokenbar_helper::openrouter::Catalog::from_json(&bytes).map_err(io::Error::other)?;
+        let status = tokenbar_helper::openrouter::CatalogStatus {
+            source: "openrouter".into(),
+            updated_at_ms: None,
+            model_count: catalog.model_count(),
+            status: "file".into(),
+        };
+        tokenbar_helper::openrouter::CatalogLoad {
+            catalog: Some(catalog),
+            status,
+        }
+    } else if let Some(dir) = tokenbar_helper::openrouter::default_cache_dir() {
+        tokenbar_helper::openrouter::refresh(&dir, config.offline_pricing)
+    } else {
+        tokenbar_helper::openrouter::CatalogLoad {
+            catalog: None,
+            status: tokenbar_helper::openrouter::CatalogStatus {
+                source: "bundled".into(),
+                updated_at_ms: None,
+                model_count: 0,
+                status: "cache-unavailable".into(),
+            },
+        }
+    };
+    let catalog = catalog_load.catalog.map(Arc::new);
+    let pricing = CodexPricing::with_fast_pricing(codex_fast_pricing_basis(&config))
+        .with_openrouter_catalog(catalog.clone());
     let mut codex_messages = parse_local_codex_messages(
         LocalParseOptions {
             home_dir: home_dir.clone(),
@@ -171,7 +205,8 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .anthropic_pricing_markdown
         .as_deref()
         .and_then(|path| AnthropicPricing::from_official_markdown_file(path, today).ok())
-        .unwrap_or_else(|| AnthropicPricing::bundled_for_date(today));
+        .unwrap_or_else(|| AnthropicPricing::bundled_for_date(today))
+        .with_openrouter_catalog(catalog);
     let claude_messages = parse_local_claude_messages(
         ClaudeParseOptions {
             home_dir: home_dir.clone(),
@@ -220,15 +255,12 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     if let Some(database_path) = config.memory_database.as_deref() {
-        snapshot.memory_usage = load_usage_snapshot(
-            database_path,
-            today,
-            generated_at_ms,
-            config.days,
-        )
-        .map_err(io::Error::other)?;
+        snapshot.memory_usage =
+            load_usage_snapshot(database_path, today, generated_at_ms, config.days)
+                .map_err(io::Error::other)?;
     }
 
+    snapshot.pricing_catalog = Some(catalog_load.status);
     write_json(&snapshot)
 }
 
@@ -295,6 +327,13 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
 
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            Some("--offline-pricing") => config.offline_pricing = true,
+            Some("--openrouter-pricing-json") => {
+                config.openrouter_pricing_json = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("--openrouter-pricing-json requires a path")?,
+                ));
+            }
             Some("--days") => {
                 let value = args.next().ok_or("--days requires a value")?;
                 let value = value.to_str().ok_or("--days must be valid UTF-8")?;
@@ -410,9 +449,7 @@ fn parse_memory_receiver_args(
             }
             Some("--parent-pid") => {
                 let value = args.next().ok_or("--parent-pid requires a value")?;
-                let value = value
-                    .to_str()
-                    .ok_or("--parent-pid must be valid UTF-8")?;
+                let value = value.to_str().ok_or("--parent-pid must be valid UTF-8")?;
                 parent_pid = Some(
                     value
                         .parse::<u32>()
@@ -538,6 +575,8 @@ mod tests {
                 grok_weekly_reset_ms: Some(1_798_000_000_000),
                 anthropic_pricing_markdown: Some(PathBuf::from("/tmp/anthropic-pricing.md")),
                 memory_database: None,
+                offline_pricing: false,
+                openrouter_pricing_json: None,
             })
         );
     }
