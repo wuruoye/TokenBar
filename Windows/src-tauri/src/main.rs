@@ -3,8 +3,6 @@
 mod process;
 mod diagnostics;
 mod lifecycle;
-#[cfg(windows)]
-mod native_panel;
 mod quota;
 mod settings;
 mod sync;
@@ -75,8 +73,6 @@ fn show_panel(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
 async fn publish(app: &tauri::AppHandle, state: &AppState) {
     let dashboard = state.dashboard.lock().await.clone();
     state.taskbar.update(&dashboard);
-    #[cfg(windows)]
-    native_panel::update(&dashboard);
     if let Some(tray) = app.tray_by_id("tokenbar") {
         let mut lines = vec!["TokenBar".to_string()];
         if let Some(snapshot) = &dashboard.snapshot {
@@ -592,15 +588,12 @@ fn main() {
                 dir,
                 helper,
             }));
-            #[cfg(windows)]
-            native_panel::start(app.handle().clone());
             state(app.handle()).taskbar.start(app.handle().clone());
             let open = MenuItem::with_id(app, "open", "打开 TokenBar", true, None::<&str>)?;
             let refresh_item = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
             let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出 TokenBar", true, None::<&str>)?;
-            let native = MenuItem::with_id(app, "native", "打开原生面板（试用）", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &native, &refresh_item, &settings_item, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &refresh_item, &settings_item, &quit])?;
             TrayIconBuilder::with_id("tokenbar")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("TokenBar")
@@ -614,10 +607,6 @@ fn main() {
                     "settings" => {
                         show(app);
                         let _ = app.emit("open-settings", ());
-                    }
-                    "native" => {
-                        #[cfg(windows)]
-                        native_panel::show();
                     }
                     "quit" => lifecycle::quit(app),
                     _ => {}
@@ -728,10 +717,6 @@ fn main() {
 #[tauri::command]
 async fn test_lifecycle_action(app: tauri::AppHandle, action: String) -> Result<(), String> {
     match action.as_str() {
-        "show-native" => {
-            native_panel::show();
-            Ok(())
-        }
         "destroy-panel" => app.get_webview_window("main").ok_or("missing panel")?.destroy().map_err(|e| e.to_string()),
         "close-panel" => app.get_webview_window("main").ok_or("missing panel")?.close().map_err(|e| e.to_string()),
         "quit" => { lifecycle::quit(&app); Ok(()) }
