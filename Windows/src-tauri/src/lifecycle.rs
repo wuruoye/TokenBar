@@ -62,21 +62,17 @@ pub fn with_panel(app: &tauri::AppHandle, ready: impl FnOnce(WebviewWindow) + Se
 pub fn quit(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         state.exiting.store(true, Ordering::Release);
-        // Do not leave the Explorer child surface or its message-loop thread
-        // alive while Tauri is waiting for WebView2 to close.
+        // Stop the Explorer child surface before cleaning up the Tauri
+        // resources. Explicit Quit is allowed to discard an in-flight refresh.
         state.taskbar.stop();
     }
     diagnostics::record("quit-selected", json!({}));
-    app.exit(0);
-    // Tray callbacks run on Tauri's event loop. A blocked WebView2 teardown or
-    // a stuck native child window can otherwise keep a resident process alive
-    // after app.exit has returned. The normal event-loop exit wins; this is a
-    // bounded last resort for the explicit user-selected Quit action only.
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        diagnostics::record("quit-timeout", json!({}));
-        std::process::exit(0);
-    });
+    // Tauri documents this cleanup-before-exit sequence for cases where the
+    // event loop cannot finish WebView2 teardown. The OS releases the
+    // single-instance mutex when this process exits.
+    app.cleanup_before_exit();
+    diagnostics::record("exit", json!({}));
+    std::process::exit(0);
 }
 
 pub fn recover_panel(app: &tauri::AppHandle) {
