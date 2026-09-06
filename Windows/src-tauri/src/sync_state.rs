@@ -164,6 +164,7 @@ pub fn round(
     settings: &Settings,
     snapshot: Option<&ActivitySnapshot>,
 ) -> Result<Outcome, String> {
+    crate::diagnostics::record("sync-stage", serde_json::json!({"stage":"start"}));
     let bytes = read_token(dir)?;
     let token = std::str::from_utf8(&bytes).map_err(|_| "同步凭据无效。")?;
     let local = device::load_or_create(dir).map_err(|_| "无法读取本机设备标识。")?;
@@ -172,6 +173,9 @@ pub fn round(
     let fingerprint = format!("{:x}", Sha256::digest(&bytes));
     let client = SyncClient::new(endpoint).map_err(|e| e.to_string())?;
     let mut cache = load(dir, &endpoint_key, &local, &fingerprint);
+    crate::diagnostics::record("sync-stage", serde_json::json!({
+        "stage":"client-ready", "hasSnapshot":snapshot.is_some(),
+    }));
     let now = chrono::Utc::now().timestamp_millis();
     let descriptor = DeviceDescriptor {
         id: local.id,
@@ -191,10 +195,22 @@ pub fn round(
         let mut plan =
             IncrementalPlan::build(&envelope, cache.upload.as_ref(), &endpoint_key, 30, now)
                 .map_err(|_| "无法准备上传记录。")?;
+        crate::diagnostics::record("sync-stage", serde_json::json!({
+            "stage":"upload-start", "mode":plan.mode.label(),
+        }));
         let mut uploaded = client.upload_v2(token, &plan.body);
+        crate::diagnostics::record("sync-stage", serde_json::json!({
+            "stage":"upload-returned", "ok":uploaded.is_ok(),
+        }));
         if matches!(uploaded, Err(SyncError::Conflict)) && plan.mode == UploadMode::Delta {
             plan.force_full();
+            crate::diagnostics::record("sync-stage", serde_json::json!({
+                "stage":"upload-retry-full",
+            }));
             uploaded = client.upload_v2(token, &plan.body);
+            crate::diagnostics::record("sync-stage", serde_json::json!({
+                "stage":"upload-retry-returned", "ok":uploaded.is_ok(),
+            }));
         }
         match uploaded {
             Ok(result) => {
@@ -219,16 +235,21 @@ pub fn round(
     });
     let mut download_mode = "v2";
     let download = (|| -> Result<(), String> {
+        crate::diagnostics::record("sync-stage", serde_json::json!({"stage":"download-start"}));
         if !legacy {
             let query = cache.download.query(local.id, now, false);
             match client.query_v2(token, &query) {
                 Ok(response) => {
+                    crate::diagnostics::record("sync-stage", serde_json::json!({"stage":"download-returned"}));
                     let applied = cache
                         .download
                         .apply(response, local.id, query.force_full, now);
                     let next = match applied {
                         Ok(next) => next,
                         Err(_) if !query.force_full => {
+                            crate::diagnostics::record("sync-stage", serde_json::json!({
+                                "stage":"download-retry-full",
+                            }));
                             let query = cache.download.query(local.id, now, true);
                             let full = client.query_v2(token, &query).map_err(|e| e.to_string())?;
                             cache
@@ -245,6 +266,9 @@ pub fn round(
                 }
                 Err(SyncError::Http(404)) => {}
                 Err(SyncError::InvalidV2Response) if !query.force_full => {
+                    crate::diagnostics::record("sync-stage", serde_json::json!({
+                        "stage":"download-invalid-retry-full",
+                    }));
                     let full_query = cache.download.query(local.id, now, true);
                     let full = client
                         .query_v2(token, &full_query)
@@ -286,6 +310,7 @@ pub fn round(
     if let Err(error) = save(dir, &cache) {
         messages.push(error);
     }
+    crate::diagnostics::record("sync-stage", serde_json::json!({"stage":"cache-saved"}));
     crate::diagnostics::record(
         "sync-finished",
         serde_json::json!({"uploadSuccess":upload.as_ref().map(|r|r.is_ok()),

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,6 +126,87 @@ pub fn load(dir: &Path) -> Result<Settings, String> {
     let settings: Settings = serde_json::from_slice(&bytes).map_err(|_| "设置文件格式无效。")?;
     // Paths can become unavailable between launches. Validate those when saving.
     Ok(settings)
+}
+
+/// Import sync configuration created inside the Codex packaged-app cache when
+/// the unpackaged Windows client is launched from Explorer. Windows can give a
+/// packaged parent and an unpackaged child different LocalAppData views even
+/// though both paths print the same. Only migrate when the target has no sync
+/// credential, so an explicit target configuration always wins.
+pub fn migrate_from_packaged_peer(dir: &Path) {
+    let target = match load(dir) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    if target.sync_enabled && crate::sync::has_token(dir) {
+        return;
+    }
+    let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
+        return;
+    };
+    let packages = local.join("Packages");
+    let Ok(entries) = fs::read_dir(packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("OpenAI.Codex_") {
+            continue;
+        }
+        let source_dir = entry
+            .path()
+            .join("LocalCache")
+            .join("Local")
+            .join("com.wuruoye.tokenbar.windows");
+        let Ok(source) = load(&source_dir) else {
+            continue;
+        };
+        if !source.sync_enabled || !crate::sync::has_token(&source_dir) {
+            continue;
+        }
+        let mut merged = target.clone();
+        merged.sync_enabled = true;
+        merged.sync_endpoint = source.sync_endpoint;
+        merged.sync_device_name = source.sync_device_name;
+        merged.sync_all_devices = source.sync_all_devices;
+        let mut copied = true;
+        for file in ["sync-token.protected", "device.json", "sync-state.protected"] {
+            if let Err(error) = copy_file(&source_dir.join(file), &dir.join(file)) {
+                crate::diagnostics::record(
+                    "sync-migration-failed",
+                    serde_json::json!({"step":file,"error":error.to_string()}),
+                );
+                copied = false;
+                break;
+            }
+        }
+        if !copied {
+            continue;
+        }
+        if let Err(error) = save(dir, &merged) {
+            crate::diagnostics::record(
+                "sync-migration-failed",
+                serde_json::json!({"step":"settings","error":error}),
+            );
+            continue;
+        }
+        crate::diagnostics::record("sync-migration-complete", serde_json::json!({}));
+        break;
+    }
+}
+
+fn copy_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    let bytes = fs::read(source)?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sync migration file exceeds 64 MiB",
+        ));
+    }
+    let temp = target.with_extension(format!("migrate-{}.tmp", std::process::id()));
+    fs::write(&temp, bytes)?;
+    fs::rename(temp, target)
 }
 
 pub fn save(dir: &Path, settings: &Settings) -> Result<(), String> {

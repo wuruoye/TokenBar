@@ -273,6 +273,10 @@ async fn refresh(app: tauri::AppHandle) {
         }
     }
     publish(&app, &state).await;
+    diagnostics::record("sync-decision", serde_json::json!({
+        "enabled": settings.sync_enabled,
+        "hasSnapshot": fresh_snapshot.is_some(),
+    }));
     if settings.sync_enabled {
             state.dashboard.lock().await.sync_status = "正在同步上传、下载记录…".into();
             publish(&app, &state).await;
@@ -534,11 +538,18 @@ fn main() {
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            settings::migrate_from_packaged_peer(&dir);
             let (mut settings, error) = match settings::load(&dir) {
                 Ok(settings) => (settings, None),
                 Err(error) => (settings::Settings::default(), Some(error)),
             };
             settings.autostart = app.autolaunch().is_enabled().unwrap_or(settings.autostart);
+            diagnostics::record("settings-loaded", serde_json::json!({
+                "syncEnabled": settings.sync_enabled,
+                "syncEndpointConfigured": !settings.sync_endpoint.is_empty(),
+                "syncTokenConfigured": sync::has_token(&dir),
+                "loadError": error.is_some(),
+            }));
             let sibling = std::env::current_exe()?
                 .parent()
                 .unwrap()
