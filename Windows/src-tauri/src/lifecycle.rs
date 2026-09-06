@@ -66,6 +66,8 @@ pub fn quit(app: &tauri::AppHandle) {
         // resources. Explicit Quit is allowed to discard an in-flight refresh.
         state.taskbar.stop();
     }
+    #[cfg(windows)]
+    crate::native_panel::stop();
     diagnostics::record("quit-selected", json!({}));
     // Tauri documents this cleanup-before-exit sequence for cases where the
     // event loop cannot finish WebView2 teardown. The OS releases the
