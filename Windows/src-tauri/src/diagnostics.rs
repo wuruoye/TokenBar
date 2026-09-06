@@ -22,14 +22,15 @@ impl Logger {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(
-            &mut file,
-            &json!({
-                "time": chrono::Utc::now().to_rfc3339(), "pid": std::process::id(),
-                "event": event, "fields": fields,
-            }),
-        )?;
-        file.write_all(b"\n")?;
+        // Serialize the record and newline together. Separate writes can
+        // interleave with another TokenBar instance during a fast restart,
+        // leaving malformed JSON in the shared log.
+        let mut line = serde_json::to_vec(&json!({
+            "time": chrono::Utc::now().to_rfc3339(), "pid": std::process::id(),
+            "event": event, "fields": fields,
+        }))?;
+        line.push(b'\n');
+        file.write_all(&line)?;
         file.flush()
     }
 }
