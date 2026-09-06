@@ -3,11 +3,12 @@ export interface Tokens { input: number; output: number; cacheRead: number; cach
 export interface Totals {
   tokens: Tokens; costUsd: number; sessionCount: number; requestCount: number;
   averageGenerationTokensPerSecond?: number | null;
+  averageTimeToFirstTokenMs?: number | null; firstTokenSampleCount?: number;
   tokenCosts?: Tokens;
 }
 export interface Day extends Totals {
   date: string;
-  models: Array<{ platform: string; model: string; tokens: Tokens; costUsd: number }>;
+  models: Array<{ platform: string; model: string; provider?:string; tokens: Tokens; costUsd: number; sessionCount?:number;requestCount?:number }>;
 }
 export interface Request {
   id: string; platform: string; sessionId: string; physicalSessionId: string;
@@ -26,6 +27,7 @@ export interface MemoryPhase { total: number; input: number; cachedInput: number
 export interface Snapshot {
   schemaVersion: number; generatedAtMs: number; timezone: string;
   today: Totals; days: Day[]; sessions: Session[]; sources: Source[];
+  rangeTotals?: Totals; weeklySinceReset?: Source["weeklySinceReset"];
   memoryUsage?: { observationCount: number; rangeTotals: { phase1: MemoryPhase; phase2: MemoryPhase }; lastMemoryReceivedAtMs?: number };
   pricingCatalog?: {source:string;updatedAtMs?:number;modelCount:number;status:string};
 }
@@ -35,6 +37,7 @@ export interface Settings {
   refreshSeconds: number; recentLimit: number; theme: string; showClaude: boolean; showGrok: boolean;
   autostart: boolean; codexHome: string; claudeHome: string; grokHome: string; codexBinary: string; memoryEnabled: boolean;
   syncEnabled: boolean; syncEndpoint: string; syncDeviceName: string;
+  syncAllDevices: boolean;
   taskbarEnabled: boolean; taskbarPlatform: string; taskbarPosition: string;
 }
 export interface Dashboard {
@@ -142,48 +145,5 @@ export function throughput(request: Request): number | undefined {
   }
   return milliseconds > 0 ? tokens * 1000 / milliseconds : undefined;
 }
-export function sessionKey(session: Session): string { return (session.deviceId ?? "local") + ":" + session.id; }
-function addTokens(left: Tokens, right: Tokens): Tokens {
-  return { input: left.input + right.input, output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite,
-    reasoning: left.reasoning + right.reasoning };
-}
-function addTotals(left: Totals, right: Totals): Totals {
-  return { tokens: addTokens(left.tokens, right.tokens), costUsd: left.costUsd + right.costUsd,
-    sessionCount: left.sessionCount + right.sessionCount, requestCount: left.requestCount + right.requestCount };
-}
-export function mergedSnapshot(local: Snapshot, remotes: Remote[]): Snapshot {
-  const merged = structuredClone(local);
-  const today = local.days.at(-1)?.date;
-  for (const remote of remotes) {
-    const snapshot = remote.snapshot;
-    if (snapshot.schemaVersion !== local.schemaVersion || snapshot.timezone !== local.timezone) continue;
-    const sameDay = snapshot.days.at(-1)?.date === today;
-    merged.sessions.push(...snapshot.sessions.map(s => ({ ...s, deviceId: remote.deviceId, deviceName: remote.deviceName })));
-    for (const incoming of snapshot.sources) {
-      let source = merged.sources.find(s => s.platform === incoming.platform);
-      if (!source) {
-        source = { platform: incoming.platform, today: { tokens: zeroTokens(), costUsd: 0, sessionCount: 0, requestCount: 0 },
-          days: local.days.map(d => ({ date: d.date, tokens: zeroTokens(), costUsd: 0, sessionCount: 0, requestCount: 0, models: [] })) };
-        merged.sources.push(source);
-      }
-      if (sameDay) source.today = addTotals(source.today, incoming.today);
-      if (source.weeklySinceReset && incoming.weeklySinceReset
-        && source.weeklySinceReset.startedAtMs === incoming.weeklySinceReset.startedAtMs) {
-        source.weeklySinceReset.totals = addTotals(source.weeklySinceReset.totals, incoming.weeklySinceReset.totals);
-      } else { source.weeklySinceReset = undefined; }
-      source.days = source.days.map(day => {
-        const other = incoming.days.find(d => d.date === day.date);
-        if (!other) return day;
-        const models = structuredClone(day.models);
-        for (const incomingModel of other.models ?? []) {
-          const model = models.find(m => m.platform === incomingModel.platform && m.model === incomingModel.model);
-          if (model) { model.tokens = addTokens(model.tokens, incomingModel.tokens); model.costUsd += incomingModel.costUsd; }
-          else models.push(structuredClone(incomingModel));
-        }
-        return { ...addTotals(day, other), date: day.date, models };
-      });
-    }
-  }
-  return merged;
-}
+export function sessionKey(session: Session): string { return (session.deviceId ?? "local") + ":" + session.platform + ":" + session.id; }
+export { mergedSnapshot, currentRemotes } from "./merge";

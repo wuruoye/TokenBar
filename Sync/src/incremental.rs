@@ -16,7 +16,7 @@ const DELTA_FULL_PERCENT: usize = 70;
 const MAX_PARTITIONS: usize = 100_000;
 
 pub type PartitionManifest = BTreeMap<String, String>;
-type SnapshotPartitions = BTreeMap<String, Value>;
+pub(crate) type SnapshotPartitions = BTreeMap<String, Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -224,7 +224,7 @@ fn full_calibration_due(state: &IncrementalState, device_id: Uuid, now_ms: i64) 
         .is_none_or(|elapsed| elapsed >= FULL_CALIBRATION_INTERVAL_MS + i64::from(jitter))
 }
 
-fn partition_key(kind: &str, identity: &[&str]) -> String {
+pub(crate) fn partition_key(kind: &str, identity: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(kind.as_bytes());
     for value in identity {
@@ -248,7 +248,7 @@ fn insert_partition(
     Ok(())
 }
 
-fn snapshot_partitions(snapshot: &Value) -> Result<SnapshotPartitions> {
+pub(crate) fn snapshot_partitions(snapshot: &Value) -> Result<SnapshotPartitions> {
     let object = snapshot.as_object().context("snapshot must be an object")?;
     let mut root = object.clone();
     for key in ["sessions", "days", "sources", "memoryUsage"] {
@@ -256,7 +256,7 @@ fn snapshot_partitions(snapshot: &Value) -> Result<SnapshotPartitions> {
     }
 
     let sources = match object.get("sources") {
-        None => Value::Null,
+        None | Some(Value::Null) => Value::Null,
         Some(value) => Value::Array(
             value
                 .as_array()
@@ -274,7 +274,7 @@ fn snapshot_partitions(snapshot: &Value) -> Result<SnapshotPartitions> {
         ),
     };
     let memory_summary = match object.get("memoryUsage") {
-        None => Value::Null,
+        None | Some(Value::Null) => Value::Null,
         Some(value) => {
             let mut summary = value
                 .as_object()
@@ -365,7 +365,7 @@ fn partition_manifest(partitions: &SnapshotPartitions) -> Result<PartitionManife
         .collect()
 }
 
-fn valid_manifest(manifest: &PartitionManifest) -> bool {
+pub(crate) fn valid_manifest(manifest: &PartitionManifest) -> bool {
     manifest.len() <= MAX_PARTITIONS
         && manifest.iter().all(|(key, digest)| {
             !key.is_empty()

@@ -28,8 +28,9 @@ For development, build the helper once with the build script, then run npm run d
 - Session rows and request details pair each model with its recorded reasoning effort. Codex effort follows each turn's context; multiple model/effort combinations are listed together and missing values remain marked as unrecorded.
 - Codex links open its desktop task; Claude opens its local-session list. Grok sessions expose copyable IDs for CLI resume.
 - Data roots default to CODEX_HOME, CLAUDE_CONFIG_DIR and GROK_HOME, then the Windows user profile. Settings can specify directories and a native codex.exe. WSL requires explicitly accessible data directories and a Windows CLI for live Codex quota.
-- Settings and quota cache live in %LOCALAPPDATA%/com.wuruoye.tokenbar.windows. Local snapshots, titles and request content remain in memory; complete request text is loaded only when requested.
+- Settings and quota cache live in %LOCALAPPDATA%/com.wuruoye.tokenbar.windows. Local snapshots, local titles and local request content remain in memory; complete request text is loaded only when requested.
 - Login startup is opt-in. It starts in the tray without opening the panel.
+- Closing or unexpectedly destroying the panel keeps the tray process running. A destroyed panel is rebuilt in the background; choosing Quit still exits normally. Local lifecycle logs at `%LOCALAPPDATA%/com.wuruoye.tokenbar.windows/logs/runtime.log` record launches, exit reasons, panics, refresh health, and taskbar availability without session contents or credentials. Logs rotate at 1 MiB with one backup.
 
 The native taskbar host combines Windows accessibility bounds with native child-window enumeration. It reserves complete regions for custom tools such as TrafficMonitor even when they expose no accessibility buttons, and never overlaps or resizes them. A per-pixel alpha popup surface parented into the taskbar keeps text visible above Windows 11's DirectComposition bridge while preserving the taskbar background. Text uses regular 9-point Microsoft YaHei and full rectangular click targets. The host follows taskbar visibility and DPI changes and recreates its own surface after Explorer changes. Layout queries run on a separate MTA thread that owns no windows. If no safe gap is available, the tray remains usable and Settings reports the reason. Display readiness requires a successful composited-frame update.
 
@@ -39,7 +40,11 @@ The shared Helper automatically refreshes the public OpenRouter model-price list
 
 ## Multi-device sync
 
-Enable sync in Settings and supply the HTTPS server origin, device name and device token from the existing protocol-v1 service. The Rust UI reuses tokenbar-sync validation, redaction and HTTP handling. The token is protected with DPAPI CurrentUser and is never returned to the frontend after saving. Sync uploads fresh local statistics and downloads compatible snapshots. The device selector can combine all devices; remote sessions remain read-only. Today only includes remote snapshots from the same UTC day, and combined weekly totals require matching reset boundaries.
+Enable sync in Settings and supply the HTTPS sync-server origin, device name and device token. The Rust client reuses tokenbar-sync validation and redaction, uploads fresh local statistics using protocol v2, and queries changed remote partitions and deletions. It falls back to v1 when v2 is unavailable, retries stale upload revisions in full, and recalibrates invalid download deltas. Upload and download failures are reported independently; failed downloads retain the previous remote records.
+
+The access token and endpoint-scoped remote cache use DPAPI CurrentUser encryption. Upload state contains hashes and revisions, without a local snapshot body. Cached remote records are sanitized and integrity-checked before use and restored after restarting the app. Credential or endpoint changes invalidate the old cache. The access token is never returned to the frontend; prompt/output text and local paths are excluded from sync traffic and the remote cache.
+
+By default the panel and taskbar show combined usage, with a persistent selector for this device or all devices. Merging follows the macOS rules: use the latest snapshot per device, match the current statistics date and timezone, include only the local date range, preserve model/provider attribution and weighted throughput, and add weekly totals only for matching reset boundaries. It rebuilds totals from local and remote snapshots on every update, so repeated downloads do not increase counts. Remote sessions retain their device name and session identity and remain read-only. Only the unmerged local snapshot is ever uploaded.
 
 Use one uploader identity per Windows installation. When migrating from the headless TokenBarSync scheduled task, disable that task before enabling the UI uploader so the same machine is not counted twice.
 
@@ -66,6 +71,8 @@ npm run tauri -- build --debug --no-bundle --features ui-test
 # Launch target/debug/tokenbar-windows.exe with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9237
 node tests/taskbar.native.mjs
 ~~~
+
+After stopping the normal TokenBar instance, run `node tests/lifecycle.native.mjs` against that same `ui-test` build to verify panel destruction/recreation, resident process and tray/taskbar retention, second-launch activation, and explicit Quit. The test launches and closes its own TokenBar process and leaves settings unchanged.
 
 Read-only native taskbar geometry diagnostics:
 

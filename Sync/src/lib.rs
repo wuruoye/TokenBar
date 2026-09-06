@@ -1,6 +1,7 @@
 //! Shared protocol and client implementation for native TokenBar applications.
 pub mod config;
 pub mod device;
+pub mod download;
 pub mod incremental;
 pub mod protocol;
 pub mod sync_client;

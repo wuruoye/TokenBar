@@ -1,12 +1,6 @@
-use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokenbar_helper::ActivitySnapshot;
-use tokenbar_sync::{
-    device,
-    protocol::{self, DeviceDescriptor, DeviceOs},
-    sync_client::{Endpoint, SyncClient},
-};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,14 +12,14 @@ pub struct Remote {
 }
 
 #[cfg(windows)]
-fn crypt(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
+pub(super) fn crypt(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
             CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         },
     };
-    if input.is_empty() || input.len() > 65536 {
+    if input.is_empty() || input.len() > 65 * 1024 * 1024 {
         return Err("同步凭据大小无效。".into());
     }
     let source = CRYPT_INTEGER_BLOB {
@@ -70,7 +64,7 @@ fn crypt(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
     }
 }
 #[cfg(not(windows))]
-fn crypt(_: &[u8], _: bool) -> Result<Vec<u8>, String> {
+pub(super) fn crypt(_: &[u8], _: bool) -> Result<Vec<u8>, String> {
     Err("同步凭据存储需要 Windows DPAPI。".into())
 }
 
@@ -91,55 +85,23 @@ pub fn has_token(dir: &Path) -> bool {
     dir.join("sync-token.protected").is_file()
 }
 
-pub fn round(
-    dir: &Path,
-    settings: &Settings,
-    snapshot: &ActivitySnapshot,
-) -> Result<Vec<Remote>, String> {
-    let protected = std::fs::read(dir.join("sync-token.protected"))
-        .map_err(|_| "请在设置中填写同步访问令牌。")?;
-    let bytes = Zeroizing::new(crypt(&protected, false)?);
-    let token = std::str::from_utf8(&bytes).map_err(|_| "同步凭据无效。")?;
-    let local = device::load_or_create(dir).map_err(|_| "无法读取本机设备标识。")?;
-    let client =
-        SyncClient::new(Endpoint::parse(&settings.sync_endpoint).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    let descriptor = DeviceDescriptor {
-        id: local.id,
-        name: settings.sync_device_name.clone(),
-        os: DeviceOs::Windows,
-        client_version: Some(env!("CARGO_PKG_VERSION").into()),
-    };
-    let envelope = protocol::upload_envelope(
-        serde_json::to_value(snapshot).map_err(|_| "无法编码统计数据。")?,
-        descriptor,
-    )
-    .map_err(|_| "统计数据未通过同步校验。")?;
-    client
-        .upload(token, &envelope)
-        .map_err(|e| format!("同步上传失败：{e}"))?;
-    let response = client
-        .download(token)
-        .map_err(|e| format!("同步下载失败：{e}"))?;
-    let remotes = response
-        .snapshots
-        .into_iter()
-        .filter(|row| row.device.id != local.id)
-        .filter_map(|row| {
-            let snapshot: ActivitySnapshot = serde_json::from_value(row.snapshot).ok()?;
-            if snapshot.schema_version != tokenbar_helper::SCHEMA_VERSION
-                || snapshot.timezone != "UTC"
-            {
-                return None;
-            }
-            Some(Remote {
-                device_id: row.device.id.to_string(),
-                device_name: row.device.name,
-                snapshot,
-            })
-        })
-        .collect();
-    Ok(remotes)
+pub fn displayed_today(dashboard: &crate::Dashboard, platform: &str) -> Option<i64> {
+    let local = dashboard.snapshot.as_ref()?;
+    let latest = local.days.iter().map(|day| day.date.as_str()).max();
+    let mut snapshots = vec![local];
+    if latest.is_some() && dashboard.settings.sync_enabled && dashboard.settings.sync_all_devices {
+        let mut ids = std::collections::HashSet::new();
+        snapshots.extend(dashboard.remote_snapshots.iter().filter(|remote| ids.insert(&remote.device_id)
+            && remote.snapshot.timezone == local.timezone && remote.snapshot.schema_version > 0
+            && remote.snapshot.days.iter().map(|day| day.date.as_str()).max() == latest).map(|r| &r.snapshot));
+    }
+    let totals: Vec<_> = snapshots.iter().filter_map(|snapshot| snapshot.sources.iter().find(|s| s.platform == platform)).collect();
+    if totals.is_empty() { return None; }
+    Some(totals.into_iter().fold(0i64, |sum, source| {
+        let t = &source.today.tokens;
+        sum.saturating_add(t.input).saturating_add(t.output).saturating_add(t.cache_read)
+            .saturating_add(t.cache_write).saturating_add(t.reasoning)
+    }))
 }
 
 #[cfg(test)]

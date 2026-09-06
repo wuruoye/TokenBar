@@ -1,9 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod process;
+mod diagnostics;
+mod lifecycle;
 mod quota;
 mod settings;
 mod sync;
+mod sync_state;
 mod taskbar;
 #[cfg(windows)]
 mod taskbar_render;
@@ -46,6 +49,8 @@ struct AppState {
     timer_changed: Notify,
     receiver: Mutex<Option<tokio::process::Child>>,
     pinned: AtomicBool,
+    exiting: AtomicBool,
+    panel_creation: Mutex<()>,
     taskbar: taskbar::Controller,
     panel_platform: std::sync::Mutex<String>,
     dir: PathBuf,
@@ -56,11 +61,14 @@ fn state(app: &tauri::AppHandle) -> Arc<AppState> {
     app.state::<Arc<AppState>>().inner().clone()
 }
 fn show(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("panel-opened", ());
-    }
+    let handle = app.clone();
+    lifecycle::with_panel(app, move |window| show_panel(&handle, &window));
+}
+fn show_panel(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+    let shown = window.show().is_ok();
+    let _ = window.set_focus();
+    diagnostics::record("panel-opened", serde_json::json!({"shown":shown}));
+    let _ = app.emit("panel-opened", ());
 }
 async fn publish(app: &tauri::AppHandle, state: &AppState) {
     let dashboard = state.dashboard.lock().await.clone();
@@ -74,13 +82,7 @@ async fn publish(app: &tauri::AppHandle, state: &AppState) {
                 {
                     continue;
                 }
-                let t = &source.today.tokens;
-                let total = t
-                    .input
-                    .saturating_add(t.output)
-                    .saturating_add(t.cache_read)
-                    .saturating_add(t.cache_write)
-                    .saturating_add(t.reasoning);
+                let total = sync::displayed_today(&dashboard, &source.platform).unwrap_or(0);
                 lines.push(format!(
                     "{}: 今日 {:.2}M tokens",
                     source.platform,
@@ -94,10 +96,12 @@ async fn publish(app: &tauri::AppHandle, state: &AppState) {
 }
 
 fn toggle_panel(app: &tauri::AppHandle, platform: &str, anchor: taskbar::Rect) {
+    let handle = app.clone();
+    let platform = platform.to_string();
+    lifecycle::with_panel(app, move |window| toggle_existing_panel(&handle, &window, &platform, anchor));
+}
+fn toggle_existing_panel(app: &tauri::AppHandle, window: &tauri::WebviewWindow, platform: &str, anchor: taskbar::Rect) {
     let state = state(app);
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
     let mut active = state
         .panel_platform
         .lock()
@@ -139,7 +143,7 @@ fn toggle_panel(app: &tauri::AppHandle, platform: &str, anchor: taskbar::Rect) {
         }
     }
     let _ = app.emit("open-platform", platform);
-    show(app);
+    show_panel(app, window);
 }
 
 #[tauri::command]
@@ -209,6 +213,8 @@ async fn refresh(app: tauri::AppHandle) {
     let Ok(_guard) = state.refresh_lock.try_lock() else {
         return;
     };
+    let started = std::time::Instant::now();
+    diagnostics::record("refresh-started", serde_json::json!({}));
     let (settings, previous) = {
         let mut dashboard = state.dashboard.lock().await;
         dashboard.refreshing = true;
@@ -258,6 +264,7 @@ async fn refresh(app: tauri::AppHandle) {
         Ok(snapshot)
     });
     let fresh_snapshot = result.as_ref().ok().cloned();
+    diagnostics::record("refresh-finished", serde_json::json!({"success":result.is_ok(),"elapsedMs":started.elapsed().as_millis()}));
     {
         let mut dashboard = state.dashboard.lock().await;
         match result {
@@ -267,23 +274,23 @@ async fn refresh(app: tauri::AppHandle) {
     }
     publish(&app, &state).await;
     if settings.sync_enabled {
-        if let Some(snapshot) = fresh_snapshot {
+            state.dashboard.lock().await.sync_status = "正在同步上传、下载记录…".into();
+            publish(&app, &state).await;
             let directory = state.dir.clone();
             let sync_settings = settings.clone();
             let result = tauri::async_runtime::spawn_blocking(move || {
-                sync::round(&directory, &sync_settings, &snapshot)
+                sync_state::round(&directory, &sync_settings, fresh_snapshot.as_ref())
             })
             .await;
             let mut dashboard = state.dashboard.lock().await;
             match result {
-                Ok(Ok(remotes)) => {
-                    dashboard.sync_status = format!("同步完成 · {} 台其他设备", remotes.len());
-                    dashboard.remote_snapshots = remotes;
+                Ok(Ok(outcome)) => {
+                    dashboard.sync_status = outcome.status;
+                    dashboard.remote_snapshots = outcome.remotes;
                 }
                 Ok(Err(error)) => dashboard.sync_status = error,
                 Err(_) => dashboard.sync_status = "同步任务未完成。".into(),
             }
-        }
     }
     state.dashboard.lock().await.refreshing = false;
     // Quota contains percentages and timestamps only. Session content stays in memory.
@@ -311,6 +318,7 @@ async fn save_settings(
     let state = state(&app);
     let _guard = state.refresh_lock.lock().await;
     let old = state.dashboard.lock().await.settings.clone();
+    let token_changed = sync_token.as_ref().is_some_and(|v| !v.is_empty());
     if settings.sync_enabled
         && !sync::has_token(&state.dir)
         && sync_token.as_ref().is_none_or(|v| v.is_empty())
@@ -354,7 +362,7 @@ async fn save_settings(
             dashboard.snapshot = None;
             dashboard.quotas.clear();
         }
-        if !settings.sync_enabled || old.sync_endpoint != settings.sync_endpoint {
+        if !settings.sync_enabled || old.sync_endpoint != settings.sync_endpoint || token_changed {
             dashboard.remote_snapshots.clear();
             dashboard.sync_status = if settings.sync_enabled {
                 "等待同步".into()
@@ -368,6 +376,20 @@ async fn save_settings(
     state.timer_changed.notify_one();
     publish(&app, &state).await;
     tauri::async_runtime::spawn(refresh(app));
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_sync_scope(app: tauri::AppHandle, all_devices: bool) -> Result<(), String> {
+    let state = state(&app);
+    {
+        let mut dashboard = state.dashboard.lock().await;
+        let mut settings = dashboard.settings.clone();
+        settings.sync_all_devices = all_devices;
+        settings::save(&state.dir, &settings)?;
+        dashboard.settings = settings;
+    }
+    publish(&app, &state).await;
     Ok(())
 }
 #[tauri::command]
@@ -479,24 +501,28 @@ async fn open_session(
 }
 
 fn main() {
+    diagnostics::init();
     macro_rules! command_handler {
         ($($extra:path),*) => {
             tauri::generate_handler![
                 get_dashboard, refresh_dashboard, save_settings, set_pinned,
                 request_detail, copy_text, open_session,
-                get_taskbar_status, get_active_platform, set_active_platform
+                get_taskbar_status, get_active_platform, set_active_platform, set_sync_scope
                 $(,$extra)*
             ]
         };
     }
     #[cfg(all(windows, feature = "ui-test"))]
     let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
-        Box::new(command_handler![test_taskbar_click]);
+        Box::new(command_handler![test_taskbar_click, test_lifecycle_action, test_lifecycle_status]);
     #[cfg(not(all(windows, feature = "ui-test")))]
     let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
         Box::new(command_handler![]);
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            diagnostics::record("second-instance-activation", serde_json::json!({}));
+            show(app);
+        }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .arg("--background")
@@ -527,6 +553,8 @@ fn main() {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
+            let cached_remotes = sync_state::cached_remotes(&dir, &settings);
+            let sync_status = if !settings.sync_enabled { "未启用" } else if cached_remotes.is_empty() { "等待同步" } else { "已载入上次同步记录" }.to_string();
             app.manage(Arc::new(AppState {
                 dashboard: Mutex::new(Dashboard {
                     settings,
@@ -535,13 +563,15 @@ fn main() {
                     refreshing: false,
                     error,
                     memory_status: "未启用".into(),
-                    remote_snapshots: vec![],
-                    sync_status: "未同步".into(),
+                    remote_snapshots: cached_remotes,
+                    sync_status,
                 }),
                 refresh_lock: Mutex::new(()),
                 timer_changed: Notify::new(),
                 receiver: Mutex::new(None),
                 pinned: AtomicBool::new(false),
+                exiting: AtomicBool::new(false),
+                panel_creation: Mutex::new(()),
                 taskbar: taskbar::Controller::new(),
                 panel_platform: std::sync::Mutex::new("codex".into()),
                 dir,
@@ -567,7 +597,7 @@ fn main() {
                         show(app);
                         let _ = app.emit("open-settings", ());
                     }
-                    "quit" => app.exit(0),
+                    "quit" => lifecycle::quit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -599,6 +629,21 @@ fn main() {
                 }
             }
             let handle = app.handle().clone();
+            diagnostics::record("primary-ready", serde_json::json!({}));
+            let health_app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let state = state(&health_app);
+                    if state.exiting.load(Ordering::Acquire) { break; }
+                    let bar = state.taskbar.status();
+                    diagnostics::record("heartbeat", serde_json::json!({
+                        "panelExists":health_app.get_webview_window("main").is_some(),
+                        "trayExists":health_app.tray_by_id("tokenbar").is_some(),
+                        "taskbarAttached":bar.attached, "taskbarPainted":bar.painted,
+                    }));
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 refresh(handle.clone()).await;
                 loop {
@@ -623,6 +668,11 @@ fn main() {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
+                diagnostics::record("panel-close-hidden", serde_json::json!({}));
+            }
+            tauri::WindowEvent::Destroyed => {
+                diagnostics::record("panel-destroyed", serde_json::json!({"label":window.label()}));
+                state(window.app_handle()).pinned.store(false, Ordering::Relaxed);
             }
             tauri::WindowEvent::Focused(false)
                 if !state(window.app_handle()).pinned.load(Ordering::Relaxed)
@@ -634,11 +684,40 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("TokenBar could not start")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                state(app).taskbar.stop();
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                diagnostics::record("exit-requested", serde_json::json!({"code":code,"prevented":code.is_none()}));
+                // Losing the last panel must not terminate a resident tray application.
+                if code.is_none() {
+                    api.prevent_exit();
+                    lifecycle::recover_panel(app);
+                }
+                else { state(app).exiting.store(true, Ordering::Release); }
             }
+            tauri::RunEvent::Exit => {
+                diagnostics::record("exit", serde_json::json!({}));
+                if let Some(state) = app.try_state::<Arc<AppState>>() { state.taskbar.stop(); }
+            }
+            _ => {}
         });
+}
+
+#[cfg(all(windows, feature = "ui-test"))]
+#[tauri::command]
+async fn test_lifecycle_action(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    match action.as_str() {
+        "destroy-panel" => app.get_webview_window("main").ok_or("missing panel")?.destroy().map_err(|e| e.to_string()),
+        "close-panel" => app.get_webview_window("main").ok_or("missing panel")?.close().map_err(|e| e.to_string()),
+        "quit" => { lifecycle::quit(&app); Ok(()) }
+        _ => Err("invalid lifecycle test action".into()),
+    }
+}
+
+#[cfg(all(windows, feature = "ui-test"))]
+#[tauri::command]
+fn test_lifecycle_status(app: tauri::AppHandle) -> serde_json::Value {
+    serde_json::json!({"pid":std::process::id(),"panelExists":app.get_webview_window("main").is_some(),
+        "trayExists":app.tray_by_id("tokenbar").is_some(),"taskbar":state(&app).taskbar.status()})
 }
 
 #[cfg(all(windows, feature = "ui-test"))]

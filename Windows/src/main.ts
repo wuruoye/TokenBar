@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails,
+  remainingPercent, weeklyPacing, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes,
   type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
 
@@ -14,7 +14,7 @@ let selectedSession: string | undefined;
 let chartDays = 30;
 let pinned = false;
 let settingsDirty = false;
-let allDevices = false;
+let allDevices = true;
 const names: Record<Platform, string> = { codex: "Codex", claude: "Claude", grok: "Grok" };
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = "", text?: string): HTMLElementTagNameMap[K] {
@@ -185,11 +185,12 @@ function dashboard(): HTMLElement {
     const devices = el("div", "device-scope");
     const selector = el("select");
     selector.setAttribute("aria-label", "统计设备");
-    for (const [value, label] of [["local", "本机"], ["all", "全部设备（" + (1 + data.remoteSnapshots.length) + "）"]]) {
+    const count = data.snapshot ? currentRemotes(data.snapshot, data.remoteSnapshots).length : data.remoteSnapshots.length;
+    for (const [value, label] of [["local", "本机"], ["all", "全部设备（" + (1 + count) + "）"]]) {
       const option = el("option", "", label); option.value = value; selector.append(option);
     }
     selector.value = allDevices ? "all" : "local";
-    selector.addEventListener("change", () => { allDevices = selector.value === "all"; render(); });
+    selector.addEventListener("change", () => { void invoke("set_sync_scope", {allDevices:selector.value === "all"}).catch(notify); });
     devices.append(selector, el("span", "muted small", data.syncStatus)); main.append(devices);
   }
   const quota = data?.quotas[platform];
@@ -469,6 +470,7 @@ function render() {
 }
 function update(next: Dashboard) {
   data = next;
+  allDevices = next.settings.syncEnabled && (next.settings.syncAllDevices ?? true);
   if (view === "settings" && settingsDirty || view === "session") {
     document.querySelector("footer")?.replaceWith(footer()); return;
   }
@@ -487,7 +489,7 @@ async function start() {
   await listen<Dashboard>("dashboard-updated", event => update(event.payload));
   await listen("open-settings", () => { view = "settings"; settingsDirty = false; render(); });
   await listen<Platform>("open-platform", event => {
-    platform = event.payload; view = "dashboard"; settingsDirty = false; allDevices = false; render();
+    platform = event.payload; view = "dashboard"; settingsDirty = false; allDevices = !!data?.settings.syncEnabled && (data.settings.syncAllDevices ?? true); render();
   });
   await listen("panel-opened", () => {
     if (!data?.refreshing && (!data?.snapshot || Date.now() - data.snapshot.generatedAtMs > 60000)) void invoke("refresh_dashboard");

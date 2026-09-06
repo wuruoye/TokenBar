@@ -96,7 +96,13 @@ impl Controller {
             .clone()
     }
     fn set_status(&self, value: Status) {
-        *self.0.status.write().unwrap_or_else(|e| e.into_inner()) = value;
+        let mut previous = self.0.status.write().unwrap_or_else(|e| e.into_inner());
+        if previous.attached != value.attached || previous.message != value.message {
+            crate::diagnostics::record("taskbar-state", serde_json::json!({
+                "attached":value.attached, "painted":value.painted, "message":value.message,
+            }));
+        }
+        *previous = value;
     }
     pub fn pointer_pressed(&self) -> bool {
         #[cfg(windows)]
@@ -139,21 +145,7 @@ fn model(dashboard: &Dashboard) -> Model {
                 || (*platform == "grok" && settings.show_grok)
         })
         .map(|(platform, title)| {
-            let today = dashboard
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.sources.iter().find(|s| s.platform == platform))
-                .map(|s| {
-                    let t = &s.today.tokens;
-                    compact(
-                        t.input
-                            .saturating_add(t.output)
-                            .saturating_add(t.cache_read)
-                            .saturating_add(t.cache_write)
-                            .saturating_add(t.reasoning),
-                    )
-                })
-                .unwrap_or_else(|| "—".into());
+            let today = crate::sync::displayed_today(dashboard, platform).map(compact).unwrap_or_else(|| "—".into());
             let quota = dashboard.quotas.get(platform);
             let weekly = quota
                 .and_then(|q| q.weekly.as_ref())
@@ -377,6 +369,7 @@ mod native {
                         TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
+                    crate::diagnostics::record("taskbar-loop-ended", serde_json::json!({}));
                     controller.0.manager.store(0, Ordering::Release);
                 }
                 context.destroy_host();
@@ -1011,6 +1004,7 @@ mod native {
                     return 0;
                 }
                 WM_NCDESTROY => {
+                    crate::diagnostics::record("taskbar-host-destroyed", serde_json::json!({}));
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 _ => {}

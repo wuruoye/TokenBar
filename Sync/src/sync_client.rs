@@ -70,6 +70,9 @@ impl Endpoint {
         url.set_path(&format!("/v2/snapshots/{device_id}"));
         url
     }
+    fn query_url(&self) -> Url {
+        let mut url = self.0.clone(); url.set_path("/v2/snapshots/query"); url
+    }
 
     fn reset_metadata_url(&self) -> Url {
         let mut url = self.0.clone();
@@ -302,6 +305,19 @@ impl SyncClient {
         let decoded: DownloadResponse =
             serde_json::from_slice(&bytes).map_err(|_| SyncError::InvalidDownload)?;
         normalize_download(decoded).map_err(|_| SyncError::InvalidDownload)
+    }
+
+    pub fn query_v2(&self, token: &str, query: &crate::download::QueryRequest) -> Result<crate::download::QueryResponse, SyncError> {
+        require_token(token)?;
+        let body = serde_json::to_vec(query).map_err(|_| SyncError::Encode)?;
+        if body.len() > MAX_UPLOAD_BYTES { return Err(SyncError::UploadTooLarge); }
+        let response = self.client.post(self.endpoint.query_url()).bearer_auth(token)
+            .header(CONTENT_TYPE, "application/json").body(body).send().map_err(|_| SyncError::Network)?;
+        match response.status().as_u16() {
+            200..=299 => decode_limited(response, MAX_DOWNLOAD_BYTES, SyncError::InvalidV2Response),
+            401 | 403 => Err(SyncError::Authentication),
+            other => Err(SyncError::Http(other)),
+        }
     }
 }
 

@@ -1,11 +1,6 @@
 mod collector;
-mod config;
-mod device;
-mod incremental;
-mod protocol;
 mod storage;
-mod sync_client;
-mod weekly_resets;
+use tokenbar_sync::{config, device, incremental, protocol, sync_client, weekly_resets};
 
 use std::path::PathBuf;
 
