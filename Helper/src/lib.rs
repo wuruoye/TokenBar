@@ -999,7 +999,10 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         .and_then(usage::normalize_reasoning_effort)
         .or_else(|| usage::reasoning_effort_from_model(&message.model_id));
     let physical_session_id = physical_session_id(&message);
-    let is_subagent = message.is_subagent || physical_session_id != message.session_id;
+    // Codex can continue a user session in another physical rollout file.
+    // Its explicit lineage determines subagent status across those files.
+    let is_subagent = message.is_subagent
+        || (message.client != "codex" && physical_session_id != message.session_id);
     let request_start_timestamp = message
         .duration_ms
         .filter(|duration| *duration > 0)

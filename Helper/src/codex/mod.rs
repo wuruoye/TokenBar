@@ -348,6 +348,9 @@ fn assign_subagent_messages_to_root_sessions(
     }
 
     for message in messages {
+        if let Some(upstream_id) = upstream_by_physical.get(&message.session_id) {
+            message.is_subagent = parent_by_upstream.contains_key(upstream_id);
+        }
         if let Some(root_session_id) = root_by_physical.get(&message.session_id) {
             message.session_id.clone_from(root_session_id);
         }
@@ -721,6 +724,59 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert!(messages.iter().all(|message| message.session_id == "root"));
         assert!(messages.iter().all(|message| message.token_costs.is_some()));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn continued_user_session_keeps_turns_separate_from_subagents() {
+        let home = temporary_home("continued-user-turns");
+        let directory = home.join(".codex/sessions");
+        for (filename, timestamp, id, parent, prompt) in [
+            ("root", "2026-07-01T00:00:01Z", "root-id", None, "First prompt"),
+            ("root_continued", "2026-07-01T01:00:01Z", "root-id", None, "Next prompt"),
+            ("subagent", "2026-07-01T01:00:02Z", "child-id", Some("root-id"), "Child task"),
+        ] {
+            write_json_lines(
+                &directory.join(format!("{filename}.jsonl")),
+                vec![
+                    session_meta(timestamp, id, parent),
+                    turn_context(timestamp),
+                    serde_json::json!({
+                        "timestamp": timestamp,
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user", "content": [
+                            {"type": "input_text", "text": prompt}
+                        ]}
+                    }),
+                    token_count(timestamp, 100, 10),
+                ],
+            );
+        }
+        let messages = parse_local_codex_messages(
+            LocalParseOptions {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            &CodexPricing::bundled(),
+        ).unwrap();
+        let expected_cost: f64 = messages.iter().map(|message| message.cost).sum();
+        let snapshot = crate::build_snapshot(
+            messages,
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            1782950399000,
+            "UTC".to_string(),
+            1,
+        ).unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        let turns = &snapshot.sessions[0].requests;
+        assert_eq!(turns.len(), 2);
+        let continued = turns.iter().find(|turn| turn.prompt_preview.as_deref() == Some("Next prompt")).unwrap();
+        assert!(!continued.is_subagent);
+        assert_eq!(continued.contributions.len(), 2);
+        assert_eq!(continued.contributions.iter().filter(|request| request.is_subagent).count(), 1);
+        assert_eq!(snapshot.today.tokens.input, 300);
+        assert_eq!(snapshot.today.tokens.output, 30);
+        assert!((snapshot.today.cost_usd - expected_cost).abs() < 1e-10);
         fs::remove_dir_all(home).unwrap();
     }
 
