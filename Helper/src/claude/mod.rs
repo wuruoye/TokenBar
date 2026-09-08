@@ -44,6 +44,7 @@ pub fn parse_local_claude_messages(
     pricing: &AnthropicPricing,
 ) -> Result<Vec<UnifiedMessage>, String> {
     let paths = discover_claude_files(&options)?;
+    let session_aliases = desktop_session_aliases(&options);
     let parsed = paths
         .par_iter()
         .map(|path| parse_claude_file(path))
@@ -55,6 +56,9 @@ pub fn parse_local_claude_messages(
         let path_text = path.to_string_lossy().into_owned();
         for mut message in file_messages {
             message.session_path = Some(path_text.clone());
+            if let Some(current_id) = session_aliases.get(&message.session_id) {
+                message.session_id.clone_from(current_id);
+            }
             if message
                 .dedup_key
                 .as_ref()
@@ -83,6 +87,47 @@ pub fn parse_local_claude_messages(
         messages.retain(|message| message.date.as_str() <= until);
     }
     Ok(messages)
+}
+
+// Desktop can replace its CLI session ID while retaining the same conversation.
+// Only its explicit prior-ID mapping joins transcripts; shared titles or replayed
+// messages also occur in independent forks and cannot establish this relation.
+fn desktop_session_aliases(options: &LocalParseOptions) -> HashMap<String, String> {
+    let Some(home) = options.home_dir.as_ref().map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from)) else {
+        return HashMap::new();
+    };
+    let mut pending = vec![home.join("Library/Application Support/Claude/claude-code-sessions")];
+    let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !kind.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(record) = fs::read(&path).ok()
+                .and_then(|data| serde_json::from_slice::<Value>(&data).ok()) else { continue };
+            if !record.get("sessionId").and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("local_")) {
+                continue;
+            }
+            let Some(current) = record.get("cliSessionId").and_then(Value::as_str)
+                .filter(|id| !id.is_empty()) else { continue };
+            let Some(prior_ids) = record.get("priorCliSessionIds").and_then(Value::as_array) else { continue };
+            for prior in prior_ids.iter().filter_map(Value::as_str).filter(|id| !id.is_empty() && *id != current) {
+                candidates.entry(prior.to_string()).or_default().insert(current.to_string());
+            }
+        }
+    }
+    candidates.into_iter().filter_map(|(prior, targets)| {
+        (targets.len() == 1).then(|| (prior, targets.into_iter().next().unwrap()))
+    }).collect()
 }
 
 pub fn extract_request_detail(
@@ -739,6 +784,63 @@ mod tests {
         assert_eq!(messages[0].output_preview.as_deref(), Some("Done"));
         assert!(messages[0].is_turn_start);
         assert!(!messages[0].is_subagent);
+    }
+
+    #[test]
+    fn desktop_prior_ids_merge_user_turns_without_recounting_replay() {
+        let home = temporary_path("desktop-continuation");
+        let directory = home.join(".claude/projects/project");
+        fs::create_dir_all(&directory).unwrap();
+        let turn = |id: &str, prompt: &str, timestamp: &str, message_id: &str, sidechain: bool| {
+            [
+                serde_json::json!({"type":"custom-title","customTitle":"Same title","sessionId":id}),
+                serde_json::json!({"type":"user","sessionId":id,"isSidechain":sidechain,
+                    "timestamp":timestamp,"message":{"content":prompt}}),
+                serde_json::json!({"type":"assistant","sessionId":id,"isSidechain":sidechain,
+                    "timestamp":timestamp,"message":{"id":message_id,"model":"claude-sonnet-4-6",
+                        "usage":{"input_tokens":10,"output_tokens":2}}}),
+            ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n"
+        };
+        fs::write(directory.join("a-old.jsonl"),
+            turn("a-old", "Original", "2026-07-24T10:00:00Z", "first", false)).unwrap();
+        fs::write(directory.join("b-current.jsonl"), format!("{}{}",
+            turn("b-current", "Original", "2026-07-24T10:00:00Z", "first", false),
+            turn("b-current", "Continued", "2026-07-24T11:00:00Z", "second", false))).unwrap();
+        fs::write(directory.join("c-unrelated.jsonl"),
+            turn("c-unrelated", "Separate", "2026-07-24T11:00:00Z", "third", false)).unwrap();
+        fs::write(directory.join("agent-child.jsonl"),
+            turn("a-old", "Child", "2026-07-24T11:00:01Z", "child", true)).unwrap();
+        let options = LocalParseOptions {
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pricing = AnthropicPricing::default();
+        let before = parse_local_claude_messages(options.clone(), &pricing).unwrap();
+        let index = home.join("Library/Application Support/Claude/claude-code-sessions/account/org");
+        fs::create_dir_all(&index).unwrap();
+        fs::write(index.join("local_session.json"),
+            r#"{"sessionId":"local_session","cliSessionId":"b-current","priorCliSessionIds":["a-old"]}"#).unwrap();
+        let messages = parse_local_claude_messages(options, &pricing).unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.iter().map(|message| &message.tokens).collect::<Vec<_>>(),
+            before.iter().map(|message| &message.tokens).collect::<Vec<_>>());
+        assert_eq!(messages.iter().map(|message| message.cost).sum::<f64>(),
+            before.iter().map(|message| message.cost).sum::<f64>());
+        let titles = crate::load_claude_session_titles(&messages);
+        let snapshot = crate::build_snapshot_with_session_titles(
+            messages, NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(), i64::MAX,
+            "UTC".to_string(), 1, &titles, None,
+        ).unwrap();
+        assert_eq!(snapshot.sessions.len(), 2);
+        let session = snapshot.sessions.iter().find(|session| session.id == "b-current").unwrap();
+        assert_eq!(session.requests.len(), 2);
+        assert!(session.requests.iter().all(|turn| !turn.is_subagent));
+        let original = session.requests.iter().find(|turn| turn.prompt_preview.as_deref() == Some("Original")).unwrap();
+        assert!(original.session_path.as_deref().unwrap().ends_with("a-old.jsonl"));
+        let continued = session.requests.iter().find(|turn| turn.prompt_preview.as_deref() == Some("Continued")).unwrap();
+        assert_eq!(continued.contributions.len(), 2);
+        assert_eq!(continued.contributions.iter().filter(|request| request.is_subagent).count(), 1);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

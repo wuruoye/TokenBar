@@ -556,8 +556,8 @@ pub fn load_codex_session_titles(
 /// Reads the latest custom title written into each root Claude Code transcript.
 ///
 /// Claude appends `custom-title` records directly to the CLI JSONL. Subagent
-/// transcripts share the parent logical session id, so only the physical root
-/// transcript is allowed to name the grouped session.
+/// transcripts cannot name the grouped session. Prefer the current user
+/// transcript's title, with prior user transcripts as a fallback.
 pub fn load_claude_session_titles(messages: &[UnifiedMessage]) -> SessionTitleMap {
     let mut seen_paths = HashSet::new();
     let mut titles_by_session = HashMap::new();
@@ -569,15 +569,17 @@ pub fn load_claude_session_titles(messages: &[UnifiedMessage]) -> SessionTitleMa
         let Some(path) = message.session_path.as_deref() else {
             continue;
         };
-        if physical_session_id(message) != message.session_id || !seen_paths.insert(path) {
+        if message.is_subagent || !seen_paths.insert(path) {
             continue;
         }
 
         if let Some(title) = read_claude_custom_title(Path::new(path)) {
-            titles_by_session.insert(
-                ("claude".to_string(), message.session_id.clone()),
-                title,
-            );
+            let key = ("claude".to_string(), message.session_id.clone());
+            if physical_session_id(message) == message.session_id {
+                titles_by_session.insert(key, title);
+            } else {
+                titles_by_session.entry(key).or_insert(title);
+            }
         }
     }
 
@@ -999,10 +1001,11 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         .and_then(usage::normalize_reasoning_effort)
         .or_else(|| usage::reasoning_effort_from_model(&message.model_id));
     let physical_session_id = physical_session_id(&message);
-    // Codex can continue a user session in another physical rollout file.
-    // Its explicit lineage determines subagent status across those files.
+    // Codex and Claude can continue a user session in another transcript.
+    // Their parsers determine subagent status from explicit lineage.
     let is_subagent = message.is_subagent
-        || (message.client != "codex" && physical_session_id != message.session_id);
+        || (!matches!(message.client.as_str(), "codex" | "claude")
+            && physical_session_id != message.session_id);
     let request_start_timestamp = message
         .duration_ms
         .filter(|duration| *duration > 0)
