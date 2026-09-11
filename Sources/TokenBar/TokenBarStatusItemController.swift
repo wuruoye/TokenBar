@@ -41,6 +41,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private let activitySync: ActivitySyncController
     private let requestDetailService: any RequestDetailProviding
     private let sessionLauncher: SessionLauncher
+    private let unreadTasks: DesktopUnreadTaskMonitor
     private let showSettingsAction: () -> Void
     private let statusItem: NSStatusItem
     private let rootMenu = TokenBarMenu()
@@ -89,7 +90,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         activitySync: ActivitySyncController,
         showSettings: @escaping () -> Void,
         requestDetailService: any RequestDetailProviding = CodexRequestDetailService(),
-        sessionLauncher: SessionLauncher = SessionLauncher())
+        sessionLauncher: SessionLauncher = SessionLauncher(),
+        unreadTasks: DesktopUnreadTaskMonitor = DesktopUnreadTaskMonitor())
     {
         self.model = model
         self.settings = settings
@@ -98,6 +100,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.showSettingsAction = showSettings
         self.requestDetailService = requestDetailService
         self.sessionLauncher = sessionLauncher
+        self.unreadTasks = unreadTasks
         self.syncSettingsSignature = SyncSettingsSignature(
             settings,
             activitySync: activitySync)
@@ -122,9 +125,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.observeModel()
         self.observeScope()
         self.observeSettings()
+        self.observeUnreadTasks()
     }
 
     func start() {
+        self.unreadTasks.start()
         self.startupTask = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.model.start()
@@ -142,6 +147,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     func tearDown() {
+        self.unreadTasks.stop()
         self.startupTask?.cancel()
         self.startupTask = nil
         self.sessionHistoryTask?.cancel()
@@ -182,6 +188,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         if menu === self.rootMenu {
             self.isRootMenuOpen = true
             self.installShortcutMonitor()
+            self.unreadTasks.refresh()
             Task { @MainActor [weak self] in
                 await self?.model.refreshAll(forceQuota: false)
             }
@@ -260,11 +267,15 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let antigravity = self.settings.showsAntigravity
             ? self.statusValues(for: .antigravity)
             : nil
+        let codexUnread = self.unreadTasks.count(for: .codex)
+        let claudeUnread = self.unreadTasks.count(for: .claude)
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
+            codexUnreadCount: codexUnread,
             claudeToday: claude?.today,
             claudeWeekly: claude?.weekly,
+            claudeUnreadCount: claudeUnread,
             grokToday: grok?.today,
             grokWeekly: grok?.weekly,
             antigravityToday: antigravity?.today,
@@ -272,17 +283,19 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.statusLabelLayout = layout
         button.image = layout.image
 
+        let codexUnreadText = Self.unreadStatusText(codexUnread)
         var toolTips = [
-            "Codex · Today: \(codex.today) tokens · Weekly: \(codex.weekly) left",
+            "Codex · Today: \(codex.today) tokens · Weekly: \(codex.weekly) left\(codexUnreadText.toolTip)",
         ]
         var accessibilityLabels = [
-            "Codex. Today, \(codex.today) tokens. Weekly quota, \(codex.weekly) remaining.",
+            "Codex. Today, \(codex.today) tokens. Weekly quota, \(codex.weekly) remaining.\(codexUnreadText.accessibility)",
         ]
         if let claude {
+            let claudeUnreadText = Self.unreadStatusText(claudeUnread)
             toolTips.append(
-                "Claude Code · Today: \(claude.today) tokens · Weekly: \(claude.weekly) left")
+                "Claude Code · Today: \(claude.today) tokens · Weekly: \(claude.weekly) left\(claudeUnreadText.toolTip)")
             accessibilityLabels.append(
-                "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.")
+                "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.\(claudeUnreadText.accessibility)")
         }
         if let grok {
             toolTips.append(
@@ -298,6 +311,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
         button.toolTip = toolTips.joined(separator: "\n")
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
+    }
+
+    private static func unreadStatusText(_ count: Int) -> (toolTip: String, accessibility: String) {
+        guard count > 0 else { return ("", "") }
+        return (
+            " · Unread: \(count)",
+            " \(count) unread completed \(count == 1 ? "task" : "tasks").")
     }
 
     private func statusValues(for platform: TokenPlatform) -> (today: String, weekly: String) {
@@ -353,6 +373,18 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 guard let self else { return }
                 self.observeModel()
                 self.modelDidChange()
+            }
+        }
+    }
+
+    private func observeUnreadTasks() {
+        withObservationTracking {
+            _ = self.unreadTasks.counts
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.observeUnreadTasks()
+                self.updateStatusButton()
             }
         }
     }
@@ -1689,30 +1721,33 @@ enum StatusLabelRenderer {
     static func layout(
         codexToday: String,
         codexWeekly: String,
+        codexUnreadCount: Int = 0,
         claudeToday: String? = nil,
         claudeWeekly: String? = nil,
+        claudeUnreadCount: Int = 0,
         grokToday: String? = nil,
         grokWeekly: String? = nil,
         antigravityToday: String? = nil,
         antigravityWeekly: String? = nil) -> StatusLabelLayout
     {
-        var values: [(scope: DashboardScope, today: String, weekly: String)] = [
-            (.codex, codexToday, codexWeekly),
+        var values: [(scope: DashboardScope, today: String, weekly: String, unreadCount: Int)] = [
+            (.codex, codexToday, codexWeekly, codexUnreadCount),
         ]
         if let claudeToday, let claudeWeekly {
-            values.append((.claude, claudeToday, claudeWeekly))
+            values.append((.claude, claudeToday, claudeWeekly, claudeUnreadCount))
         }
         if let grokToday, let grokWeekly {
-            values.append((.grok, grokToday, grokWeekly))
+            values.append((.grok, grokToday, grokWeekly, 0))
         }
         if let antigravityToday, let antigravityWeekly {
-            values.append((.antigravity, antigravityToday, antigravityWeekly))
+            values.append((.antigravity, antigravityToday, antigravityWeekly, 0))
         }
         let images = values.map { value in
             self.image(
                 platform: value.scope.platform,
                 today: value.today,
-                weekly: value.weekly)
+                weekly: value.weekly,
+                unreadCount: value.unreadCount)
         }
         let gap: CGFloat = 7
         let size = NSSize(
@@ -1752,7 +1787,8 @@ enum StatusLabelRenderer {
     static func image(
         platform: TokenPlatform? = nil,
         today: String,
-        weekly: String) -> NSImage
+        weekly: String,
+        unreadCount: Int = 0) -> NSImage
     {
         let topValue = today as NSString
         let bottomValue = weekly as NSString
@@ -1769,6 +1805,7 @@ enum StatusLabelRenderer {
         }
         let iconWidth: CGFloat = platformIcon == nil ? 0 : 15
         let iconGap: CGFloat = platformIcon == nil ? 0 : 4
+        let badge = platformIcon != nil && unreadCount > 0 ? StatusUnreadBadge(count: unreadCount) : nil
         let contentWidth = iconWidth + iconGap + valueWidth
         let size = NSSize(width: max(30, contentWidth + 4), height: 20)
         let contentX = floor((size.width - contentWidth) / 2)
@@ -1781,15 +1818,23 @@ enum StatusLabelRenderer {
 
         let image = NSImage(size: size, flipped: false) { _ in
             if let platformIcon {
+                let iconRect = NSRect(
+                    x: contentX,
+                    y: floor((size.height - iconWidth) / 2),
+                    width: iconWidth,
+                    height: iconWidth)
                 platformIcon.draw(
-                    in: NSRect(
-                        x: contentX,
-                        y: floor((size.height - iconWidth) / 2),
-                        width: iconWidth,
-                        height: iconWidth),
+                    in: iconRect,
                     from: .zero,
                     operation: .sourceOver,
                     fraction: 1)
+                if let badge {
+                    badge.draw(in: NSRect(
+                        x: iconRect.maxX + StatusUnreadBadge.iconOverhang - badge.width,
+                        y: size.height - StatusUnreadBadge.height,
+                        width: badge.width,
+                        height: StatusUnreadBadge.height))
+                }
             }
             let valueRect = NSRect(x: textX, y: 0, width: valueWidth, height: 10)
             topValue.draw(
@@ -1800,6 +1845,54 @@ enum StatusLabelRenderer {
         }
         image.isTemplate = true
         return image
+    }
+}
+
+/// Unread count drawn as a pill over a provider icon's top-right corner. The ring
+/// and digits are knocked out so the count stays legible in template images.
+/// Longer counts grow leftward over the icon, so the status label keeps its width.
+private struct StatusUnreadBadge {
+    static let height: CGFloat = 9
+    /// How far the pill reaches past the icon into the 4pt gap; its 1pt ring still
+    /// leaves 1pt before the values.
+    static let iconOverhang: CGFloat = 2
+
+    private let label: NSString
+    private let font: NSFont
+    let width: CGFloat
+
+    init(count: Int) {
+        let label = (count > 99 ? "99+" : "\(count)") as NSString
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 7, weight: .heavy)
+        self.label = label
+        self.font = font
+        self.width = max(Self.height, ceil(label.size(withAttributes: [.font: font]).width) + 4)
+    }
+
+    func draw(in rect: NSRect) {
+        guard let context = NSGraphicsContext.current else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: self.font,
+            .foregroundColor: NSColor.black,
+        ]
+        let radius = rect.height / 2
+        context.saveGraphicsState()
+        defer { context.restoreGraphicsState() }
+        NSColor.black.setFill()
+        context.compositingOperation = .clear
+        NSBezierPath(
+            roundedRect: rect.insetBy(dx: -1, dy: -1),
+            xRadius: radius + 1,
+            yRadius: radius + 1).fill()
+        context.compositingOperation = .sourceOver
+        NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+        context.compositingOperation = .destinationOut
+        let labelWidth = self.label.size(withAttributes: attributes).width
+        self.label.draw(
+            at: NSPoint(
+                x: rect.midX - labelWidth / 2,
+                y: rect.midY - self.font.capHeight / 2 + self.font.descender),
+            withAttributes: attributes)
     }
 }
 
