@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes,
+  remainingPercent, weeklyPacing, quotaPaceComparison, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes, formatTPS,
   type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
 
@@ -15,7 +15,7 @@ let chartDays = 30;
 let pinned = false;
 let settingsDirty = false;
 let allDevices = true;
-const names: Record<Platform, string> = { codex: "Codex", claude: "Claude", grok: "Grok" };
+const names: Record<Platform, string> = { codex: "Codex", claude: "Claude", grok: "Grok", antigravity: "Antigravity" };
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = "", text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -100,34 +100,35 @@ function quotaRow(label: string, window: QuotaWindow, measuredAt = Date.now()): 
   const row = el("div", "quota-row");
   const line = el("div", "quota-label");
   const caption = el("span"); caption.append(el("strong", "", label));
-  if (label === "Weekly") caption.append(el("span", "muted", " · " + resetText(window.resetsAtMs)));
+  const pacing = label === "Weekly" && (window.resetsAtMs ?? 0) > Date.now() ? weeklyPacing(window, measuredAt, data?.settings.usesWeekdayWeeklyPacing ?? false) : undefined;
+  if (pacing) caption.append(el("span", "muted", " · " + resetText(window.resetsAtMs)));
   line.append(caption, el("strong", "", remainingPercent(window).toFixed(0) + "% left"));
-  const pacing = label === "Weekly" ? weeklyPacing(window, measuredAt) : undefined;
+  const tint = remainingPercent(window) < 10 ? " critical-fill" : remainingPercent(window) < 20 ? " warning-fill" : "";
   const track = el("div", pacing ? "track segmented-quota" : "track");
   if (pacing) {
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < pacing.segments; i++) {
       const segment = el("span", "quota-segment");
-      const fill = el("span", "fill");
-      fill.style.width = Math.max(0, Math.min(100, window.usedPercent * 7 - i * 100)) + "%";
+      const fill = el("span", "fill" + tint);
+      fill.style.width = Math.max(0, Math.min(100, pacing.actual * pacing.segments - i * 100)) + "%";
       segment.append(fill); track.append(segment);
     }
     const marker = el("span", "pace-marker");
-    marker.style.left = pacing.expected + "%"; track.append(marker);
+    marker.style.left = "clamp(1px, " + pacing.expected + "%, calc(100% - 1px))"; track.append(marker);
   } else {
-    const fill = el("div", "fill" + (remainingPercent(window) < 10 ? " warning-fill" : ""));
+    const fill = el("div", "fill" + tint);
     fill.style.width = remainingPercent(window) + "%"; track.append(fill);
   }
   track.setAttribute("role", "progressbar");
   track.setAttribute("aria-label", label + (pacing ? "已用额度" : "剩余额度"));
-  track.setAttribute("aria-valuenow", String(pacing ? window.usedPercent : remainingPercent(window)));
+  track.setAttribute("aria-valuenow", String(pacing ? pacing.actual : remainingPercent(window)));
   track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
   row.append(line, track);
   if (pacing) {
     const pace = el("div", "pace-caption muted");
-    const delta = Math.round(pacing.delta);
-    pace.append(el("span", "", "Day " + pacing.day + "/7 · " + window.usedPercent.toFixed(0) + "% used"),
+    const comparison = quotaPaceComparison(pacing.delta);
+    pace.append(el("span", "", (pacing.weekdaysOnly ? "Workday " : "Day ") + pacing.day + "/" + pacing.segments + " · " + pacing.actual.toFixed(0) + "% used"),
       el("span", "", pacing.expected.toFixed(0) + "% expected · "),
-      el("span", delta > 0 ? "over-pace" : delta < 0 ? "under-pace" : "", delta === 0 ? "on pace" : Math.abs(delta) + "pp " + (delta > 0 ? "over" : "under")));
+      el("span", comparison.className, comparison.text));
     row.append(pace);
   } else row.append(el("div", "quota-reset muted", resetText(window.resetsAtMs)));
   return row;
@@ -175,7 +176,7 @@ function totalsSection(title: string, totals: Totals, costText: string, detailed
 function dashboard(): HTMLElement {
   const main = el("main", "content dashboard");
   const tabs = el("nav", "provider-tabs"); tabs.setAttribute("aria-label", "平台");
-  const platforms: Platform[] = ["codex", ...(data?.settings.showClaude ? ["claude" as const] : []), ...(data?.settings.showGrok ? ["grok" as const] : [])];
+  const platforms: Platform[] = ["codex", ...(data?.settings.showClaude ? ["claude" as const] : []), ...(data?.settings.showGrok ? ["grok" as const] : []), ...(data?.settings.showAntigravity ? ["antigravity" as const] : [])];
   for (const item of platforms) {
     const tab = button(names[item], () => { platform = item; render(); return invoke("set_active_platform", { platform: item }); }, item === platform ? "selected" : "");
     tab.setAttribute("aria-pressed", String(platform === item)); tabs.append(tab);
@@ -309,7 +310,7 @@ function sessionView(): HTMLElement {
     el("p", "muted small", names[platform] + " · " + dateTime(session.startedAtMs)), modelDetails(sessionModelDetails(session)));
   const actions = el("div", "detail-actions");
   actions.append(button("复制会话", () => copy(locator(session))));
-  if (platform !== "grok" && !session.deviceId) actions.append(button(platform === "claude" ? "打开 Claude 会话列表" : "在 Codex 中打开", () =>
+  if (platform !== "grok" && !session.deviceId) actions.append(button(platform === "claude" ? "打开 Claude 会话列表" : platform === "antigravity" ? "在 Antigravity 中打开" : "在 Codex 中打开", () =>
     invoke("open_session", { platform, sessionId: session.id })));
   const costSummary = el("div", "session-cost-summary");
   costSummary.append(el("span", "muted small", "会话费用"), el("strong", "cost", sessionCost(session)));
@@ -325,7 +326,7 @@ function sessionView(): HTMLElement {
     if (request.serviceTier === "fast" || request.serviceTier === "mixed") name.append(el("span", "badge", request.serviceTier.toUpperCase()));
     heading.append(name, el("strong", "cost", requestCost(request)));
     const tps = throughput(request);
-    const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + tps.toFixed(1) + " tok/s" : ""));
+    const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + (formatTPS(tps) ?? tps.toFixed(1) + " tok/s") : ""));
     summary.append(heading, metrics, modelDetails(requestModelDetails(request)), el("p", "preview", request.promptPreview || request.model));
     turn.append(summary);
     let loaded = false;
@@ -398,13 +399,15 @@ function settingsView(): HTMLElement {
   form.append(el("h2", "", "显示与刷新"));
   field("theme", "主题", "select", [["system", "跟随系统"], ["dark", "深色"], ["light", "浅色"]]);
   field("refreshSeconds", "后台刷新间隔（秒）", "number");
+  field("usesWeekdayWeeklyPacing", "周额度按工作日计算（周末不推进预期用量）", "checkbox");
   field("recentLimit", "最近会话数量", "number");
   field("showClaude", "显示 Claude", "checkbox");
   field("showGrok", "显示 Grok", "checkbox");
+  field("showAntigravity", "显示 Antigravity", "checkbox");
   field("autostart", "登录 Windows 后在托盘启动", "checkbox");
   form.append(el("h2", "", "任务栏常驻用量"));
   field("taskbarEnabled", "在任务栏显示用量", "checkbox");
-  field("taskbarPlatform", "显示平台", "select", [["codex","Codex"],["claude","Claude"],["grok","Grok"],["all","全部已显示的平台"]]);
+  field("taskbarPlatform", "显示平台", "select", [["codex","Codex"],["claude","Claude"],["grok","Grok"],["antigravity","Antigravity"],["all","全部已显示的平台"]]);
   field("taskbarPosition", "优先位置", "select", [["right","靠近通知区域"],["left","任务栏左侧空位"]]);
   form.append(el("p", "muted small", "以透明背景和两行文字显示：上行是各平台的今日 Tokens，下行是周额度剩余。点击平台展开，再次点击收起。"));
   const taskbarStatus = el("p", "muted small", "正在检查任务栏…");
@@ -416,6 +419,7 @@ function settingsView(): HTMLElement {
   field("codexHome", "Codex 数据目录", "text");
   field("claudeHome", "Claude Code 数据目录", "text");
   field("grokHome", "Grok Build 数据目录", "text");
+  field("antigravityHome", "Antigravity 数据目录", "text");
   field("codexBinary", "Codex 可执行文件（.exe）", "text");
   form.append(el("p", "muted small", "留空时读取客户端环境变量和当前用户目录。统计按 UTC 日期汇总。"));
   form.append(el("h2", "", "多设备同步"));
@@ -460,7 +464,7 @@ function footer(): HTMLElement {
   footer.append(status, refresh); return footer;
 }
 function render() {
-  if (platform === "claude" && !data?.settings.showClaude || platform === "grok" && !data?.settings.showGrok) platform = "codex";
+  if ((platform === "claude" && !data?.settings.showClaude) || (platform === "grok" && !data?.settings.showGrok) || (platform === "antigravity" && !data?.settings.showAntigravity)) platform = "codex";
   document.documentElement.dataset.theme = data?.settings.theme ?? "system";
   document.documentElement.dataset.provider = platform;
   const content = document.querySelector("main");

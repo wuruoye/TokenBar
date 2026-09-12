@@ -272,8 +272,162 @@ fn parse_grok(record: &Value) -> Result<Quota, String> {
     })
 }
 
+fn extract_csrf_token(content: &str) -> Option<String> {
+    let mut last = None;
+    for line in content.lines() {
+        if let Some(pos) = line.rfind("--csrf_token ") {
+            let rest = &line[pos + "--csrf_token ".len()..];
+            let token: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+                .collect();
+            if token.len() == 36 {
+                last = Some(token);
+            }
+        }
+    }
+    last
+}
+
+fn extract_http_port(content: &str) -> Option<u16> {
+    let prefix = "listening on random port at ";
+    let mut last = None;
+    for line in content.lines() {
+        if let Some(pos) = line.find(prefix) {
+            let rest = &line[pos + prefix.len()..];
+            if let Some(space_pos) = rest.find(" for HTTP") {
+                let port_str = &rest[..space_pos];
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    if port > 0 {
+                        last = Some(port);
+                    }
+                }
+            }
+        }
+    }
+    last
+}
+
+fn parse_antigravity(payload: &Value) -> Result<Quota, String> {
+    let groups = payload
+        .get("response")
+        .and_then(|r| r.get("groups"))
+        .and_then(|g| g.as_array())
+        .ok_or("Antigravity 返回了无法解析的额度数据。")?;
+
+    let lowest_fraction = |group: &Value| -> f64 {
+        group
+            .get("buckets")
+            .and_then(|b| b.as_array())
+            .map(|buckets| {
+                buckets
+                    .iter()
+                    .filter_map(|b| number(&b["remainingFraction"]))
+                    .fold(1.0, f64::min)
+            })
+            .unwrap_or(1.0)
+    };
+
+    let most_constrained = groups
+        .iter()
+        .filter(|g| {
+            g.get("buckets")
+                .and_then(|b| b.as_array())
+                .is_some_and(|b| !b.is_empty())
+        })
+        .min_by(|a, b| {
+            lowest_fraction(a)
+                .partial_cmp(&lowest_fraction(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or("Antigravity 未提供额度资源池。")?;
+
+    let window = |window_name: &str, minutes: i64| -> Option<Window> {
+        let bucket = most_constrained
+            .get("buckets")?
+            .as_array()?
+            .iter()
+            .find(|b| b.get("window").and_then(|w| w.as_str()) == Some(window_name))?;
+        let remaining = number(&bucket["remainingFraction"])?.clamp(0.0, 1.0);
+        Some(Window {
+            used_percent: (1.0 - remaining) * 100.0,
+            window_minutes: Some(minutes),
+            resets_at_ms: date(&bucket["resetTime"]),
+        })
+    };
+
+    let quota = Quota {
+        session: window("5h", 300),
+        weekly: window("weekly", 10080),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        error: None,
+        available_reset_credits: None,
+    };
+    if quota.session.is_none() && quota.weekly.is_none() {
+        return Err("Antigravity 未返回额度窗口。".into());
+    }
+    Ok(quota)
+}
+
+async fn antigravity(_settings: &Settings) -> Result<Quota, String> {
+    let log_dir = std::env::var_os("ANTIGRAVITY_LOG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("APPDATA")
+                .filter(|v| !v.is_empty())
+                .map(|p| PathBuf::from(p).join("Antigravity").join("logs"))
+        })
+        .unwrap_or_else(|| {
+            crate::settings::user_home()
+                .join("AppData")
+                .join("Roaming")
+                .join("Antigravity")
+                .join("logs")
+        });
+
+    let main_log_bytes = tokio::fs::read(log_dir.join("main.log"))
+        .await
+        .map_err(|_| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。")?;
+    let server_log_bytes = tokio::fs::read(log_dir.join("language_server.log"))
+        .await
+        .map_err(|_| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。")?;
+
+    let main_log = String::from_utf8_lossy(&main_log_bytes);
+    let server_log = String::from_utf8_lossy(&server_log_bytes);
+
+    let token = extract_csrf_token(&main_log)
+        .ok_or("Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
+    let port = extract_http_port(&server_log)
+        .ok_or("Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "无法初始化额度请求。")?
+        .post(format!(
+            "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-codeium-csrf-token", token)
+        .body("{}")
+        .send()
+        .await
+        .map_err(|_| "Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Antigravity 额度查询失败（HTTP {}）。",
+            response.status().as_u16()
+        ));
+    }
+    let payload: Value = response.json().await.map_err(|_| "Antigravity 额度响应无效。")?;
+    parse_antigravity(&payload)
+}
+
 pub async fn fetch(settings: &Settings, previous: &Quotas) -> Quotas {
-    let (codex, claude, grok) = tokio::join!(
+    let (codex, claude, grok, antigravity) = tokio::join!(
         codex(settings),
         async {
             if settings.show_claude {
@@ -288,19 +442,31 @@ pub async fn fetch(settings: &Settings, previous: &Quotas) -> Quotas {
             } else {
                 Err("已隐藏".into())
             }
+        },
+        async {
+            if settings.show_antigravity {
+                antigravity(settings).await
+            } else {
+                Err("已隐藏".into())
+            }
         }
     );
-    [("codex", codex), ("claude", claude), ("grok", grok)]
-        .into_iter()
-        .map(|(name, result)| {
-            let value = result.unwrap_or_else(|error| {
-                let mut old = previous.get(name).cloned().unwrap_or_default();
-                old.error = Some(error);
-                old
-            });
-            (name.to_string(), value)
-        })
-        .collect()
+    [
+        ("codex", codex),
+        ("claude", claude),
+        ("grok", grok),
+        ("antigravity", antigravity),
+    ]
+    .into_iter()
+    .map(|(name, result)| {
+        let value = result.unwrap_or_else(|error| {
+            let mut old = previous.get(name).cloned().unwrap_or_default();
+            old.error = Some(error);
+            old
+        });
+        (name.to_string(), value)
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -325,11 +491,65 @@ mod tests {
             parse_grok(&json!({"ctx":{"config":{"monthlyLimit":{"val":0},"used":{"val":3}}}}))
                 .is_err()
         );
+        assert!(parse_antigravity(&json!({})).is_err());
+        assert!(parse_antigravity(&json!({"response":{"groups":[]}})).is_err());
     }
     #[test]
     fn optional_claude_windows_remain_absent() {
         let quota = parse_claude(&json!({"seven_day":{"utilization": 45}})).unwrap();
         assert!(quota.session.is_none());
         assert_eq!(quota.weekly.unwrap().used_percent, 45.0);
+    }
+    #[test]
+    fn antigravity_parses_most_constrained_group_and_extracts_windows() {
+        let value = json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "window": "weekly",
+                                "remainingFraction": 0.8,
+                                "resetTime": "2026-09-13T13:18:59Z"
+                            },
+                            {
+                                "window": "5h",
+                                "remainingFraction": 0.95,
+                                "resetTime": "2026-09-11T20:43:08Z"
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "window": "weekly",
+                                "remainingFraction": 0.5,
+                                "resetTime": "2026-09-18T15:43:08Z"
+                            },
+                            {
+                                "window": "5h",
+                                "remainingFraction": 0.7,
+                                "resetTime": "2026-09-11T20:43:08Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let quota = parse_antigravity(&value).unwrap();
+        assert_eq!(quota.weekly.as_ref().unwrap().used_percent, 50.0);
+        assert_eq!(quota.weekly.as_ref().unwrap().window_minutes, Some(10080));
+        assert!((quota.session.as_ref().unwrap().used_percent - 30.0).abs() < 0.001);
+        assert_eq!(quota.session.as_ref().unwrap().window_minutes, Some(300));
+    }
+    #[test]
+    fn extract_csrf_and_port_from_logs() {
+        let main_log = "foo\nSpawning: language_server.exe --csrf_token 3c259d60-d82b-4c44-a723-931c481aef50 --app_data_dir\nbar";
+        assert_eq!(extract_csrf_token(main_log), Some("3c259d60-d82b-4c44-a723-931c481aef50".into()));
+
+        let server_log = "I0911 23:42:31.653621 1 server.go:607] Language server listening on random port at 52960 for HTTP\n";
+        assert_eq!(extract_http_port(server_log), Some(52960));
     }
 }

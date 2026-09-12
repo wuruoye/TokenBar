@@ -8,8 +8,7 @@ $application = [IO.Path]::GetFullPath((Join-Path $projectRoot 'src-tauri/target/
 if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
     throw 'Build TokenBar first with Windows/scripts/Build-TokenBar.ps1.'
 }
-# Only restart the executable built by this checkout.
+# Stop any running TokenBar instances to prevent single-instance collisions.
 Get-Process -Name tokenbar-windows -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -eq $application } |
-    Stop-Process
+    Stop-Process -Force
 Start-Process -FilePath $application -WorkingDirectory (Split-Path -Parent $application) -WindowStyle Hidden

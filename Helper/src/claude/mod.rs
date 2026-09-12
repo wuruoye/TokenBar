@@ -192,6 +192,7 @@ fn discover_claude_files(options: &LocalParseOptions) -> Result<Vec<PathBuf>, St
         .as_deref()
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .ok_or("could not resolve the home directory")?;
     let claude_home = if options.home_dir.is_none() && options.use_env_roots {
         std::env::var_os("CLAUDE_CONFIG_DIR")

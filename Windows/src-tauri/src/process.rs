@@ -15,6 +15,7 @@ pub fn command(path: &Path, settings: &Settings) -> Command {
     command.env("CODEX_HOME", settings.root("codex"));
     command.env("CLAUDE_CONFIG_DIR", settings.root("claude"));
     command.env("GROK_HOME", settings.root("grok"));
+    command.env("ANTIGRAVITY_HOME", settings.root("antigravity"));
     command
 }
 

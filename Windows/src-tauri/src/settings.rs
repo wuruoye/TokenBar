@@ -10,10 +10,12 @@ pub struct Settings {
     pub theme: String,
     pub show_claude: bool,
     pub show_grok: bool,
+    pub show_antigravity: bool,
     pub autostart: bool,
     pub codex_home: String,
     pub claude_home: String,
     pub grok_home: String,
+    pub antigravity_home: String,
     pub codex_binary: String,
     pub memory_enabled: bool,
     pub sync_enabled: bool,
@@ -23,6 +25,7 @@ pub struct Settings {
     pub taskbar_enabled: bool,
     pub taskbar_platform: String,
     pub taskbar_position: String,
+    pub uses_weekday_weekly_pacing: bool,
 }
 
 impl Default for Settings {
@@ -33,10 +36,12 @@ impl Default for Settings {
             theme: "system".into(),
             show_claude: true,
             show_grok: true,
+            show_antigravity: true,
             autostart: false,
             codex_home: String::new(),
             claude_home: String::new(),
             grok_home: String::new(),
+            antigravity_home: String::new(),
             codex_binary: String::new(),
             memory_enabled: false,
             sync_enabled: false,
@@ -46,20 +51,22 @@ impl Default for Settings {
             taskbar_enabled: true,
             taskbar_platform: "all".into(),
             taskbar_position: "right".into(),
+            uses_weekday_weekly_pacing: false,
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
-        if !["codex", "claude", "grok", "all"].contains(&self.taskbar_platform.as_str())
+        if !["codex", "claude", "grok", "antigravity", "all"].contains(&self.taskbar_platform.as_str())
             || !["left", "right"].contains(&self.taskbar_position.as_str())
         {
             return Err("任务栏显示设置无效。".into());
         }
         if self.taskbar_enabled
             && ((self.taskbar_platform == "claude" && !self.show_claude)
-                || (self.taskbar_platform == "grok" && !self.show_grok))
+                || (self.taskbar_platform == "grok" && !self.show_grok)
+                || (self.taskbar_platform == "antigravity" && !self.show_antigravity))
         {
             return Err("请先开启对应平台的显示，再将它放入任务栏。".into());
         }
@@ -69,7 +76,7 @@ impl Settings {
         if !["system", "dark", "light"].contains(&self.theme.as_str()) {
             return Err("无效的主题。".into());
         }
-        for path in [&self.codex_home, &self.claude_home, &self.grok_home] {
+        for path in [&self.codex_home, &self.claude_home, &self.grok_home, &self.antigravity_home] {
             if !path.is_empty() && (!Path::new(path).is_absolute() || !Path::new(path).is_dir()) {
                 return Err("数据目录须为存在的绝对路径。".into());
             }
@@ -98,6 +105,7 @@ impl Settings {
         let (custom, key, name) = match platform {
             "claude" => (&self.claude_home, "CLAUDE_CONFIG_DIR", ".claude"),
             "grok" => (&self.grok_home, "GROK_HOME", ".grok"),
+            "antigravity" => (&self.antigravity_home, "ANTIGRAVITY_HOME", ".gemini/antigravity"),
             _ => (&self.codex_home, "CODEX_HOME", ".codex"),
         };
         if !custom.is_empty() {
@@ -247,5 +255,6 @@ mod tests {
         assert_eq!(settings.taskbar_platform, "all");
         assert_eq!(settings.refresh_seconds, 600);
         assert!(!settings.show_claude);
+ assert!(!settings.uses_weekday_weekly_pacing);
     }
 }

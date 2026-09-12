@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { locator, sessionsFor, sourceFor, throughput, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, displayedBuckets, sessionModelDetails, requestModelDetails, type Session, type Snapshot, type Request } from "./model";
+import { locator, sessionsFor, sourceFor, throughput, sessionThroughput, formatTPS, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
+  remainingPercent, weeklyPacing, quotaPaceComparison, displayedBuckets, sessionModelDetails, requestModelDetails, type Session, type Snapshot, type Request } from "./model";
 
 describe("provider isolation and counting", () => {
   it("keeps identical session IDs in different platforms separate", () => {
@@ -9,6 +9,20 @@ describe("provider isolation and counting", () => {
     expect(sessionsFor(snapshot, "codex")).toHaveLength(1);
     expect(sourceFor(snapshot, "claude")?.today.requestCount).toBe(5);
     expect(sourceFor(snapshot, "grok")).toBeUndefined();
+    expect(sourceFor(snapshot, "antigravity")).toBeUndefined();
+  });
+  it("isolates antigravity sessions and sources", () => {
+    const snapshot = {
+      sessions: [
+        { id: "ag-1", platform: "antigravity", endedAtMs: 100 },
+        { id: "cx-1", platform: "codex", endedAtMs: 200 }
+      ],
+      sources: [
+        { platform: "antigravity", today: { requestCount: 8 } }
+      ]
+    } as unknown as Snapshot;
+    expect(sessionsFor(snapshot, "antigravity")).toHaveLength(1);
+    expect(sourceFor(snapshot, "antigravity")?.today.requestCount).toBe(8);
   });
   it("adds each disjoint helper token bucket once", () => {
     expect(tokenTotal({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 50 })).toBe(150);
@@ -56,6 +70,24 @@ describe("macOS menu presentation", () => {
     expect(sessionModelDetails({models:["gpt-5.6-sol"],requests:[]} as unknown as Session))
       .toEqual(["gpt-5.6-sol · effort: 未记录"]);
   });
+  it("formats model lists with generation speed when model durations are present", () => {
+    const turn = {
+      model: "gemini-3.8-flash",
+      reasoningEffort: null,
+      modelDurationMs: 4000,
+      tokens: { input: 1000, output: 200, cacheRead: 0, cacheWrite: 0, reasoning: 200 }
+    } as Request;
+    expect(sessionModelDetails({ requests: [turn], models: ["gemini-3.8-flash"] } as Session))
+      .toEqual(["gemini-3.8-flash · effort: 未记录 · 100.0 tok/s"]);
+    expect(sessionModelDetails({ requests: [turn], models: ["gemini-3.8-flash"] } as Session, false))
+      .toEqual(["gemini-3.8-flash · effort: 未记录"]);
+    expect(requestModelDetails(turn))
+      .toEqual(["gemini-3.8-flash · effort: 未记录"]);
+    expect(sessionThroughput({ requests: [turn] } as Session)).toBe(100);
+    expect(formatTPS(100)).toBe("100.0 tok/s");
+    expect(formatTPS(1500)).toBe("1.5K tok/s");
+    expect(formatTPS(undefined)).toBeUndefined();
+  });
   it("keeps the aggregated turn price separate from its physical request prices", () => {
     const turn = { costUsd: 4.5, costSource: "unknown", contributions: [
       { costUsd: 1.25, costSource: "estimated" }, { costUsd: 3.25, costSource: "providerReported" }
@@ -94,7 +126,7 @@ describe("macOS menu presentation", () => {
     const window = {usedPercent:78,windowMinutes:10080,resetsAtMs:7*86400000};
     expect(remainingPercent(window)).toBe(22);
     const pacing = weeklyPacing(window, 3.5*86400000);
-    expect(pacing).toEqual({day:4,expected:50,delta:28});
+    expect(pacing).toEqual({day:4,segments:7,weekdaysOnly:false,actual:78,expected:50,delta:28});
     expect(window.usedPercent).toBe(78);
   });
   it("does not invent pacing outside the known reset cycle", () => {
@@ -108,6 +140,38 @@ describe("macOS menu presentation", () => {
     const buckets = displayedBuckets(tokens);
     expect(buckets.map(b => b.value)).toEqual([130,20,70,10]);
     expect(buckets.reduce((n,b) => n+b.value,0)).toBe(tokenTotal(tokens));
+  });
+  it("matches Swift weekday pacing at midnight and across weekends", () => {
+    const start = new Date(2026, 8, 7).getTime();
+    const window = {usedPercent:34,windowMinutes:10080,resetsAtMs:start+7*86400000};
+    expect(weeklyPacing(window, new Date(2026,8,7,12).getTime(), true)).toMatchObject({day:1,segments:5,expected:10,delta:24});
+    expect(weeklyPacing(window, new Date(2026,8,8).getTime(), true)).toMatchObject({day:2,expected:20});
+    for (const day of [12,13]) {
+      expect(weeklyPacing(window, new Date(2026,8,day,12).getTime(), true)).toMatchObject({day:5,expected:100});
+    }
+    const weekend = {...window,resetsAtMs:new Date(2026,8,19).getTime()};
+    expect(weeklyPacing(weekend,new Date(2026,8,13,12).getTime(),true)).toMatchObject({day:0,expected:0});
+  });
+  it("counts partial calendar workdays", () => {
+    const start = new Date(2026,8,7,12).getTime();
+    const window = {usedPercent:30,windowMinutes:10080,resetsAtMs:start+7*86400000};
+    expect(weeklyPacing(window,new Date(2026,8,8).getTime(),true)).toMatchObject({day:1,expected:10});
+    expect(weeklyPacing(window,new Date(2026,8,12).getTime(),true)).toMatchObject({day:5,expected:90});
+  });
+  it("rejects invalid samples and clamps actual usage like Swift", () => {
+    const window = {usedPercent:0,windowMinutes:10080,resetsAtMs:7*86400000};
+    for (const usedPercent of [NaN,Infinity,-Infinity]) expect(weeklyPacing({...window,usedPercent},86400000)).toBeUndefined();
+    for (const windowMinutes of [0,-1,Infinity,NaN]) expect(weeklyPacing({...window,windowMinutes},86400000)).toBeUndefined();
+    expect(weeklyPacing(window,NaN)).toBeUndefined();
+    expect(weeklyPacing({...window,usedPercent:1},0)).toBeUndefined();
+    expect(weeklyPacing(window,window.resetsAtMs)).toBeUndefined();
+    expect(weeklyPacing({...window,usedPercent:120},3.5*86400000)).toMatchObject({actual:100,delta:50});
+    expect(weeklyPacing({...window,usedPercent:-10},0)).toMatchObject({actual:0,delta:0});
+  });
+  it("uses the unrounded one percentage point threshold", () => {
+    for (const delta of [-0.99,-0.5,0,0.5,0.99]) expect(quotaPaceComparison(delta)).toEqual({text:"on pace",className:""});
+    expect(quotaPaceComparison(1)).toEqual({text:"1pp over",className:"over-pace"});
+    expect(quotaPaceComparison(-1.5)).toEqual({text:"2pp under",className:"under-pace"});
   });
 });
 

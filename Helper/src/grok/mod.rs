@@ -171,6 +171,7 @@ fn discover_grok_files(options: &LocalParseOptions) -> Result<Vec<PathBuf>, Stri
         .as_deref()
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .ok_or("could not resolve the home directory")?;
     let grok_home = if options.home_dir.is_none() && options.use_env_roots {
         std::env::var_os("GROK_HOME")

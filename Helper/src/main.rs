@@ -333,6 +333,7 @@ fn codex_home_path(config: &SnapshotConfig) -> Option<PathBuf> {
         return Some(PathBuf::from(codex_home));
     }
     env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .map(|home| home.join(".codex"))
 }

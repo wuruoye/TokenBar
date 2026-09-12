@@ -1,4 +1,4 @@
-export type Platform = "codex" | "claude" | "grok";
+export type Platform = "codex" | "claude" | "grok" | "antigravity";
 export interface Tokens { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number }
 export interface Totals {
   tokens: Tokens; costUsd: number; sessionCount: number; requestCount: number;
@@ -34,11 +34,12 @@ export interface Snapshot {
 export interface QuotaWindow { usedPercent: number; windowMinutes?: number; resetsAtMs?: number }
 export interface Quota { session?: QuotaWindow; weekly?: QuotaWindow; updatedAtMs: number; error?: string; availableResetCredits?: number }
 export interface Settings {
-  refreshSeconds: number; recentLimit: number; theme: string; showClaude: boolean; showGrok: boolean;
-  autostart: boolean; codexHome: string; claudeHome: string; grokHome: string; codexBinary: string; memoryEnabled: boolean;
+  refreshSeconds: number; recentLimit: number; theme: string; showClaude: boolean; showGrok: boolean; showAntigravity: boolean;
+  autostart: boolean; codexHome: string; claudeHome: string; grokHome: string; antigravityHome: string; codexBinary: string; memoryEnabled: boolean;
   syncEnabled: boolean; syncEndpoint: string; syncDeviceName: string;
   syncAllDevices: boolean;
   taskbarEnabled: boolean; taskbarPlatform: string; taskbarPosition: string;
+  usesWeekdayWeeklyPacing: boolean;
 }
 export interface Dashboard {
   settings: Settings; snapshot?: Snapshot; quotas: Partial<Record<Platform, Quota>>;
@@ -58,14 +59,44 @@ export function compact(value: number): string {
   return Math.round(value).toLocaleString();
 }
 export function remainingPercent(window: QuotaWindow): number { return Math.max(0, Math.min(100, 100 - window.usedPercent)); }
-export function weeklyPacing(window: QuotaWindow, measuredAt: number) {
+export function weeklyPacing(window: QuotaWindow, measuredAt: number, weekdaysOnly = false) {
   const duration = (window.windowMinutes ?? 0) * 60000;
   const end = window.resetsAtMs;
-  if (!end || !duration || measuredAt >= end || measuredAt < end - duration) return undefined;
-  const elapsed = measuredAt - end + duration;
-  if (elapsed === 0 && window.usedPercent > 0) return undefined;
-  const expected = elapsed / duration * 100;
-  return { day: Math.min(7, Math.floor(elapsed / duration * 7) + 1), expected, delta: window.usedPercent - expected };
+  if (!Number.isFinite(window.usedPercent) || !Number.isFinite(duration) || duration <= 0 ||
+      end == null || !Number.isFinite(end) || !Number.isFinite(measuredAt) ||
+      measuredAt >= end || measuredAt < end - duration) return undefined;
+  const start = end - duration;
+  const elapsed = measuredAt - start;
+  const actual = Math.max(0, Math.min(100, window.usedPercent));
+  if (elapsed === 0 && actual > 0) return undefined;
+  let expected = elapsed / duration * 100;
+  const segments = weekdaysOnly ? 5 : 7;
+  let day = Math.min(7, Math.floor(elapsed / (duration / 7)) + 1);
+  if (weekdaysOnly) {
+    let total = 0, consumed = 0, withinWorkday = false;
+    const cursor = new Date(start);
+    cursor.setHours(0, 0, 0, 0);
+    while (cursor.getTime() < end) {
+      const dayStart = cursor.getTime(), weekday = cursor.getDay();
+      // Calendar days preserve local midnight boundaries across DST changes.
+      cursor.setDate(cursor.getDate() + 1);
+      if (weekday === 0 || weekday === 6) continue;
+      const from = Math.max(start, dayStart), to = Math.min(end, cursor.getTime());
+      if (from >= to) continue;
+      total += to - from;
+      consumed += Math.max(0, Math.min(to - from, measuredAt - from));
+      withinWorkday ||= measuredAt >= from && measuredAt < to;
+    }
+    if (total <= 0) return undefined;
+    expected = Math.max(0, Math.min(100, consumed / total * 100));
+    day = Math.max(0, Math.min(5, withinWorkday ? Math.floor(expected / 20) + 1 : Math.ceil(expected / 20)));
+  }
+  return { day, segments, weekdaysOnly, actual, expected, delta: actual - expected };
+}
+export function quotaPaceComparison(delta: number) {
+  return Math.abs(delta) < 1 ? { text: "on pace", className: "" }
+    : { text: Math.round(Math.abs(delta)) + "pp " + (delta > 0 ? "over" : "under"),
+      className: delta > 0 ? "over-pace" : "under-pace" };
 }
 export function cachePercentage(tokens: Tokens): string {
   const prompt = tokens.input + tokens.cacheWrite + tokens.cacheRead;
@@ -110,25 +141,43 @@ export function sessionsFor(snapshot: Snapshot | undefined, platform: Platform):
 function physicalRequests(request: Request): Request[] {
   return request.contributions?.length ? request.contributions.flatMap(physicalRequests) : [request];
 }
-function describeModels(requests: Request[], fallbackModels: string[] = []): string[] {
-  const models = new Map<string, Set<string>>();
+export function formatTPS(value: number | undefined): string | undefined {
+  if (value == null || !Number.isFinite(value) || value <= 0) return undefined;
+  if (value >= 1e6) return (value / 1e6).toFixed(1) + "M tok/s";
+  if (value >= 1e3) return (value / 1e3).toFixed(1) + "K tok/s";
+  return value.toFixed(1) + " tok/s";
+}
+function describeModels(requests: Request[], fallbackModels: string[] = [], includeTPS = false): string[] {
+  const models = new Map<string, { efforts: Set<string>; tokens: number; durationMs: number }>();
   for (const request of requests) {
     const model = request.model?.trim() || "unknown";
-    const efforts = models.get(model) ?? new Set<string>();
-    efforts.add(request.reasoningEffort?.trim() || "未记录");
-    models.set(model, efforts);
+    const entry = models.get(model) ?? { efforts: new Set<string>(), tokens: 0, durationMs: 0 };
+    entry.efforts.add(request.reasoningEffort?.trim() || "未记录");
+    if (request.modelDurationMs && request.modelDurationMs > 0 && request.tokens && (request.tokens.output + request.tokens.reasoning > 0)) {
+      entry.tokens += request.tokens.output + request.tokens.reasoning;
+      entry.durationMs += request.modelDurationMs;
+    }
+    models.set(model, entry);
   }
-  for (const model of fallbackModels) if (!models.has(model)) models.set(model, new Set(["未记录"]));
-  if (!models.size) models.set("unknown", new Set(["未记录"]));
+  for (const model of fallbackModels) if (!models.has(model)) models.set(model, { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0 });
+  if (!models.size) models.set("unknown", { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0 });
   const levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto", "未记录"];
-  return [...models].map(([model, efforts]) => (model === "unknown" ? "模型未记录" : model) + " · effort: "
-    + [...efforts].sort((a, b) => levels.indexOf(a) - levels.indexOf(b) || a.localeCompare(b)).join(" / "));
+  return [...models].map(([model, entry]) => {
+    let line = (model === "unknown" ? "模型未记录" : model) + " · effort: "
+      + [...entry.efforts].sort((a, b) => levels.indexOf(a) - levels.indexOf(b) || a.localeCompare(b)).join(" / ");
+    if (includeTPS && entry.durationMs > 0 && entry.tokens > 0) {
+      const rate = entry.tokens * 1000 / entry.durationMs;
+      const tps = formatTPS(rate);
+      if (tps) line += " · " + tps;
+    }
+    return line;
+  });
 }
-export function sessionModelDetails(session: Session): string[] {
-  return describeModels(session.requests.flatMap(physicalRequests), session.models);
+export function sessionModelDetails(session: Session, includeTPS = true): string[] {
+  return describeModels(session.requests.flatMap(physicalRequests), session.models, includeTPS);
 }
 export function requestModelDetails(request: Request): string[] {
-  return describeModels(physicalRequests(request));
+  return describeModels(physicalRequests(request), [], false);
 }
 export function locator(session: Session, request?: Request): string {
   return "platform=" + session.platform + " session_id=" + (request?.physicalSessionId ?? session.id)
@@ -138,12 +187,23 @@ export function throughput(request: Request): number | undefined {
   const leaves = request.contributions?.length ? request.contributions : [request];
   let tokens = 0, milliseconds = 0;
   for (const row of leaves) {
-    if (row.modelDurationMs && row.modelDurationMs > 0 && row.tokens.output + row.tokens.reasoning > 0) {
+    if (row.modelDurationMs && row.modelDurationMs > 0 && row.tokens && (row.tokens.output + row.tokens.reasoning > 0)) {
       tokens += row.tokens.output + row.tokens.reasoning;
       milliseconds += row.modelDurationMs;
     }
   }
   return milliseconds > 0 ? tokens * 1000 / milliseconds : undefined;
+}
+export function sessionThroughput(session: Session): number | undefined {
+  const leaves = session.requests.flatMap(physicalRequests);
+  let tokens = 0, milliseconds = 0;
+  for (const row of leaves) {
+    if (row.modelDurationMs && row.modelDurationMs > 0 && row.tokens && (row.tokens.output + row.tokens.reasoning > 0)) {
+      tokens += row.tokens.output + row.tokens.reasoning;
+      milliseconds += row.modelDurationMs;
+    }
+  }
+  return milliseconds > 0 && tokens > 0 ? tokens * 1000 / milliseconds : undefined;
 }
 export function sessionKey(session: Session): string { return (session.deviceId ?? "local") + ":" + session.platform + ":" + session.id; }
 export { mergedSnapshot, currentRemotes } from "./merge";

@@ -79,6 +79,7 @@ async fn publish(app: &tauri::AppHandle, state: &AppState) {
             for source in &snapshot.sources {
                 if (source.platform == "claude" && !dashboard.settings.show_claude)
                     || (source.platform == "grok" && !dashboard.settings.show_grok)
+                    || (source.platform == "antigravity" && !dashboard.settings.show_antigravity)
                 {
                     continue;
                 }
@@ -160,7 +161,7 @@ fn get_active_platform(app: tauri::AppHandle) -> String {
 }
 #[tauri::command]
 fn set_active_platform(app: tauri::AppHandle, platform: String) -> Result<(), String> {
-    if !["codex", "claude", "grok"].contains(&platform.as_str()) {
+    if !["codex", "claude", "grok", "antigravity"].contains(&platform.as_str()) {
         return Err("平台无效。".into());
     }
     *state(&app)
@@ -237,6 +238,7 @@ async fn refresh(app: tauri::AppHandle) {
         ("codex", "--weekly-reset-ms"),
         ("claude", "--claude-weekly-reset-ms"),
         ("grok", "--grok-weekly-reset-ms"),
+        ("antigravity", "--antigravity-weekly-reset-ms"),
     ] {
         if let Some(window) = quotas.get(platform).and_then(|q| q.weekly.as_ref()) {
             if let Some(reset) = window
@@ -362,6 +364,7 @@ async fn save_settings(
         if old.codex_home != settings.codex_home
             || old.claude_home != settings.claude_home
             || old.grok_home != settings.grok_home
+            || old.antigravity_home != settings.antigravity_home
         {
             dashboard.snapshot = None;
             dashboard.quotas.clear();
@@ -485,7 +488,7 @@ async fn open_session(
                 .find(|s| s.platform == platform && s.id == session_id)
         })
         .ok_or("会话不可用。")?;
-    let url = match platform.as_str() {
+    match platform.as_str() {
         "codex" => {
             let id = session
                 .id
@@ -494,14 +497,66 @@ async fn open_session(
             if id.len() != 36 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
                 return Err("会话标识无效。".into());
             }
-            format!("codex://threads/{id}")
+            app.opener()
+                .open_url(format!("codex://threads/{id}"), None::<&str>)
+                .map_err(|_| "无法打开客户端，请确认已安装并注册应用链接。".into())
         }
-        "claude" => "claude://claude.ai/local_sessions".into(),
-        _ => return Err("请复制会话标识，在 Grok Build 中使用 --resume 恢复会话。".into()),
-    };
-    app.opener()
-        .open_url(url, None::<&str>)
-        .map_err(|_| "无法打开客户端，请确认已安装并注册应用链接。".into())
+        "claude" => app
+            .opener()
+            .open_url("claude://claude.ai/local_sessions", None::<&str>)
+            .map_err(|_| "无法打开客户端，请确认已安装并注册应用链接。".into()),
+        "antigravity" => {
+            let workspace = session
+                .workspace_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("此会话未记录可打开的工作区目录。")?;
+            if !std::path::Path::new(workspace).exists() {
+                return Err("会话记录的工作区目录不存在。".into());
+            }
+            if let Some(exe) = find_antigravity_binary() {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg(workspace);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
+                cmd.spawn().map_err(|_| "无法启动 Antigravity。")?;
+                return Ok(());
+            }
+            app.opener()
+                .open_path(workspace, None::<&str>)
+                .map_err(|_| "无法打开工作区目录。".into())
+        }
+        _ => Err("请复制会话标识，在 Grok Build 中使用 --resume 恢复会话。".into()),
+    }
+}
+
+fn find_antigravity_binary() -> Option<PathBuf> {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local).join("Programs/antigravity/Antigravity.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let candidate = PathBuf::from(program_files).join("Antigravity/Antigravity.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for parent in paths {
+        let candidate = parent.join("antigravity.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn main() {

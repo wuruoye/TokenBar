@@ -133,7 +133,12 @@ fn compact(value: i64) -> String {
 }
 fn model(dashboard: &Dashboard) -> Model {
     let settings = &dashboard.settings;
-    let platforms = [("codex", "Codex"), ("claude", "Claude"), ("grok", "Grok")];
+    let platforms = [
+        ("codex", "Codex"),
+        ("claude", "Claude"),
+        ("grok", "Grok"),
+        ("antigravity", "Antigravity"),
+    ];
     let segments = platforms
         .into_iter()
         .filter(|(platform, _)| {
@@ -143,6 +148,7 @@ fn model(dashboard: &Dashboard) -> Model {
             *platform == "codex"
                 || (*platform == "claude" && settings.show_claude)
                 || (*platform == "grok" && settings.show_grok)
+                || (*platform == "antigravity" && settings.show_antigravity)
         })
         .map(|(platform, title)| {
             let today = crate::sync::displayed_today(dashboard, platform).map(compact).unwrap_or_else(|| "—".into());
@@ -1156,7 +1162,7 @@ mod tests {
             sync_status: String::new(),
         };
         let loading = model(&dashboard);
-        assert_eq!(loading.segments.len(), 3);
+        assert_eq!(loading.segments.len(), 4);
         assert_eq!(loading.segments[0].today, "—");
         assert_eq!(loading.segments[0].quota, "—");
         dashboard.quotas.insert(
@@ -1174,6 +1180,8 @@ mod tests {
         assert_eq!(loaded.segments[0].quota, "—");
         assert_eq!(loaded.segments[1].quota, "55%");
         dashboard.settings.show_claude = false;
+        assert_eq!(model(&dashboard).segments.len(), 3);
+        dashboard.settings.show_antigravity = false;
         assert_eq!(model(&dashboard).segments.len(), 2);
     }
     #[test]

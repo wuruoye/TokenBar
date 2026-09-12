@@ -1,6 +1,7 @@
 :root { font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif; color: #e9efeb; background: #101512; font-synthesis: none; font-size: 13px; --bg: #101512; --card: #19201c; --text: #e9efeb; --muted: #94a299; --border: #2a352e; --accent: #93dfb7; --hover: #26372e; --shadow: #0006; color-scheme: dark; }
 :root[data-provider=claude] { --accent: #edb18a; }
 :root[data-provider=grok] { --accent: #9fbff5; }
+:root[data-provider=antigravity] { --accent: #b4a6ff; }
 :root[data-theme=light] { --bg: #f2f5f3; --card: #fff; --text: #1b2d23; --muted: #617269; --border: #dce4df; --accent: #23784a; --hover: #e5eee8; --shadow: #12221718; color-scheme: light; }
 @media (prefers-color-scheme: light) {
   :root[data-theme=system] { --bg: #f2f5f3; --card: #fff; --text: #1b2d23; --muted: #617269; --border: #dce4df; --accent: #23784a; --hover: #e5eee8; --shadow: #12221718; color-scheme: light; }
@@ -172,3 +173,4 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
 .dashboard .session-meta { font-size: 9px; margin-top: 3px; }
 .dashboard .footnote { font-size: 8px; margin-top: 9px; }
 .statusbar { height: 35px; padding: 6px 14px; }
+.critical-fill { background: #ef4444; }
