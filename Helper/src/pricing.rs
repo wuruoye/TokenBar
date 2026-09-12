@@ -54,8 +54,10 @@ struct AnthropicModelRate {
 /// GPT-5.3-Codex's public rate. Recognized OpenAI model ids keep their estimate
 /// even when a local Codex gateway records a custom provider name.
 ///
-/// GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra apply their explicit long-context table row
-/// to each request whose raw input exceeds 272K tokens.
+/// GPT-5.4, GPT-5.5, and GPT-5.6 apply their explicit long-context table row
+/// to each request whose raw input exceeds 272K tokens. GPT-6 Astra applies
+/// its long-context table row for API Priority sessions, while ChatGPT subscription
+/// sessions keep short-context rates across all prompt lengths.
 ///
 /// Sources:
 /// - https://developers.openai.com/api/docs/models/gpt-6-astra
@@ -158,7 +160,9 @@ impl CodexPricing {
         // Explicit official tables retain priority; automatic quotes cover other models.
         if !self.standard_overrides.contains_key(&normalize_pricing_model_id(model_id)) {
             let known_long_context = bundled_rate_for_model(model_id)
-                .is_some_and(|rate| rate.long_context.is_some());
+                .is_some_and(|rate| rate.long_context.is_some())
+                && !(self.fast_pricing_basis == FastPricingBasis::ChatGptSubscription
+                    && normalize_pricing_model_id(model_id) == "gpt-6-astra");
             if let Some(costs) = self.openrouter.as_ref().and_then(|catalog|
                 catalog.costs("openai", model_id, usage, None, known_long_context)) {
                 return Some(costs);
@@ -170,10 +174,16 @@ impl CodexPricing {
 
     fn rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
         let normalized = normalize_pricing_model_id(model_id);
-        self.standard_overrides
+        let mut rate = self.standard_overrides
             .get(&normalized)
             .copied()
-            .or_else(|| bundled_rate_for_model(&normalized))
+            .or_else(|| bundled_rate_for_model(&normalized))?;
+        if self.fast_pricing_basis == FastPricingBasis::ChatGptSubscription
+            && normalized == "gpt-6-astra"
+        {
+            rate.long_context = None;
+        }
+        Some(rate)
     }
 
     fn fast_rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
@@ -1417,19 +1427,43 @@ mod tests {
                 .unwrap();
             assert!((fast.total() - normal.total() * factor).abs() < 1e-9);
         }
+        let long_usage = TokenBreakdown {
+            cache_write: 72001,
+            ..usage
+        };
         let long = CodexPricing::bundled()
             .calculate_token_costs_with_provider(
                 "openai/gpt-6-astra-2026-09-01",
                 None,
-                &TokenBreakdown {
-                    cache_write: 72001,
-                    ..usage
-                },
+                &long_usage,
             )
             .unwrap();
         assert!((long.input - 2.0).abs() < 1e-9);
         assert!((long.cache_read - 0.2).abs() < 1e-9);
         assert!((long.output - 0.75).abs() < 1e-9);
+
+        let chatgpt_long = CodexPricing::with_fast_pricing(FastPricingBasis::ChatGptSubscription)
+            .calculate_token_costs_with_provider(
+                "openai/gpt-6-astra-2026-09-01",
+                None,
+                &long_usage,
+            )
+            .unwrap();
+        assert!((chatgpt_long.input - 1.0).abs() < 1e-9);
+        assert!((chatgpt_long.cache_read - 0.1).abs() < 1e-9);
+        assert!((chatgpt_long.cache_write - (72001.0 * 12.5 / 1_000_000.0)).abs() < 1e-9);
+        assert!((chatgpt_long.output - 0.5).abs() < 1e-9);
+        assert!((chatgpt_long.reasoning - 0.25).abs() < 1e-9);
+
+        let chatgpt_long_fast = CodexPricing::with_fast_pricing(FastPricingBasis::ChatGptSubscription)
+            .calculate_token_costs_with_service_tier(
+                "gpt-6-astra",
+                None,
+                &long_usage,
+                ServiceTier::Fast,
+            )
+            .unwrap();
+        assert!((chatgpt_long_fast.total() - chatgpt_long.total() * 2.5).abs() < 1e-9);
     }
 
     #[test]

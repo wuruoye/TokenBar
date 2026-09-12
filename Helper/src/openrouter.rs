@@ -232,9 +232,11 @@ impl Catalog {
             .saturating_add(usage.cache_read.max(0))
             .saturating_add(usage.cache_write.max(0));
         let mut rates = entry.rates.clone();
-        for override_ in &entry.thresholds {
-            if prompt > override_.min_prompt_tokens {
-                rates.overlay(&override_.rates);
+        if known_long_context {
+            for override_ in &entry.thresholds {
+                if prompt > override_.min_prompt_tokens {
+                    rates.overlay(&override_.rates);
+                }
             }
         }
         // When the quote omits context overrides, retain the verified OpenAI
