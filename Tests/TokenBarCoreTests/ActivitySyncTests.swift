@@ -839,6 +839,61 @@ struct ActivitySyncTests {
         #expect(merged.rangeTotals?.firstTokenSampleCount == 4)
     }
 
+    @Test("missing token costs are treated as zero only for zero usage and zero cost")
+    func mergesMissingTokenCosts() {
+        let base = TestFixtures.activity()
+        let local = ActivitySnapshot(
+            schemaVersion: base.schemaVersion,
+            generatedAtMs: base.generatedAtMs,
+            timezone: base.timezone,
+            today: base.today,
+            sessions: base.sessions,
+            days: base.days,
+            sources: [ActivitySourceSnapshot(
+                platform: .codex,
+                today: base.today,
+                weeklySinceReset: nil,
+                days: base.days)])
+        for (tokens, costUsd) in [(TokenBreakdown.zero, 0.0), (local.today.tokens, 0.0), (.zero, 1.0)] {
+            let totals = ActivityTotals(
+                tokens: tokens,
+                costUsd: costUsd,
+                requestCount: 0,
+                sessionCount: 0)
+            let remote = ActivitySnapshot(
+                schemaVersion: local.schemaVersion,
+                generatedAtMs: local.generatedAtMs,
+                timezone: local.timezone,
+                today: totals,
+                sessions: [],
+                days: [DailySummary(
+                    date: local.days[0].date,
+                    tokens: tokens,
+                    costUsd: costUsd,
+                    requestCount: 0,
+                    sessionCount: 0)],
+                sources: [ActivitySourceSnapshot(
+                    platform: .codex,
+                    today: totals,
+                    weeklySinceReset: nil,
+                    days: [])])
+            let merged = ActivitySnapshotMerger.merge(
+                local: local,
+                localDevice: self.localDevice,
+                remote: [ActivitySyncStoredSnapshot(
+                    device: self.remoteDevice,
+                    generatedAtMs: remote.generatedAtMs,
+                    receivedAtMs: remote.generatedAtMs + 1,
+                    snapshot: remote)])
+
+            let expectedCosts = tokens == .zero && costUsd == 0 ? local.today.tokenCosts : nil
+            #expect(merged.today.tokenCosts == expectedCosts)
+            #expect(merged.sourceSnapshots.first { $0.platform == .codex }?.today.tokenCosts == expectedCosts)
+            #expect(merged.today.tokens.total == local.today.tokens.total + tokens.total)
+            #expect(merged.today.costUsd == local.today.costUsd + costUsd)
+        }
+    }
+
     @Test("synchronized provider uploads redacted data and returns the merged snapshot")
     func synchronizedProvider() async throws {
         let local = TestFixtures.activity(

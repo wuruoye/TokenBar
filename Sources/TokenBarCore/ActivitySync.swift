@@ -1091,7 +1091,9 @@ public enum ActivitySnapshotMerger {
     }
 
     private static func sumTotals(_ totals: [ActivityTotals]) -> ActivityTotals {
-        let tokenCosts: TokenCostBreakdown? = totals.allSatisfy { $0.tokenCosts != nil }
+        let tokenCosts: TokenCostBreakdown? = totals.allSatisfy {
+            $0.tokenCosts != nil || ($0.tokens == .zero && $0.costUsd == 0)
+        }
             ? TokenCostBreakdown(
                 input: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.input)),
                 output: self.sumFinite(totals.compactMap(\.tokenCosts).map(\.output)),
