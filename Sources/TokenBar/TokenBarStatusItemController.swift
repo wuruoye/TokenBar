@@ -347,11 +347,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func scopeForCurrentStatusClick() -> DashboardScope? {
         guard self.visibleScopes.count > 1,
-              let event = NSApp.currentEvent,
-              event.type == .leftMouseDown || event.type == .leftMouseUp,
               let button = self.statusItem.button,
               let window = button.window,
-              let image = button.image,
               let layout = self.statusLabelLayout
         else {
             return nil
@@ -359,9 +356,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
         let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
         let point = button.convert(windowPoint, from: nil)
-        guard button.bounds.contains(point) else { return nil }
-        let imageMinX = button.bounds.midX - image.size.width / 2
-        return layout.scope(at: point.x - imageMinX)
+        return layout.scope(at: point, in: button.bounds, eventType: NSApp.currentEvent?.type)
     }
 
     private func observeModel() {
@@ -1709,6 +1704,15 @@ struct StatusLabelLayout {
 
     func scope(at imageX: CGFloat) -> DashboardScope {
         self.regions.last(where: { imageX >= $0.startX })?.scope ?? .codex
+    }
+
+    func scope(at point: NSPoint, in buttonBounds: NSRect, eventType: NSEvent.EventType?) -> DashboardScope? {
+        // macOS 27 can leave currentEvent as mouseMoved when the status menu opens.
+        guard eventType != .keyDown, eventType != .keyUp,
+              buttonBounds.contains(point)
+        else { return nil }
+        let imageMinX = buttonBounds.midX - self.image.size.width / 2
+        return self.scope(at: point.x - imageMinX)
     }
 
     func centerX(for platform: TokenPlatform) -> CGFloat? {

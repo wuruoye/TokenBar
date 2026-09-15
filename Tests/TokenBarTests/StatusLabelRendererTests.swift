@@ -75,6 +75,26 @@ struct StatusLabelRendererTests {
         #expect(layout.scope(at: layout.image.size.width) == .codex)
     }
 
+    @Test("Menu opening uses pointer position even when AppKit reports mouseMoved")
+    func menuOpeningHitRegions() {
+        let layout = StatusLabelRenderer.layout(
+            codexToday: "12K",
+            codexWeekly: "80%",
+            claudeToday: "8K",
+            claudeWeekly: "60%")
+        let padding: CGFloat = 8
+        let bounds = NSRect(x: 0, y: 0, width: layout.image.size.width + padding * 2, height: 22)
+        for region in layout.regions {
+            let point = NSPoint(x: padding + region.centerX, y: bounds.midY)
+            for eventType: NSEvent.EventType? in [.leftMouseDown, .leftMouseUp, .mouseMoved, .appKitDefined, nil] {
+                #expect(layout.scope(at: point, in: bounds, eventType: eventType) == region.scope)
+            }
+            #expect(layout.scope(at: point, in: bounds, eventType: .keyDown) == nil)
+            #expect(layout.scope(at: point, in: bounds, eventType: .keyUp) == nil)
+        }
+        #expect(layout.scope(at: NSPoint(x: bounds.midX, y: -1), in: bounds, eventType: .mouseMoved) == nil)
+    }
+
     @Test("Grok remains clickable when Claude is hidden")
     func codexAndGrokHitRegions() {
         let layout = StatusLabelRenderer.layout(
