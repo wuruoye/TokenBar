@@ -161,9 +161,47 @@ public struct QuotaWindowSnapshot: Codable, Equatable, Sendable {
     public let usedPercent: Double
     public let windowMinutes: Int?
     public let resetsAt: Date?
+    /// False when the provider reported a reset time but not a usage percentage.
+    /// `usedPercent` is then 0 and must not be displayed or recorded.
+    public let usageKnown: Bool
+
+    public init(
+        usedPercent: Double,
+        windowMinutes: Int?,
+        resetsAt: Date?,
+        usageKnown: Bool = true)
+    {
+        self.usedPercent = usedPercent
+        self.windowMinutes = windowMinutes
+        self.resetsAt = resetsAt
+        self.usageKnown = usageKnown
+    }
 
     public var remainingPercent: Double {
         max(0, 100 - self.usedPercent)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case usedPercent
+        case windowMinutes
+        case resetsAt
+        case usageKnown
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.usedPercent = try container.decode(Double.self, forKey: .usedPercent)
+        self.windowMinutes = try container.decodeIfPresent(Int.self, forKey: .windowMinutes)
+        self.resetsAt = try container.decodeIfPresent(Date.self, forKey: .resetsAt)
+        self.usageKnown = try container.decodeIfPresent(Bool.self, forKey: .usageKnown) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(self.usedPercent, forKey: .usedPercent)
+        try container.encodeIfPresent(self.windowMinutes, forKey: .windowMinutes)
+        try container.encodeIfPresent(self.resetsAt, forKey: .resetsAt)
+        try container.encode(self.usageKnown, forKey: .usageKnown)
     }
 }
 

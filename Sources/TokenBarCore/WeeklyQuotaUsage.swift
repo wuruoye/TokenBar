@@ -179,6 +179,7 @@ private struct WeeklyQuotaUsageSample {
 
     init?(snapshot: QuotaSnapshot) {
         guard let weekly = snapshot.weekly,
+              weekly.usageKnown,
               weekly.usedPercent.isFinite,
               let windowMinutes = weekly.windowMinutes,
               windowMinutes > 0,

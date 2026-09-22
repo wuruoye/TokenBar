@@ -114,6 +114,26 @@ struct SnapshotCacheTests {
         #expect(permissions == 0o600)
     }
 
+    @Test("loads quota windows saved before usageKnown existed")
+    func loadsLegacyQuotaWindow() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenBarLegacyQuotaTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("quotas.json")
+        let payload = Data(
+            """
+            {"snapshots":[{"platform":"grok","snapshot":{"updatedAt":809597709.755,"weekly":{"resetsAt":809874789.761,"usedPercent":4,"windowMinutes":10080}}}]}
+            """.utf8)
+        try payload.write(to: fileURL)
+
+        let loaded = try await QuotaSnapshotCache(fileURL: fileURL).loadQuotas()
+
+        #expect(loaded[.grok]?.weekly?.usedPercent == 4)
+        #expect(loaded[.grok]?.weekly?.usageKnown == true)
+        #expect(loaded[.grok]?.weekly?.windowMinutes == 10_080)
+    }
+
     @Test("persists weekly quota usage ledgers")
     func persistsWeeklyQuotaUsage() async throws {
         let directory = FileManager.default.temporaryDirectory

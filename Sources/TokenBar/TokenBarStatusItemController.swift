@@ -323,9 +323,14 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private func statusValues(for platform: TokenPlatform) -> (today: String, weekly: String) {
         let today = self.model.activitySnapshot?
             .scoped(to: platform).today.tokens.total.statusBarCompactCount ?? "—"
-        let weekly = self.model.quotaState(for: platform).value?.weekly.map {
-            "\(Int($0.remainingPercent.clamped(to: 0 ... 100).rounded()))%"
-        } ?? "—"
+        let weekly: String = {
+            guard let window = self.model.quotaState(for: platform).value?.weekly,
+                  window.usageKnown
+            else {
+                return "—"
+            }
+            return "\(Int(window.remainingPercent.clamped(to: 0 ... 100).rounded()))%"
+        }()
         return (today, weekly)
     }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-public enum GrokQuotaServiceError: LocalizedError, Sendable {
+public enum GrokQuotaServiceError: LocalizedError, Equatable, Sendable {
     case logUnavailable
     case snapshotUnavailable
     case invalidSnapshot
@@ -51,32 +51,56 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
     public func fetchQuota() async throws -> QuotaSnapshot {
         let data = try self.loadLog()
         let decoder = JSONDecoder()
-        let record = data.split(separator: 0x0A).reversed().lazy.compactMap { line in
-            try? decoder.decode(BillingLogRecord.self, from: Data(line))
-        }.first { record in
-            record.message == "billing: fetched credits config"
-                && record.context?.config != nil
+        var latest: (record: BillingLogRecord, config: Config)?
+        var usedPercent: Double?
+        for line in data.split(separator: 0x0A).reversed() {
+            guard let record = try? decoder.decode(BillingLogRecord.self, from: Data(line)),
+                  record.message == "billing: fetched credits config",
+                  let config = record.context?.config
+            else {
+                continue
+            }
+            if latest == nil {
+                latest = (record, config)
+                if let percent = Self.clampedPercent(config.usedPercent) {
+                    usedPercent = percent
+                    break
+                }
+                if config.resetDate == nil {
+                    break
+                }
+                continue
+            }
+            guard let targetReset = latest?.config.resetDate else { break }
+            if let recordReset = config.resetDate,
+               abs(recordReset.timeIntervalSince(targetReset)) > 1
+            {
+                break
+            }
+            if let percent = Self.clampedPercent(config.usedPercent),
+               let recordReset = config.resetDate,
+               abs(recordReset.timeIntervalSince(targetReset)) <= 1
+            {
+                usedPercent = percent
+                break
+            }
         }
-        guard let record, let config = record.context?.config else {
+        guard let latest else {
             throw GrokQuotaServiceError.snapshotUnavailable
         }
-        guard let usedPercent = config.usedPercent,
-              usedPercent.isFinite
-        else {
+        let resetsAt = latest.config.resetDate
+        guard usedPercent != nil || resetsAt != nil else {
             throw GrokQuotaServiceError.invalidSnapshot
         }
-
-        let resetsAt = config.currentPeriod?.end.flatMap(Self.parseDate)
-            ?? config.billingPeriodEnd.flatMap(Self.parseDate)
-        let windowMinutes = config.currentPeriod?.windowMinutes
         return QuotaSnapshot(
             session: nil,
             weekly: QuotaWindowSnapshot(
-                usedPercent: min(max(usedPercent, 0), 100),
-                windowMinutes: windowMinutes,
-                resetsAt: resetsAt),
+                usedPercent: usedPercent ?? 0,
+                windowMinutes: latest.config.currentPeriod?.windowMinutes,
+                resetsAt: resetsAt,
+                usageKnown: usedPercent != nil),
             resetCredits: nil,
-            updatedAt: record.timestamp.flatMap(Self.parseDate) ?? self.now())
+            updatedAt: latest.record.timestamp.flatMap(Self.parseDate) ?? self.now())
     }
 
     private static func logURL(environment: [String: String]) -> URL {
@@ -97,6 +121,11 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
         return grokHome
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("unified.jsonl", isDirectory: false)
+    }
+
+    private static func clampedPercent(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else { return nil }
+        return min(max(value, 0), 100)
     }
 
     private static func parseDate(_ value: String) -> Date? {
@@ -129,6 +158,11 @@ private extension GrokQuotaService {
         let monthlyLimit: Cent?
         let used: Cent?
         let billingPeriodEnd: String?
+
+        var resetDate: Date? {
+            self.currentPeriod?.end.flatMap(GrokQuotaService.parseDate)
+                ?? self.billingPeriodEnd.flatMap(GrokQuotaService.parseDate)
+        }
 
         var usedPercent: Double? {
             if let creditUsagePercent {

@@ -327,6 +327,95 @@ struct DashboardModelTests {
         #expect(await usageCache.histories[.codex] == model.weeklyQuotaUsage(for: .codex))
     }
 
+    @Test("a newer Grok period without usage replaces the reset and keeps the percentage unknown")
+    @MainActor
+    func grokResetSurvivesMissingUsage() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let previousReset = now.addingTimeInterval(-86_400)
+        let nextReset = now.addingTimeInterval(5 * 86_400)
+        let previous = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 4,
+                windowMinutes: 10_080,
+                resetsAt: previousReset),
+            resetCredits: nil,
+            updatedAt: now.addingTimeInterval(-2 * 86_400))
+        let current = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 0,
+                windowMinutes: 10_080,
+                resetsAt: nextReset,
+                usageKnown: false),
+            resetCredits: nil,
+            updatedAt: now)
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider(
+                [.success(previous), .success(current)],
+                platform: .grok),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+        var events: [QuotaResetEvent] = []
+        model.quotaResetHandler = { events.append($0) }
+
+        await model.refreshQuota(for: .grok)
+        await model.refreshQuota(for: .grok)
+
+        let weekly = model.quotaState(for: .grok).value?.weekly
+        #expect(weekly?.resetsAt == nextReset)
+        #expect(weekly?.usageKnown == false)
+        #expect(weekly?.usedPercent == 0)
+        #expect(events.isEmpty)
+        #expect(model.weeklyQuotaUsage(for: .grok)?.highWaterUsedPercent == 4)
+    }
+
+    @Test("missing Grok usage in the same period keeps the previous percentage")
+    @MainActor
+    func grokSamePeriodKeepsUsage() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(2 * 86_400)
+        let previous = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 4,
+                windowMinutes: 10_080,
+                resetsAt: reset),
+            resetCredits: nil,
+            updatedAt: now.addingTimeInterval(-600))
+        let current = QuotaSnapshot(
+            session: nil,
+            weekly: QuotaWindowSnapshot(
+                usedPercent: 0,
+                windowMinutes: 10_080,
+                resetsAt: reset,
+                usageKnown: false),
+            resetCredits: nil,
+            updatedAt: now)
+        let model = DashboardModel(
+            quotaService: QueueQuotaProvider(
+                [.success(previous), .success(current)],
+                platform: .grok),
+            activityService: QueueActivityProvider([]),
+            cache: nil,
+            quotaRefreshInterval: .seconds(300),
+            activityRefreshInterval: .seconds(300),
+            sleep: { _ in throw CancellationError() },
+            now: { now })
+
+        await model.refreshQuota(for: .grok)
+        await model.refreshQuota(for: .grok)
+
+        let weekly = model.quotaState(for: .grok).value?.weekly
+        #expect(weekly?.usedPercent == 4)
+        #expect(weekly?.usageKnown == true)
+        #expect(weekly?.resetsAt == reset)
+    }
+
     @Test("missing reset metadata does not inherit an expired reset date")
     @MainActor
     func rejectsExpiredInheritedReset() async {

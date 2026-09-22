@@ -510,13 +510,19 @@ public final class DashboardModel {
                 }
                 return Self.nextSundayAtEightPM(after: now, calendar: calendar)
             }()
+            let resetsAt = window.resetsAt
+                ?? inferredReset
+                ?? inheritedReset
+                ?? scheduledWeeklyReset
+            let inheritedUsage = Self.inheritedUsage(
+                for: window,
+                from: previous,
+                resetsAt: resetsAt)
             return QuotaWindowSnapshot(
-                usedPercent: window.usedPercent,
+                usedPercent: inheritedUsage ?? window.usedPercent,
                 windowMinutes: windowMinutes,
-                resetsAt: window.resetsAt
-                    ?? inferredReset
-                    ?? inheritedReset
-                    ?? scheduledWeeklyReset)
+                resetsAt: resetsAt,
+                usageKnown: inheritedUsage == nil ? window.usageKnown : true)
         }
         return QuotaSnapshot(
             session: merge(snapshot.session, previous: previous?.session),
@@ -524,6 +530,26 @@ public final class DashboardModel {
             resetCredits: snapshot.resetCredits,
             updatedAt: snapshot.updatedAt,
             origin: snapshot.origin)
+    }
+
+    /// Keeps a percentage sampled in the same quota window when a newer provider
+    /// payload repeats the reset time but omits usage.
+    private static func inheritedUsage(
+        for window: QuotaWindowSnapshot,
+        from previous: QuotaWindowSnapshot?,
+        resetsAt: Date?) -> Double?
+    {
+        guard !window.usageKnown,
+              let previous,
+              previous.usageKnown,
+              previous.usedPercent.isFinite,
+              let resetsAt,
+              let previousReset = previous.resetsAt,
+              abs(previousReset.timeIntervalSince(resetsAt)) <= 1
+        else {
+            return nil
+        }
+        return previous.usedPercent
     }
 
     private static func nextPeriodicReset(

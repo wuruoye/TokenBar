@@ -60,6 +60,37 @@ struct QuotaResetDetectorTests {
             for: .codex).isEmpty)
     }
 
+    @Test("An unknown usage sample does not count as a weekly reset")
+    func unknownUsageDoesNotReset() {
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let resetAt = observedAt.addingTimeInterval(3 * 86_400)
+        let nextResetAt = resetAt.addingTimeInterval(7 * 86_400)
+        var detector = QuotaResetDetector()
+
+        #expect(detector.observe(
+            self.snapshot(
+                weeklyUsedPercent: 72,
+                weeklyResetAt: resetAt,
+                updatedAt: observedAt),
+            for: .grok).isEmpty)
+        #expect(detector.observe(
+            self.snapshot(
+                weeklyUsedPercent: 0,
+                weeklyResetAt: nextResetAt,
+                updatedAt: observedAt.addingTimeInterval(60),
+                usageKnown: false),
+            for: .grok).isEmpty)
+
+        let events = detector.observe(
+            self.snapshot(
+                weeklyUsedPercent: 0.4,
+                weeklyResetAt: nextResetAt,
+                updatedAt: observedAt.addingTimeInterval(120)),
+            for: .grok)
+        #expect(events.count == 1)
+        #expect(events.first?.resetAt == nextResetAt)
+    }
+
     @Test("Boundary jitter and stale observations do not trigger a reset")
     func boundaryJitter() {
         let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
@@ -125,14 +156,16 @@ struct QuotaResetDetectorTests {
     private func snapshot(
         weeklyUsedPercent: Double,
         weeklyResetAt: Date?,
-        updatedAt: Date) -> QuotaSnapshot
+        updatedAt: Date,
+        usageKnown: Bool = true) -> QuotaSnapshot
     {
         QuotaSnapshot(
             session: nil,
             weekly: QuotaWindowSnapshot(
                 usedPercent: weeklyUsedPercent,
                 windowMinutes: 7 * 24 * 60,
-                resetsAt: weeklyResetAt),
+                resetsAt: weeklyResetAt,
+                usageKnown: usageKnown),
             resetCredits: nil,
             updatedAt: updatedAt)
     }

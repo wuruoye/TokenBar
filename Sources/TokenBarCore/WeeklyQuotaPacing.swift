@@ -17,7 +17,8 @@ public extension QuotaWindowSnapshot {
         weekdaysOnly: Bool,
         calendar: Calendar = .autoupdatingCurrent) -> WeeklyQuotaPacing?
     {
-        guard self.usedPercent.isFinite,
+        guard self.usageKnown,
+              self.usedPercent.isFinite,
               let windowMinutes = self.windowMinutes,
               windowMinutes > 0,
               let windowEnd = self.resetsAt,

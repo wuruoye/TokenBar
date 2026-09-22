@@ -503,22 +503,30 @@ private struct QuotaProgressRow: View {
                 Text(self.title)
                     .font(.system(size: 11.5, weight: .medium))
                 Spacer()
-                Text("\(Int(self.window.remainingPercent.clamped(to: 0 ... 100).rounded()))% left")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-            }
-
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.17))
-                    Capsule()
-                        .fill(self.tint)
-                        .frame(
-                            width: proxy.size.width
-                                * self.window.remainingPercent.clamped(to: 0 ... 100) / 100)
+                if self.window.usageKnown {
+                    Text("\(Int(self.window.remainingPercent.clamped(to: 0 ... 100).rounded()))% left")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
                 }
             }
-            .frame(height: 6)
+
+            if self.window.usageKnown {
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.17))
+                        Capsule()
+                            .fill(self.tint)
+                            .frame(
+                                width: proxy.size.width
+                                    * self.window.remainingPercent.clamped(to: 0 ... 100) / 100)
+                    }
+                }
+                .frame(height: 6)
+            } else {
+                Text("Usage unavailable")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
 
             Text(self.resetText)
                 .font(.system(size: 10.5))

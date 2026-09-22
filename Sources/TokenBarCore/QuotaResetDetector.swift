@@ -81,6 +81,7 @@ public struct QuotaResetDetector: Sendable {
         window: QuotaResetWindow) -> QuotaResetEvent?
     {
         guard let snapshot,
+              snapshot.usageKnown,
               snapshot.usedPercent.isFinite,
               snapshotUpdatedAt.timeIntervalSinceReferenceDate.isFinite
         else {
