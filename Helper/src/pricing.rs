@@ -753,6 +753,7 @@ fn official_rate_from_cells(cells: &[&str]) -> Option<AnthropicModelRate> {
 fn parse_usd_per_mtok(value: &str) -> Option<f64> {
     let value = value.trim();
     let (price, footnote) = value.split_once("/ MTok")?;
+    let footnote = footnote.replace("<sup>", "").replace("</sup>", "");
     if !footnote.chars().all(|character| {
         character.is_ascii_digit()
             || matches!(character, '^' | '{' | '}' | '[' | ']')
@@ -1944,7 +1945,7 @@ mod tests {
 
 | Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
 | --- | --- | --- | --- | --- | --- |
-| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok1 | $50 / MTok |
+| Claude Fable 5.1 | $10 / MTok | $12.50 / MTok | $20 / MTok | $0.25 / MTok<sup>1</sup> | $50 / MTok |
 | Claude Fable 5 | $10 / MTok | $12.50 / MTok | $20 / MTok | $1 / MTok | $50 / MTok |
 | Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
 | Claude Sonnet 5 [through August 31, 2026](/pricing) | $2 / MTok | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok |
