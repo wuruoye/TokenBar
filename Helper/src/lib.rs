@@ -115,6 +115,19 @@ impl From<ServiceTier> for ActivityServiceTier {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationMetrics {
+    pub generated_tokens: i64,
+    pub duration_ms: i64,
+}
+
+impl GenerationMetrics {
+    fn measured(self) -> Option<Self> {
+        (self.generated_tokens > 0 && self.duration_ms > 0).then_some(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestSummary {
@@ -133,6 +146,8 @@ pub struct RequestSummary {
     pub duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_metrics: Option<GenerationMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_token_ms: Option<i64>,
     pub tokens: TokenBreakdown,
@@ -176,6 +191,8 @@ pub struct ActivityTotals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_generation_tokens_per_second: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_metrics: Option<GenerationMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_time_to_first_token_ms: Option<f64>,
     #[serde(default)]
     pub first_token_sample_count: usize,
@@ -210,6 +227,8 @@ pub struct DailySummary {
     pub cost_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_generation_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_metrics: Option<GenerationMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_time_to_first_token_ms: Option<f64>,
     #[serde(default)]
@@ -289,6 +308,7 @@ struct RequestRow {
     service_tier: ActivityServiceTier,
     duration_ms: Option<i64>,
     model_duration_ms: Option<i64>,
+    generation_metrics: GenerationMetrics,
     time_to_first_token_ms: Option<i64>,
     request_start_timestamp: Option<i64>,
     request_end_timestamp: i64,
@@ -812,16 +832,9 @@ fn build_snapshot_core(
             entry.tokens.add_assign(&request.tokens);
             entry.cost = add_cost(entry.cost, request.cost);
             entry.token_costs.add(request.token_costs.as_ref());
-            if let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) {
-                let generated_tokens = request
-                    .tokens
-                    .output
-                    .max(0)
-                    .saturating_add(request.tokens.reasoning.max(0));
-                if generated_tokens > 0 {
-                    entry.generated_tokens += generated_tokens as f64;
-                    entry.model_duration_ms += duration_ms as f64;
-                }
+            if let Some(metrics) = request.generation_metrics.measured() {
+                entry.generated_tokens += metrics.generated_tokens as f64;
+                entry.model_duration_ms += metrics.duration_ms as f64;
             }
             entry.turn_ids.insert(turn.id.clone());
             entry
@@ -895,6 +908,10 @@ fn build_snapshot_core(
             date: date.format("%Y-%m-%d").to_string(),
             tokens: entry.map(|value| value.tokens.clone()).unwrap_or_default(),
             cost_usd: entry.map(|value| value.cost).unwrap_or(0.0),
+            generation_metrics: entry.and_then(|value| GenerationMetrics {
+                generated_tokens: value.generated_tokens as i64,
+                duration_ms: value.model_duration_ms as i64,
+            }.measured()),
             average_generation_tokens_per_second: entry.and_then(|value| {
                 (value.generated_tokens > 0.0 && value.model_duration_ms > 0.0)
                     .then_some(value.generated_tokens * 1_000.0 / value.model_duration_ms)
@@ -947,13 +964,9 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
             cost_usd = add_cost(cost_usd, request.cost);
             token_costs.add(request.token_costs.as_ref());
             session_ids.insert((request.source.clone(), request.session_id.clone()));
-            if let Some(duration_ms) = request.model_duration_ms.filter(|duration| *duration > 0) {
-                let request_generated_tokens =
-                    request.tokens.output.max(0).saturating_add(request.tokens.reasoning.max(0));
-                if request_generated_tokens > 0 {
-                    generated_tokens += request_generated_tokens as f64;
-                    model_duration_ms += duration_ms as f64;
-                }
+            if let Some(metrics) = request.generation_metrics.measured() {
+                generated_tokens += metrics.generated_tokens as f64;
+                model_duration_ms += metrics.duration_ms as f64;
             }
             included_turn = true;
         }
@@ -975,6 +988,10 @@ fn activity_totals(turns: &[TurnRow], include: impl Fn(&RequestRow) -> bool) -> 
         tokens,
         cost_usd,
         token_costs: token_costs.complete_costs(),
+        generation_metrics: GenerationMetrics {
+            generated_tokens: generated_tokens as i64,
+            duration_ms: model_duration_ms as i64,
+        }.measured(),
         average_generation_tokens_per_second: (generated_tokens.is_finite()
             && model_duration_ms.is_finite()
             && generated_tokens > 0.0
@@ -1016,6 +1033,11 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         Some(0)
     };
 
+    let generation_metrics = model_duration_ms.filter(|duration| *duration > 0)
+        .map(|duration_ms| GenerationMetrics {
+            generated_tokens: tokens.output.max(0).saturating_add(tokens.reasoning.max(0)),
+            duration_ms,
+        }).unwrap_or_default();
     Some(RequestRow {
         date,
         timestamp: message.timestamp,
@@ -1039,6 +1061,7 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         service_tier: message.service_tier.into(),
         duration_ms: message.duration_ms,
         model_duration_ms,
+        generation_metrics,
         time_to_first_token_ms: message
             .time_to_first_token_ms
             .filter(|duration| *duration >= 0),
@@ -1166,6 +1189,10 @@ fn push_turn(
 }
 
 fn merge_request(target: &mut RequestRow, row: RequestRow) {
+    target.generation_metrics.generated_tokens = target.generation_metrics.generated_tokens
+        .saturating_add(row.generation_metrics.generated_tokens);
+    target.generation_metrics.duration_ms = target.generation_metrics.duration_ms
+        .saturating_add(row.generation_metrics.duration_ms);
     if target.reasoning_effort != row.reasoning_effort {
         target.reasoning_effort = None;
     }
@@ -1437,6 +1464,7 @@ fn request_summary_with_id(
         ended_at_ms: row.request_end_timestamp,
         duration_ms: row.duration_ms,
         model_duration_ms: row.model_duration_ms,
+        generation_metrics: row.generation_metrics.measured(),
         time_to_first_token_ms: row.time_to_first_token_ms,
         tokens: row.tokens,
         cost_usd: row.cost,
@@ -2533,6 +2561,49 @@ mod tests {
         assert_eq!(snapshot.today.tokens.output, 5);
         assert_eq!(snapshot.today.request_count, 1);
         assert_eq!(snapshot.today.session_count, 1);
+    }
+
+    #[test]
+    fn partial_generation_metrics_preserve_usage_and_measured_requests() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut first = message("2026-07-13", 1_000, "root", "/tmp/root.jsonl", 100, 80);
+        first.tokens.reasoning = 20;
+        first.model_duration_ms = Some(1_000);
+        first.cost = 1.0;
+        let mut missing = message("2026-07-13", 2_000, "root", "/tmp/root.jsonl", 200, 50);
+        missing.model_duration_ms = None;
+        missing.cost = 2.0;
+        let mut last = message("2026-07-13", 3_000, "root", "/tmp/root.jsonl", 300, 90);
+        last.tokens.reasoning = 10;
+        last.model_duration_ms = Some(2_000);
+        last.cost = 3.0;
+        for mut rows in [
+            vec![first.clone(), missing.clone(), last.clone()],
+            vec![missing.clone(), first.clone(), last.clone()],
+            vec![first.clone(), last.clone(), missing.clone()],
+        ] {
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.timestamp = (index as i64 + 1) * 1_000;
+                row.is_turn_start = index == 0;
+            }
+            let snapshot = build_snapshot(rows, today, 10_000, "UTC".into(), 1).unwrap();
+            assert_eq!(snapshot.today.tokens.total(), 850);
+            assert_eq!(snapshot.today.cost_usd, 6.0);
+            assert_eq!(snapshot.today.request_count, 1);
+            let metrics = GenerationMetrics { generated_tokens: 200, duration_ms: 3_000 };
+            assert_eq!(snapshot.today.generation_metrics, Some(metrics));
+            assert_eq!(snapshot.days[0].generation_metrics, Some(metrics));
+            assert_eq!(snapshot.today.average_generation_tokens_per_second, Some(200.0 / 3.0));
+            let turn = &snapshot.sessions[0].requests[0];
+            assert_eq!(turn.generation_metrics, Some(metrics));
+            assert_eq!(turn.contributions[0].generation_metrics, Some(metrics));
+            assert_eq!(turn.model_duration_ms, None);
+            assert_eq!(turn.tokens.total(), 850);
+            assert_eq!(turn.cost_usd, 6.0);
+            let serialized = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(serialized["sessions"][0]["requests"][0]["generationMetrics"]["generatedTokens"], 200);
+            assert_eq!(serialized["sessions"][0]["requests"][0]["generationMetrics"]["durationMs"], 3_000);
+        }
     }
 
     #[test]

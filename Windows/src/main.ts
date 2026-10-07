@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
-  remainingPercent, weeklyPacing, quotaPaceComparison, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes, formatTPS,
+  remainingPercent, weeklyPacing, quotaPaceComparison, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes, formatTPS, firstTokenTime, formatFirstTokenTime,
   type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
 
@@ -170,7 +170,13 @@ function totalsSection(title: string, totals: Totals, costText: string, detailed
   meta.append(el("span", "muted", "Cache " + cachePercentage(totals.tokens) + " · " + totals.sessionCount + " sessions · " + totals.requestCount + " turns"),
     el("strong", "cost", costText));
   section.append(meta);
-  if (detailed && totals.averageGenerationTokensPerSecond) section.append(el("p", "muted small", "Avg " + totals.averageGenerationTokensPerSecond.toFixed(1) + " tok/s"));
+  if (detailed) {
+    const tps = formatTPS(totals.averageGenerationTokensPerSecond ?? undefined);
+    const metrics = el("p", "muted small", (tps ? "Avg " + tps + " · " : "")
+      + "平均首字 " + formatFirstTokenTime(totals.averageTimeToFirstTokenMs));
+    metrics.title = "首字时间仅统计有记录的请求；缺少记录时显示 —。";
+    section.append(metrics);
+  }
   return section;
 }
 function dashboard(): HTMLElement {
@@ -343,7 +349,7 @@ function sessionView(): HTMLElement {
 function requestRow(session: Session, request: Request): HTMLElement {
   const row = el("div", "request");
   const meta = el("div", "request-meta");
-  meta.append(el("span", "muted small", compact(tokenTotal(request.tokens)) + " tokens"), el("strong", "cost small", requestCost(request)));
+  meta.append(el("span", "muted small", compact(tokenTotal(request.tokens)) + " tokens · 首字 " + formatFirstTokenTime(firstTokenTime(request))), el("strong", "cost small", requestCost(request)));
   row.append(el("strong", "small", (request.isSubagent ? request.agent || "Subagent" : "Main") + " · " + requestModelDetails(request).join("；")),
     meta, tokenRows(request.tokens));
   const actions = el("div", "detail-actions");

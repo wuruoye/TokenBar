@@ -1,5 +1,6 @@
 // Rebuild the display from local data plus the newest compatible device snapshots, as on macOS.
 import type { Day, Remote, Snapshot, Source, Tokens, Totals } from "./model";
+import { generationSample } from "./performance";
 
 const latestDate = (snapshot: Snapshot) => snapshot.days.map(d => d.date).sort().at(-1);
 export function currentRemotes(local: Snapshot, remotes: Remote[]): Remote[] {
@@ -23,9 +24,8 @@ function sumTokens(values: Tokens[]): Tokens {
 function sumTotals(values: Totals[]): Totals {
   let generated = 0, seconds = 0, firstTokenTotal = 0, samples = 0;
   for (const value of values) {
-    const count = value.tokens.output + value.tokens.reasoning;
-    const rate = value.averageGenerationTokensPerSecond;
-    if (rate && Number.isFinite(rate) && rate > 0 && count > 0) { generated += count; seconds += count / rate; }
+    const sample = generationSample(value);
+    if (sample) { generated += sample.generatedTokens; seconds += sample.durationMs / 1000; }
     if (value.firstTokenSampleCount && value.firstTokenSampleCount > 0 && value.averageTimeToFirstTokenMs != null) {
       samples += value.firstTokenSampleCount; firstTokenTotal += value.firstTokenSampleCount * value.averageTimeToFirstTokenMs;
     }
@@ -34,6 +34,7 @@ function sumTotals(values: Totals[]): Totals {
     sessionCount:sum(values.map(v=>v.sessionCount)), requestCount:sum(values.map(v=>v.requestCount)),
     tokenCosts:values.length && values.every(v=>v.tokenCosts != null) ? sumTokens(values.map(v=>v.tokenCosts!)) : undefined,
     averageGenerationTokensPerSecond:seconds > 0 ? generated / seconds : undefined,
+    generationMetrics:seconds > 0 ? { generatedTokens:generated, durationMs:seconds * 1000 } : undefined,
     averageTimeToFirstTokenMs:samples > 0 ? firstTokenTotal / samples : undefined,
     firstTokenSampleCount:samples || undefined };
 }

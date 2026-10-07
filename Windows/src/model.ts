@@ -1,8 +1,12 @@
+import { generationSample } from "./performance";
+
 export type Platform = "codex" | "claude" | "grok" | "antigravity";
 export interface Tokens { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number }
+export interface GenerationMetrics { generatedTokens: number; durationMs: number }
 export interface Totals {
   tokens: Tokens; costUsd: number; sessionCount: number; requestCount: number;
   averageGenerationTokensPerSecond?: number | null;
+  generationMetrics?: GenerationMetrics | null;
   averageTimeToFirstTokenMs?: number | null; firstTokenSampleCount?: number;
   tokenCosts?: Tokens;
 }
@@ -14,7 +18,8 @@ export interface Request {
   id: string; platform: string; sessionId: string; physicalSessionId: string;
   isSubagent: boolean; agent?: string; model: string; startedAtMs: number; endedAtMs: number;
   reasoningEffort?: string | null;
-  modelDurationMs?: number; tokens: Tokens; costUsd: number; costSource: string; serviceTier: string;
+  generationMetrics?: GenerationMetrics | null;
+  modelDurationMs?: number; timeToFirstTokenMs?: number | null; tokens: Tokens; costUsd: number; costSource: string; serviceTier: string;
   sessionPath?: string; promptPreview?: string; outputPreview?: string; contributions?: Request[];
 }
 export interface Session {
@@ -147,20 +152,38 @@ export function formatTPS(value: number | undefined): string | undefined {
   if (value >= 1e3) return (value / 1e3).toFixed(1) + "K tok/s";
   return value.toFixed(1) + " tok/s";
 }
+export function formatFirstTokenTime(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(1) + " s";
+}
+export function firstTokenTime(request: Request): number | undefined {
+  let total = 0, count = 0;
+  for (const row of physicalRequests(request)) {
+    const ms = row.timeToFirstTokenMs;
+    if (ms != null && Number.isFinite(ms) && ms >= 0) { total += ms; count++; }
+  }
+  return count ? total / count : undefined;
+}
 function describeModels(requests: Request[], fallbackModels: string[] = [], includeTPS = false): string[] {
-  const models = new Map<string, { efforts: Set<string>; tokens: number; durationMs: number }>();
+  const models = new Map<string, { efforts: Set<string>; tokens: number; durationMs: number; firstTokenMs: number; firstTokenCount: number }>();
   for (const request of requests) {
     const model = request.model?.trim() || "unknown";
-    const entry = models.get(model) ?? { efforts: new Set<string>(), tokens: 0, durationMs: 0 };
+    const entry = models.get(model) ?? { efforts: new Set<string>(), tokens: 0, durationMs: 0, firstTokenMs: 0, firstTokenCount: 0 };
     entry.efforts.add(request.reasoningEffort?.trim() || "未记录");
-    if (request.modelDurationMs && request.modelDurationMs > 0 && request.tokens && (request.tokens.output + request.tokens.reasoning > 0)) {
-      entry.tokens += request.tokens.output + request.tokens.reasoning;
-      entry.durationMs += request.modelDurationMs;
+    const sample = generationSample(request);
+    if (sample) {
+      entry.tokens += sample.generatedTokens;
+      entry.durationMs += sample.durationMs;
+    }
+    const first = request.timeToFirstTokenMs;
+    if (first != null && Number.isFinite(first) && first >= 0) {
+      entry.firstTokenMs += first;
+      entry.firstTokenCount++;
     }
     models.set(model, entry);
   }
-  for (const model of fallbackModels) if (!models.has(model)) models.set(model, { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0 });
-  if (!models.size) models.set("unknown", { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0 });
+  for (const model of fallbackModels) if (!models.has(model)) models.set(model, { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0, firstTokenMs: 0, firstTokenCount: 0 });
+  if (!models.size) models.set("unknown", { efforts: new Set(["未记录"]), tokens: 0, durationMs: 0, firstTokenMs: 0, firstTokenCount: 0 });
   const levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto", "未记录"];
   return [...models].map(([model, entry]) => {
     let line = (model === "unknown" ? "模型未记录" : model) + " · effort: "
@@ -170,6 +193,7 @@ function describeModels(requests: Request[], fallbackModels: string[] = [], incl
       const tps = formatTPS(rate);
       if (tps) line += " · " + tps;
     }
+    if (entry.firstTokenCount) line += " · 平均首字 " + formatFirstTokenTime(entry.firstTokenMs / entry.firstTokenCount);
     return line;
   });
 }
@@ -187,9 +211,10 @@ export function throughput(request: Request): number | undefined {
   const leaves = request.contributions?.length ? request.contributions : [request];
   let tokens = 0, milliseconds = 0;
   for (const row of leaves) {
-    if (row.modelDurationMs && row.modelDurationMs > 0 && row.tokens && (row.tokens.output + row.tokens.reasoning > 0)) {
-      tokens += row.tokens.output + row.tokens.reasoning;
-      milliseconds += row.modelDurationMs;
+    const sample = generationSample(row);
+    if (sample) {
+      tokens += sample.generatedTokens;
+      milliseconds += sample.durationMs;
     }
   }
   return milliseconds > 0 ? tokens * 1000 / milliseconds : undefined;
@@ -198,9 +223,10 @@ export function sessionThroughput(session: Session): number | undefined {
   const leaves = session.requests.flatMap(physicalRequests);
   let tokens = 0, milliseconds = 0;
   for (const row of leaves) {
-    if (row.modelDurationMs && row.modelDurationMs > 0 && row.tokens && (row.tokens.output + row.tokens.reasoning > 0)) {
-      tokens += row.tokens.output + row.tokens.reasoning;
-      milliseconds += row.modelDurationMs;
+    const sample = generationSample(row);
+    if (sample) {
+      tokens += sample.generatedTokens;
+      milliseconds += sample.durationMs;
     }
   }
   return milliseconds > 0 && tokens > 0 ? tokens * 1000 / milliseconds : undefined;

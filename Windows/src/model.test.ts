@@ -1,6 +1,52 @@
 import { describe, expect, it } from "vitest";
-import { locator, sessionsFor, sourceFor, throughput, sessionThroughput, formatTPS, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
+import { locator, sessionsFor, sourceFor, throughput, sessionThroughput, formatTPS, firstTokenTime, tokenTotal, zeroTokens, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
   remainingPercent, weeklyPacing, quotaPaceComparison, displayedBuckets, sessionModelDetails, requestModelDetails, type Session, type Snapshot, type Request } from "./model";
+
+describe("first token timing", () => {
+  it("averages recorded times by sample count and keeps missing times absent", () => {
+    const request = {model:"gpt-6.1-sol",contributions:[
+      {model:"gpt-6.1-sol",timeToFirstTokenMs:1000},
+      {model:"gpt-6.1-sol",timeToFirstTokenMs:3000},
+      {model:"gpt-6.1-sol"},
+      {model:"gpt-6.1-sol",timeToFirstTokenMs:-1}
+    ]} as Request;
+    expect(firstTokenTime(request)).toBe(2000);
+    expect(firstTokenTime({model:"gpt-6.1-sol"} as Request)).toBeUndefined();
+    const session = {models:["gpt-6.1-sol"],requests:[request]} as Session;
+    expect(sessionModelDetails(session)[0]).toContain("平均首字 2.0 s");
+  });
+});
+
+describe("partial generation metrics", () => {
+  it("shows TPS using only timed output while retaining total usage", () => {
+    const request = {
+      model:"gpt-6.1-sol", tokens:{...zeroTokens(),output:220,reasoning:30},
+      generationMetrics:{generatedTokens:200,durationMs:3000}, costUsd:6
+    } as Request;
+    const session = {models:["gpt-6.1-sol"],requests:[request]} as Session;
+    expect(throughput(request)).toBeCloseTo(200 / 3);
+    expect(sessionThroughput(session)).toBeCloseTo(200 / 3);
+    expect(sessionModelDetails(session)[0]).toContain("66.7 tok/s");
+    expect(tokenTotal(request.tokens)).toBe(250);
+    expect(request.costUsd).toBe(6);
+  });
+  it("weights device totals by measured output and supports legacy snapshots", () => {
+    const localTotals = {tokens:{...zeroTokens(),output:250},costUsd:1,requestCount:1,sessionCount:1,
+      generationMetrics:{generatedTokens:200,durationMs:3000},averageGenerationTokensPerSecond:200 / 3};
+    const remoteTotals = {tokens:{...zeroTokens(),output:100},costUsd:2,requestCount:1,sessionCount:1,
+      averageGenerationTokensPerSecond:100};
+    const local = {schemaVersion:1,generatedAtMs:1000,timezone:"UTC",today:localTotals,
+      days:[{...localTotals,date:"2026-10-07",models:[]}],sessions:[],sources:[]} as Snapshot;
+    const remote = {deviceId:"remote",deviceName:"Remote",snapshot:{...local,generatedAtMs:2000,
+      today:remoteTotals,days:[{...remoteTotals,date:"2026-10-07",models:[]}]}};
+    const merged = mergedSnapshot(local,[remote]);
+    expect(merged.today.averageGenerationTokensPerSecond).toBe(75);
+    expect(merged.days[0].averageGenerationTokensPerSecond).toBe(75);
+    expect(merged.today.generationMetrics).toEqual({generatedTokens:300,durationMs:4000});
+    expect(merged.today.tokens.output).toBe(350);
+    expect(merged.today.costUsd).toBe(3);
+  });
+});
 
 describe("provider isolation and counting", () => {
   it("keeps identical session IDs in different platforms separate", () => {

@@ -47,6 +47,8 @@ struct CodexPayload {
     info: Option<CodexInfo>,
     turn_id: Option<String>,
     time_to_first_token_ms: Option<i64>,
+    started_at_ms: Option<i64>,
+    item: Option<CodexCompletedItem>,
     source: Option<Value>,
     thread_source: Option<String>,
     cwd: Option<String>,
@@ -60,6 +62,12 @@ struct CodexPayload {
 #[derive(Debug, Deserialize)]
 struct CodexThreadSettings {
     service_tier: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexCompletedItem {
+    #[serde(rename = "type")]
+    item_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +200,7 @@ struct CodexParseState {
     service_tier_conflicted: bool,
     current_turn_start_ms: Option<i64>,
     current_model_request_start_ms: Option<i64>,
+    current_model_generation_start_ms: Option<i64>,
     current_model_first_response_ms: Option<i64>,
     current_model_response_end_ms: Option<i64>,
     pending_next_model_request_start_ms: Option<i64>,
@@ -395,6 +404,7 @@ fn parse_codex_reader<R: BufRead>(
                         .and_then(normalize_reasoning_effort);
                     state.current_turn_start_ms = parsed_entry_timestamp;
                     state.current_model_request_start_ms = parsed_entry_timestamp;
+                    state.current_model_generation_start_ms = None;
                     state.current_model_first_response_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
@@ -458,6 +468,25 @@ fn parse_codex_reader<R: BufRead>(
                     handled = true;
                 }
 
+                if entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("item_completed")
+                    && payload.item.as_ref().is_some_and(|item| {
+                        matches!(item.item_type.as_str(), "Reasoning" | "AgentMessage")
+                    })
+                {
+                    if let Some(start_ms) = payload.started_at_ms.filter(|start| {
+                        *start >= 0
+                            && parsed_entry_timestamp.is_some_and(|end| *start <= end)
+                            && state.current_model_request_start_ms
+                                .is_some_and(|request_start| *start >= request_start)
+                    }) {
+                        state.current_model_generation_start_ms = Some(
+                            state.current_model_generation_start_ms
+                                .map_or(start_ms, |existing| existing.min(start_ms)),
+                        );
+                    }
+                }
+
                 if is_response_item {
                     if state.accepts_response_item_user_messages {
                         if let Some(preview) = codex_response_item_user_preview(&payload) {
@@ -507,18 +536,19 @@ fn parse_codex_reader<R: BufRead>(
                         .current_model_request_start_ms
                         .or(state.current_turn_start_ms);
                     let model_duration_ms = duration_between_ms(
-                        model_request_start_ms,
+                        state.current_model_generation_start_ms.or(model_request_start_ms),
                         state.current_model_response_end_ms,
                     );
                     let time_to_first_token_ms = nonnegative_duration_between_ms(
                         model_request_start_ms,
-                        state.current_model_first_response_ms,
+                        state.current_model_generation_start_ms,
                     );
                     state.current_model_request_start_ms = latest_timestamp_ms(
                         parsed_entry_timestamp,
                         state.pending_next_model_request_start_ms,
                     );
                     state.current_model_first_response_ms = None;
+                    state.current_model_generation_start_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
 
@@ -734,6 +764,7 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
             state.service_tier_consensus = None;
             state.service_tier_conflicted = false;
             state.current_model_request_start_ms = None;
+            state.current_model_generation_start_ms = None;
             state.current_model_first_response_ms = None;
             state.current_model_response_end_ms = None;
             state.pending_next_model_request_start_ms = None;
@@ -996,6 +1027,7 @@ fn begin_human_turn(
     state.pending_turn_start = true;
     state.current_turn_start_ms = timestamp_ms.or(state.current_turn_start_ms);
     state.current_model_request_start_ms = state.current_turn_start_ms;
+    state.current_model_generation_start_ms = None;
     state.current_model_first_response_ms = None;
     state.current_model_response_end_ms = None;
     state.pending_next_model_request_start_ms = None;
@@ -1365,6 +1397,20 @@ mod tests {
         .to_string()
     }
 
+    fn completed_model_item_line(timestamp: &str, item_type: &str, started_at: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": item_type},
+                "started_at_ms": chrono::DateTime::parse_from_rfc3339(started_at)
+                    .unwrap().timestamp_millis()
+            }
+        })
+        .to_string()
+    }
+
     fn response_message_line(timestamp: &str, role: &str) -> String {
         serde_json::json!({
             "timestamp": timestamp,
@@ -1638,16 +1684,19 @@ mod tests {
     }
 
     #[test]
-    fn model_request_duration_excludes_tool_execution() {
+    fn model_generation_duration_excludes_first_token_wait_and_tools() {
         let lines = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
             r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Run it"}}"#,
+            completed_model_item_line("2026-01-01T00:00:01.500Z", "Reasoning", "2026-01-01T00:00:01.200Z"),
             response_item_line("2026-01-01T00:00:01.500Z", "reasoning"),
+            completed_model_item_line("2026-01-01T00:00:02.500Z", "AgentMessage", "2026-01-01T00:00:02Z"),
             response_item_line("2026-01-01T00:00:03Z", "function_call"),
             response_item_line("2026-01-01T00:00:53Z", "function_call_output"),
             response_message_line("2026-01-01T00:00:53Z", "developer"),
             token_line("2026-01-01T00:00:53.010Z", (100, 100, 0, 20), (100, 100, 0, 20)),
+            completed_model_item_line("2026-01-01T00:00:54Z", "AgentMessage", "2026-01-01T00:00:53.200Z"),
             response_item_line("2026-01-01T00:00:54Z", "reasoning"),
             response_item_line("2026-01-01T00:00:55.500Z", "function_call"),
             response_item_line("2026-01-01T00:01:55.500Z", "function_call_output"),
@@ -1657,10 +1706,14 @@ mod tests {
         let messages = parse(&lines);
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].model_duration_ms, Some(2_000));
-        assert_eq!(messages[1].model_duration_ms, Some(2_490));
-        assert_eq!(messages[0].time_to_first_token_ms, Some(500));
-        assert_eq!(messages[1].time_to_first_token_ms, Some(990));
+        assert_eq!(messages[0].model_duration_ms, Some(1_800));
+        assert_eq!(messages[1].model_duration_ms, Some(2_300));
+        assert_eq!(messages[0].time_to_first_token_ms, Some(200));
+        assert_eq!(messages[1].time_to_first_token_ms, Some(190));
+        assert_eq!(messages[0].tokens.output, 100);
+        assert_eq!(messages[0].tokens.reasoning, 20);
+        assert_eq!(messages[1].tokens.output, 50);
+        assert_eq!(messages[1].tokens.reasoning, 10);
         assert_eq!(messages[0].duration_ms, Some(52_010));
         assert_eq!(messages[1].duration_ms, Some(114_510));
     }
@@ -1668,12 +1721,14 @@ mod tests {
     #[test]
     fn steering_message_resets_the_next_model_request_start() {
         let lines = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#,
             r#"{"timestamp":"2026-01-01T00:00:00.100Z","type":"event_msg","payload":{"type":"user_message","message":"Original"}}"#,
+            completed_model_item_line("2026-01-01T00:00:01Z", "AgentMessage", "2026-01-01T00:00:00.500Z"),
             response_item_line("2026-01-01T00:00:01Z", "message"),
             token_line("2026-01-01T00:00:01.100Z", (100, 20, 0, 5), (100, 20, 0, 5)),
             r#"{"timestamp":"2026-01-01T00:01:40Z","type":"event_msg","payload":{"type":"user_message","message":"Steer"}}"#,
+            completed_model_item_line("2026-01-01T00:01:42Z", "Reasoning", "2026-01-01T00:01:41.500Z"),
             response_item_line("2026-01-01T00:01:42Z", "function_call"),
             response_item_line("2026-01-01T00:02:42Z", "function_call_output"),
             token_line("2026-01-01T00:02:42.010Z", (200, 50, 0, 10), (100, 30, 0, 5))
@@ -1684,8 +1739,32 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content_preview.as_deref(), Some("Steer"));
         assert!(messages[1].is_turn_start);
-        assert_eq!(messages[1].model_duration_ms, Some(2_000));
+        assert_eq!(messages[0].model_duration_ms, Some(500));
+        assert_eq!(messages[1].model_duration_ms, Some(500));
         assert_eq!(messages[1].duration_ms, Some(62_010));
+    }
+
+    #[test]
+    fn model_generation_duration_falls_back_for_missing_or_invalid_start() {
+        for started_at in [None, Some("2025-12-31T23:59:59Z"), Some("2026-01-01T00:00:10Z")] {
+            let timing = started_at.map(|start| {
+                completed_model_item_line("2026-01-01T00:00:02Z", "Reasoning", start)
+            }).unwrap_or_default();
+            let lines = format!("{}\n{}\n{}\n{}\n{}\n{}\n",
+                r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#,
+                timing,
+                response_item_line("2026-01-01T00:00:02Z", "reasoning"),
+                response_item_line("2026-01-01T00:00:03Z", "function_call"),
+                response_item_line("2026-01-01T00:00:30Z", "function_call_output"),
+                token_line("2026-01-01T00:00:31Z", (100, 20, 0, 5), (100, 20, 0, 5))
+            );
+            let messages = parse(&lines);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].model_duration_ms, Some(3_000));
+            assert_eq!(messages[0].time_to_first_token_ms, None);
+            assert_eq!(messages[0].tokens.output, 20);
+            assert_eq!(messages[0].tokens.reasoning, 5);
+        }
     }
 
     #[test]
