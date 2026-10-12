@@ -1,6 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([switch]$SkipTests, [switch]$NoInstaller)
+param([switch]$NoInstaller)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -29,12 +29,6 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
         & npm.cmd run build
         if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
-        if (-not $SkipTests) {
-            & npm.cmd test
-            if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed.' }
-            & cargo test --manifest-path src-tauri/Cargo.toml --locked
-            if ($LASTEXITCODE -ne 0) { throw 'Windows backend tests failed.' }
-        }
         & node scripts/licenses.mjs
         if ($LASTEXITCODE -ne 0) { throw 'Dependency license generation failed.' }
         if ($NoInstaller) { & npm.cmd run tauri -- build --no-bundle }

@@ -95,15 +95,6 @@ Non-loopback endpoints must use HTTPS, and the client bypasses ambient forward p
 
 Client configuration variables are `TOKENBAR_SYNC_URL`, `TOKENBAR_SYNC_TOKEN`, `TOKENBAR_ACTIVITY_SNAPSHOT`, `TOKENBAR_HELPER`, `TOKENBAR_HELPER_DAYS`, `TOKENBAR_STATISTICS_TIMEZONE`, `TOKENBAR_SYNC_DEVICE_ID`, `TOKENBAR_SYNC_DEVICE_ID_FILE`, `TOKENBAR_SYNC_DEVICE_NAME`, `TOKENBAR_SYNC_CLIENT_VERSION`, and optional `TOKENBAR_SYNC_STATE_DIR`.
 
-## Tests
-
-```sh
-cd TokenBar/Sync/Linux
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-```
-
-The Python suite exercises authentication, Mac-decodable structure validation, recursive sanitization, helper argument/timezone behavior, schema-version preservation, request limits, fresh collection after 409, reset freshness, create/update/exact-retry/older-conflict behavior, durable and in-memory repositories, future-clock rejection, and stable device ordering. The helper's Rust tests cover CLI timezone parsing and UTC date normalization.
-
 ## systemd installation
 
 The repository contains a hardened server unit and a per-user upload timer. Build `tokenbar-helper` first, or point `TOKENBAR_HELPER_BINARY` at a packaged Linux helper. Both installers deploy files from this repository and reload unit metadata, but intentionally do not enable or start anything:

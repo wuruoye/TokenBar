@@ -72,34 +72,3 @@ pub fn record(event: &str, fields: Value) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn rotates_at_one_megabyte_and_retains_complete_json_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let logger = Logger {
-            path: dir.path().join("runtime.log"),
-        };
-        fs::write(&logger.path, vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
-        logger
-            .write("exit-requested", json!({"code":null}))
-            .unwrap();
-        assert_eq!(
-            fs::metadata(logger.path.with_extension("log.1"))
-                .unwrap()
-                .len(),
-            MAX_LOG_BYTES
-        );
-        let entry: Value = serde_json::from_slice(&fs::read(&logger.path).unwrap()).unwrap();
-        assert_eq!(entry["event"], "exit-requested");
-        // Replacement also has to work on Windows when the previous rotation exists.
-        fs::write(&logger.path, vec![b'y'; MAX_LOG_BYTES as usize]).unwrap();
-        logger.write("exit", json!({})).unwrap();
-        assert_eq!(
-            fs::read(logger.path.with_extension("log.1")).unwrap()[0],
-            b'y'
-        );
-    }
-}

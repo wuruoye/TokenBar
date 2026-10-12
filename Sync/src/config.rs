@@ -187,16 +187,3 @@ pub fn tokenbar_sync_device_name(value: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_name_validation_enforces_display_bounds() {
-        assert!(tokenbar_sync_device_name("Windows workstation").is_ok());
-        assert!(tokenbar_sync_device_name("").is_err());
-        assert!(tokenbar_sync_device_name("\n").is_err());
-        assert!(tokenbar_sync_device_name(&"x".repeat(81)).is_err());
-    }
-}

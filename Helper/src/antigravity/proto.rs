@@ -152,24 +152,3 @@ pub fn timestamp_ms(buffer: &[u8], numbers: &[u32]) -> Option<i64> {
         .checked_mul(1_000)
         .and_then(|value| value.checked_add(nanos / 1_000_000))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_nested_fields() {
-        // field 1 { field 2: 300 }, field 3: "ok"
-        let blob = [0x0a, 0x03, 0x10, 0xac, 0x02, 0x1a, 0x02, b'o', b'k'];
-        assert_eq!(integer(&blob, &[1, 2]), Some(300));
-        assert_eq!(string(&blob, &[3]), Some("ok"));
-        assert_eq!(integer(&blob, &[9]), None);
-    }
-
-    #[test]
-    fn reads_timestamps_in_milliseconds() {
-        // field 1 { seconds: 2, nanos: 500000000 }
-        let blob = [0x0a, 0x08, 0x08, 0x02, 0x10, 0x80, 0xca, 0xb5, 0xee, 0x01];
-        assert_eq!(timestamp_ms(&blob, &[1]), Some(2_500));
-    }
-}

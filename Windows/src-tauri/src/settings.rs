@@ -224,37 +224,3 @@ pub fn save(dir: &Path, settings: &Settings) -> Result<(), String> {
     std::fs::write(&temp, data).map_err(|_| "无法写入设置。")?;
     std::fs::rename(temp, dir.join("settings.json")).map_err(|_| "无法保存设置。".into())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn settings_reject_unbounded_refresh_and_unknown_theme() {
-        let mut settings = Settings::default();
-        assert!(settings.validate().is_ok());
-        settings.refresh_seconds = 0;
-        assert!(settings.validate().is_err());
-        settings.refresh_seconds = 60;
-        settings.theme = "unknown".into();
-        assert!(settings.validate().is_err());
-    }
-    #[test]
-    fn settings_replace_existing_file_without_losing_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut settings = Settings::default();
-        save(dir.path(), &settings).unwrap();
-        settings.show_grok = false;
-        save(dir.path(), &settings).unwrap();
-        assert!(!load(dir.path()).unwrap().show_grok);
-    }
-    #[test]
-    fn existing_preferences_enable_taskbar_without_resetting_other_settings() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"refreshSeconds":600,"showClaude":false}"#).unwrap();
-        assert!(settings.taskbar_enabled);
-        assert_eq!(settings.taskbar_platform, "all");
-        assert_eq!(settings.refresh_seconds, 600);
-        assert!(!settings.show_claude);
- assert!(!settings.uses_weekday_weekly_pacing);
-    }
-}

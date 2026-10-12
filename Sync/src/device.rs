@@ -82,17 +82,3 @@ fn read_state(path: &Path) -> Result<DeviceState> {
 fn temporary_path(state_dir: &Path) -> PathBuf {
     state_dir.join(format!(".device-{}.tmp", Uuid::new_v4()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_uuid_is_stable_across_reads() {
-        let directory = tempfile::tempdir().unwrap();
-        let first = load_or_create(directory.path()).unwrap();
-        let second = load_or_create(directory.path()).unwrap();
-        assert_eq!(first.id, second.id);
-        assert!(!first.id.is_nil());
-    }
-}

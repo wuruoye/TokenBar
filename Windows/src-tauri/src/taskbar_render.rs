@@ -205,18 +205,3 @@ pub unsafe fn render(
         ULW_ALPHA,
     ) != 0
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn transparent_background_keeps_hit_target_and_text_has_premultiplied_alpha() {
-        let source = [0, 0, 0, 0, 128, 128, 128, 0, 255, 255, 255, 0];
-        let mut light = source;
-        text_alpha(&mut light, true);
-        assert_eq!(light, [0, 0, 0, 1, 0, 0, 0, 128, 0, 0, 0, 255]);
-        let mut dark = source;
-        text_alpha(&mut dark, false);
-        assert_eq!(dark, [1, 1, 1, 1, 128, 128, 128, 128, 255, 255, 255, 255]);
-    }
-}

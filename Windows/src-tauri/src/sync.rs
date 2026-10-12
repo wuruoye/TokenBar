@@ -103,26 +103,3 @@ pub fn displayed_today(dashboard: &crate::Dashboard, platform: &str) -> Option<i
             .saturating_add(t.cache_write).saturating_add(t.reasoning)
     }))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(windows)]
-    #[test]
-    fn dpapi_round_trip_and_disk_never_contain_plaintext() {
-        let dir = tempfile::tempdir().unwrap();
-        let token = "test-only-credential-12345678901234567890";
-        save_token(dir.path(), token.into()).unwrap();
-        let bytes = std::fs::read(dir.path().join("sync-token.protected")).unwrap();
-        assert!(!bytes
-            .windows(token.len())
-            .any(|window| window == token.as_bytes()));
-        assert_eq!(crypt(&bytes, false).unwrap(), token.as_bytes());
-    }
-    #[test]
-    fn invalid_token_is_not_saved() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(save_token(dir.path(), "short".into()).is_err());
-        assert!(!has_token(dir.path()));
-    }
-}

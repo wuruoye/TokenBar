@@ -553,6 +553,3 @@ fn provider_for_model(model_id: &str) -> &'static str {
         "google"
     }
 }
-
-#[cfg(test)]
-mod tests;

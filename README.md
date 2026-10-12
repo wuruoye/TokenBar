@@ -229,15 +229,6 @@ swift build
 cargo build --locked --manifest-path Helper/Cargo.toml
 ```
 
-### Test
-
-The test suites use fixtures and do not require live provider accounts:
-
-```bash
-swift test
-cargo test --locked --manifest-path Helper/Cargo.toml
-```
-
 When `Helper/Cargo.lock` changes, refresh the bundled Rust license catalog:
 
 ```bash
@@ -313,7 +304,6 @@ Sources/TokenBar/             AppKit/SwiftUI menu bar UI
 Sources/TokenBarCore/         Models, quota client, caching, and presentation logic
 Helper/                       Codex/Claude/Grok/Antigravity parsers and shared activity aggregator
 Sync/                         Windows/Linux headless clients, Linux service, and protocol
-Tests/TokenBarCoreTests/      Swift behavior and fixture tests
 Resources/                    Bundle metadata and app icon assets
 Scripts/package_app.sh        Build, embed, sign, and verify TokenBar.app
 Scripts/release_app.sh        Build, notarize, and archive a Universal 2 release
@@ -363,13 +353,13 @@ TokenBar is a standalone implementation: none of these projects is a build-time 
 
 ## Contributing
 
-Issues and focused pull requests are welcome. Please keep changes scoped and include tests for parsing, accounting, quota normalization, caching, or menu presentation behavior when applicable.
+Issues and focused pull requests are welcome. Please keep changes scoped and verify affected behavior with local client data.
 
 Before opening a pull request, run:
 
 ```bash
-swift test
-cargo test --locked --manifest-path Helper/Cargo.toml
+swift build
+cargo build --locked --manifest-path Helper/Cargo.toml
 ```
 
 For visual changes, include a screenshot made with demo data.

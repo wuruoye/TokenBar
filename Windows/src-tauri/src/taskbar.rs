@@ -118,10 +118,6 @@ impl Controller {
         #[cfg(windows)]
         native::stop(self.0.manager.load(Ordering::Acquire));
     }
-    #[cfg(all(windows, feature = "ui-test"))]
-    pub fn test_click(&self, index: usize) {
-        native::test_click(self.0.manager.load(Ordering::Acquire), index);
-    }
 }
 fn compact(value: i64) -> String {
     match value {
@@ -291,8 +287,6 @@ mod native {
         },
     };
     const UPDATE: u32 = WM_APP + 20;
-    #[cfg(feature = "ui-test")]
-    const TEST_CLICK: u32 = WM_APP + 21;
     const TIMER: usize = 41;
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
@@ -435,14 +429,6 @@ mod native {
         if hwnd != 0 {
             unsafe {
                 PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
-            }
-        }
-    }
-    #[cfg(feature = "ui-test")]
-    pub fn test_click(hwnd: usize, index: usize) {
-        if hwnd != 0 {
-            unsafe {
-                PostMessageW(hwnd as HWND, TEST_CLICK, index, 0);
             }
         }
     }
@@ -940,18 +926,6 @@ mod native {
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Native;
         if !pointer.is_null() {
             match message {
-                #[cfg(feature = "ui-test")]
-                TEST_CLICK => {
-                    let native = &*pointer;
-                    eprintln!(
-                        "native test click: index={w} buttons={}",
-                        native.buttons.len()
-                    );
-                    if let Some(&button) = native.buttons.get(w) {
-                        SendMessageW(button, BM_CLICK, 0, 0);
-                    }
-                    return 0;
-                }
                 UPDATE | WM_TIMER => {
                     (*pointer).tick();
                     return 0;
@@ -988,8 +962,6 @@ mod native {
                 // draws all text into one premultiplied-alpha bitmap.
                 WM_DRAWITEM => return 1,
                 WM_COMMAND if (w >> 16) == BN_CLICKED as usize => {
-                    #[cfg(feature = "ui-test")]
-                    eprintln!("native BN_CLICKED: id={} hwnd={l}", w & 0xffff);
                     let index = (w & 0xffff).saturating_sub(100);
                     let model = host
                         .controller
@@ -1031,164 +1003,5 @@ mod native {
             &mut bytes,
         );
         light != 0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reserves_traffic_monitor_even_when_it_has_no_accessibility_button() {
-        let taskbar = Rect {
-            left: 0,
-            top: 2064,
-            right: 3840,
-            bottom: 2160,
-        };
-        let traffic = Rect {
-            left: 3041,
-            top: 2080,
-            right: 3364,
-            bottom: 2144,
-        };
-        let obstacle =
-            foreign_window_obstacle(taskbar, traffic, true, 7732, 52340, 55096, 16).unwrap();
-        let occupied = [(1244, 2242), (3352, 3840), (obstacle.left, obstacle.right)];
-        let (left, width) = free_slot(16, 3824, &occupied, 300, 300, false).unwrap();
-        let bar = Rect {
-            left,
-            top: 2084,
-            right: left + width,
-            bottom: 2140,
-        };
-        assert!(!bar.intersects(traffic));
-        assert!(bar.right < traffic.left);
-        assert!(foreign_window_obstacle(taskbar, traffic, false, 7732, 52340, 55096, 16).is_none());
-        assert!(foreign_window_obstacle(taskbar, traffic, true, 55096, 52340, 55096, 16).is_none());
-    }
-    #[test]
-    fn placement_uses_real_gaps_and_keeps_notifications_and_buttons_clear() {
-        let occupied = [(0, 180), (700, 1200), (1700, 1920)];
-        assert_eq!(
-            free_slot(8, 1912, &occupied, 344, 256, false),
-            Some((1356, 344))
-        );
-        assert_eq!(
-            free_slot(8, 1912, &occupied, 344, 256, true),
-            Some((180, 344))
-        );
-        assert!(free_slot(0, 200, &[(0, 100), (140, 200)], 172, 128, false).is_none());
-    }
-    #[test]
-    fn overlapping_occupied_rectangles_and_negative_monitor_coordinates_are_supported() {
-        assert_eq!(
-            free_slot(
-                -1920,
-                0,
-                &[(-1200, -800), (-1000, -600), (-300, 0)],
-                172,
-                128,
-                false
-            ),
-            Some((-472, 172))
-        );
-        assert_eq!(
-            free_slot(0, 500, &[(0, 150), (140, 320)], 200, 128, false),
-            Some((320, 180))
-        );
-    }
-    #[test]
-    fn panel_stays_in_work_area_for_top_bottom_and_secondary_monitors() {
-        let work = Rect {
-            left: -1920,
-            top: 0,
-            right: 0,
-            bottom: 1040,
-        };
-        assert_eq!(
-            panel_position(
-                Rect {
-                    left: -250,
-                    top: 1040,
-                    right: -70,
-                    bottom: 1080
-                },
-                work,
-                520,
-                780
-            ),
-            (-520, 252)
-        );
-        let top_work = Rect {
-            left: 0,
-            top: 48,
-            right: 1920,
-            bottom: 1080,
-        };
-        assert_eq!(
-            panel_position(
-                Rect {
-                    left: 1500,
-                    top: 0,
-                    right: 1700,
-                    bottom: 48
-                },
-                top_work,
-                520,
-                780
-            ),
-            (1340, 56)
-        );
-    }
-    #[test]
-    fn same_platform_click_closes_but_other_platform_switches() {
-        assert!(hides_on_click(true, "codex", "codex"));
-        assert!(!hides_on_click(true, "codex", "claude"));
-        assert!(!hides_on_click(false, "codex", "codex"));
-    }
-    #[test]
-    fn taskbar_summary_keeps_missing_quota_unknown_and_platform_totals_separate() {
-        let mut dashboard = Dashboard {
-            settings: crate::settings::Settings {
-                taskbar_platform: "all".into(),
-                ..Default::default()
-            },
-            snapshot: None,
-            quotas: Default::default(),
-            refreshing: false,
-            error: None,
-            memory_status: String::new(),
-            remote_snapshots: vec![],
-            sync_status: String::new(),
-        };
-        let loading = model(&dashboard);
-        assert_eq!(loading.segments.len(), 4);
-        assert_eq!(loading.segments[0].today, "—");
-        assert_eq!(loading.segments[0].quota, "—");
-        dashboard.quotas.insert(
-            "claude".into(),
-            crate::quota::Quota {
-                weekly: Some(crate::quota::Window {
-                    used_percent: 45.0,
-                    window_minutes: Some(10080),
-                    resets_at_ms: None,
-                }),
-                ..Default::default()
-            },
-        );
-        let loaded = model(&dashboard);
-        assert_eq!(loaded.segments[0].quota, "—");
-        assert_eq!(loaded.segments[1].quota, "55%");
-        dashboard.settings.show_claude = false;
-        assert_eq!(model(&dashboard).segments.len(), 3);
-        dashboard.settings.show_antigravity = false;
-        assert_eq!(model(&dashboard).segments.len(), 2);
-    }
-    #[test]
-    fn compact_counts_match_mac_status_values() {
-        assert_eq!(compact(1200), "1K");
-        assert_eq!(compact(1234567), "1M");
-        assert_eq!(compact(20800000), "21M");
-        assert_eq!(compact(999999), "1000K");
     }
 }

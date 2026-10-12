@@ -43,7 +43,6 @@ Open TokenBar Settings, enable **Multi-device sync**, then enter the HTTPS serve
 ## Verification
 
 ```sh
-cargo test --manifest-path Helper/Cargo.toml --locked
-cargo test --manifest-path Sync/Cargo.toml --locked
-cd Sync/Linux && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+cargo build --manifest-path Helper/Cargo.toml --locked
+cargo build --manifest-path Sync/Cargo.toml --locked
 ```

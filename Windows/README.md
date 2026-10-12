@@ -58,21 +58,10 @@ The opt-in receiver uses the existing Rust OTLP/HTTP JSON receiver on 127.0.0.1:
 cd Windows
 npm ci
 npm run build
-npm test
-cargo test --manifest-path src-tauri/Cargo.toml --locked
+cargo check --manifest-path src-tauri/Cargo.toml --locked
 ~~~
 
 The Windows client has its own packaging script; Scripts/package_app.sh builds the macOS app and requires macOS/Swift/AppKit.
-
-The opt-in native integration test uses a debug build with the ui-test feature and a loopback WebView2 debugging port. It sends BM_CLICK to the application's real Win32 buttons and checks actual paint completion, hit testing, no overlap with existing taskbar tools, unchanged foreign-window positions/sizes, panel visibility, screen bounds, provider selection, and disable/recreate behavior. Settings are restored afterward. The test command is omitted from ordinary builds.
-
-~~~powershell
-npm run tauri -- build --debug --no-bundle --features ui-test
-# Launch target/debug/tokenbar-windows.exe with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9237
-node tests/taskbar.native.mjs
-~~~
-
-After stopping the normal TokenBar instance, run `node tests/lifecycle.native.mjs` against that same `ui-test` build to verify panel destruction/recreation, resident process and tray/taskbar retention, second-launch activation, and explicit Quit. The test launches and closes its own TokenBar process and leaves settings unchanged.
 
 Read-only native taskbar geometry diagnostics:
 

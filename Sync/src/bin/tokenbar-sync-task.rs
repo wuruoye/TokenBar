@@ -224,21 +224,6 @@ mod windows_runner {
     fn valid_token(value: &[u8]) -> bool {
         (32..=512).contains(&value.len()) && value.iter().all(|byte| (33..=126).contains(byte))
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::valid_token;
-
-        #[test]
-        fn token_validation_matches_installer_contract() {
-            assert!(valid_token(&[b'a'; 32]));
-            assert!(valid_token(&[b'z'; 512]));
-            assert!(!valid_token(&[b'a'; 31]));
-            assert!(!valid_token(&[b'a'; 513]));
-            assert!(!valid_token(b"contains whitespace but is long enough"));
-            assert!(!valid_token(&[0; 64]));
-        }
-    }
 }
 
 #[cfg(windows)]

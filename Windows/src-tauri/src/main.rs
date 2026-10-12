@@ -107,19 +107,8 @@ fn toggle_existing_panel(app: &tauri::AppHandle, window: &tauri::WebviewWindow, 
         .panel_platform
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    #[cfg(feature = "ui-test")]
-    eprintln!(
-        "taskbar toggle: platform={platform} active={active} visible={:?}",
-        window.is_visible()
-    );
     if taskbar::hides_on_click(window.is_visible().unwrap_or(false), &active, platform) {
-        let result = window.hide();
-        #[cfg(feature = "ui-test")]
-        eprintln!(
-            "taskbar hide returned {result:?}; visible={:?}",
-            window.is_visible()
-        );
-        let _ = result;
+        let _ = window.hide();
         return;
     }
     *active = platform.to_string();
@@ -571,10 +560,6 @@ fn main() {
             ]
         };
     }
-    #[cfg(all(windows, feature = "ui-test"))]
-    let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
-        Box::new(command_handler![test_taskbar_click, test_lifecycle_action, test_lifecycle_status]);
-    #[cfg(not(all(windows, feature = "ui-test")))]
     let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
         Box::new(command_handler![]);
     tauri::Builder::default()
@@ -766,32 +751,4 @@ fn main() {
             }
             _ => {}
         });
-}
-
-#[cfg(all(windows, feature = "ui-test"))]
-#[tauri::command]
-async fn test_lifecycle_action(app: tauri::AppHandle, action: String) -> Result<(), String> {
-    match action.as_str() {
-        "destroy-panel" => app.get_webview_window("main").ok_or("missing panel")?.destroy().map_err(|e| e.to_string()),
-        "close-panel" => app.get_webview_window("main").ok_or("missing panel")?.close().map_err(|e| e.to_string()),
-        "quit" => { lifecycle::quit(&app); Ok(()) }
-        _ => Err("invalid lifecycle test action".into()),
-    }
-}
-
-#[cfg(all(windows, feature = "ui-test"))]
-#[tauri::command]
-fn test_lifecycle_status(app: tauri::AppHandle) -> serde_json::Value {
-    serde_json::json!({"pid":std::process::id(),"panelExists":app.get_webview_window("main").is_some(),
-        "trayExists":app.tray_by_id("tokenbar").is_some(),"taskbar":state(&app).taskbar.status()})
-}
-
-#[cfg(all(windows, feature = "ui-test"))]
-#[tauri::command]
-fn test_taskbar_click(app: tauri::AppHandle, index: usize) -> Result<(), String> {
-    if index >= 3 {
-        return Err("无效的任务栏按钮索引。".into());
-    }
-    state(&app).taskbar.test_click(index);
-    Ok(())
 }

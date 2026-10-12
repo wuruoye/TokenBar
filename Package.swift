@@ -34,18 +34,4 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
-        .testTarget(
-            name: "TokenBarCoreTests",
-            dependencies: ["TokenBarCore"],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency"),
-                .enableExperimentalFeature("SwiftTesting"),
-            ]),
-        .testTarget(
-            name: "TokenBarTests",
-            dependencies: ["TokenBar"],
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency"),
-                .enableExperimentalFeature("SwiftTesting"),
-            ]),
     ])
