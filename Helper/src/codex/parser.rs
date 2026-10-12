@@ -13,16 +13,11 @@ use std::time::UNIX_EPOCH;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::{human_message_text, message_content_text};
 use crate::usage::{
     content_preview_from_str, content_preview_from_value, normalize_reasoning_effort, normalize_workspace_key,
     workspace_label_from_key, ServiceTier, TokenBreakdown, UnifiedMessage,
 };
-
-const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
-    "<environment_context>",
-    "<system-reminder>",
-    "<user_instructions>",
-];
 
 #[derive(Debug, Deserialize)]
 struct CodexEntry {
@@ -422,14 +417,11 @@ fn parse_codex_reader<R: BufRead>(
                 if entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("user_message")
                 {
-                    if codex_message_is_human_turn(payload.message.as_deref()) {
+                    if let Some(text) = payload.message.as_deref().and_then(human_message_text) {
                         begin_human_turn(
                             &mut state,
                             parsed_entry_timestamp,
-                            payload
-                                .message
-                                .as_deref()
-                                .and_then(content_preview_from_str),
+                            content_preview_from_str(text),
                         );
                     }
                     handled = true;
@@ -490,13 +482,11 @@ fn parse_codex_reader<R: BufRead>(
                 if is_response_item {
                     if state.accepts_response_item_user_messages {
                         if let Some(preview) = codex_response_item_user_preview(&payload) {
-                            if codex_message_is_human_turn(Some(&preview)) {
-                                begin_human_turn(
-                                    &mut state,
-                                    parsed_entry_timestamp,
-                                    Some(preview),
-                                );
-                            }
+                            begin_human_turn(
+                                &mut state,
+                                parsed_entry_timestamp,
+                                Some(preview),
+                            );
                         }
                     }
                     if let Some(timestamp_ms) = parsed_entry_timestamp {
@@ -1014,7 +1004,9 @@ fn codex_response_item_user_preview(payload: &CodexPayload) -> Option<String> {
         payload
             .content
             .as_ref()
-            .and_then(content_preview_from_value)
+            .and_then(|content| message_content_text(content, "user"))
+            .as_deref()
+            .and_then(content_preview_from_str)
     })
     .flatten()
 }
@@ -1050,15 +1042,6 @@ fn extract_model_from_info(info: &CodexInfo) -> Option<String> {
         .clone()
         .filter(|model| !model.is_empty())
         .or(info.model_name.clone().filter(|model| !model.is_empty()))
-}
-
-fn codex_message_is_human_turn(message: Option<&str>) -> bool {
-    message.is_some_and(|text| {
-        let trimmed = text.trim_start();
-        !CODEX_SYSTEM_INJECTED_PREFIXES
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix))
-    })
 }
 
 fn reported_total_tokens(usage: &CodexTokenUsage) -> Option<i64> {

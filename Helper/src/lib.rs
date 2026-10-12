@@ -20,16 +20,11 @@ pub mod openrouter;
 pub mod usage;
 
 pub use usage::StatisticsTimeZone;
+use codex::{human_message_text, message_content_text};
 
 pub const SCHEMA_VERSION: u32 = 11;
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
-
-const CODEX_SYSTEM_INJECTED_PREFIXES: [&str; 3] = [
-    "<environment_context>",
-    "<system-reminder>",
-    "<user_instructions>",
-];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -440,19 +435,31 @@ fn extract_request_detail_from_reader<R: BufRead>(
         }
 
         if let Some(message) = codex_event_message(&entry, "user_message") {
-            if !message.trim().is_empty() && codex_message_is_human_turn(message) {
-                prompts.push(message.to_string());
+            if let Some(text) = human_message_text(message) {
+                append_codex_transcript_message(
+                    &mut prompts,
+                    text.to_string(),
+                    CodexTranscriptSource::Event,
+                );
             }
         } else if let Some(message) = codex_event_message(&entry, "agent_message") {
             if !message.trim().is_empty() {
-                outputs.push(message.to_string());
+                append_codex_transcript_message(
+                    &mut outputs,
+                    message.to_string(),
+                    CodexTranscriptSource::Event,
+                );
             }
+        } else if let Some(message) = codex_response_message(&entry, "user") {
+            append_codex_transcript_message(&mut prompts, message, CodexTranscriptSource::Response);
+        } else if let Some(message) = codex_response_message(&entry, "assistant") {
+            append_codex_transcript_message(&mut outputs, message, CodexTranscriptSource::Response);
         }
     }
 
     Ok(RequestDetail {
-        prompt: (!prompts.is_empty()).then(|| prompts.join("\n\n")),
-        output: (!outputs.is_empty()).then(|| outputs.join("\n\n")),
+        prompt: join_codex_transcript_messages(prompts),
+        output: join_codex_transcript_messages(outputs),
     })
 }
 
@@ -477,11 +484,49 @@ fn codex_event_message<'a>(entry: &'a serde_json::Value, expected_type: &str) ->
     payload.get("message")?.as_str()
 }
 
-fn codex_message_is_human_turn(message: &str) -> bool {
-    let trimmed = message.trim_start();
-    !CODEX_SYSTEM_INJECTED_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+fn codex_response_message(entry: &serde_json::Value, role: &str) -> Option<String> {
+    if entry.get("type")?.as_str()? != "response_item" {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type")?.as_str()? != "message" || payload.get("role")?.as_str()? != role {
+        return None;
+    }
+    message_content_text(payload.get("content")?, role)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexTranscriptSource {
+    Event,
+    Response,
+}
+
+fn append_codex_transcript_message(
+    messages: &mut Vec<(String, Option<CodexTranscriptSource>)>,
+    text: String,
+    source: CodexTranscriptSource,
+) {
+    // Older rollouts mirror a message in both formats. Consume each pair once
+    // while retaining repeated user messages and mixed-format continuations.
+    if let Some((previous_text, previous_source)) = messages.last_mut() {
+        if previous_text == &text && previous_source.is_some_and(|previous| previous != source) {
+            *previous_source = None;
+            return;
+        }
+    }
+    messages.push((text, Some(source)));
+}
+
+fn join_codex_transcript_messages(
+    messages: Vec<(String, Option<CodexTranscriptSource>)>,
+) -> Option<String> {
+    (!messages.is_empty()).then(|| {
+        messages
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
 }
 
 /// Normalizes Codex's reasoning breakdown before TokenBar aggregates it.

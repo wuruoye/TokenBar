@@ -1,4 +1,7 @@
+mod messages;
 mod parser;
+
+pub(crate) use messages::{human_message_text, message_content_text};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
