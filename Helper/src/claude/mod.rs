@@ -93,12 +93,43 @@ pub fn parse_local_claude_messages(
 // Only its explicit prior-ID mapping joins transcripts; shared titles or replayed
 // messages also occur in independent forks and cannot establish this relation.
 fn desktop_session_aliases(options: &LocalParseOptions) -> HashMap<String, String> {
-    let Some(home) = options.home_dir.as_ref().map(PathBuf::from)
+    let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+    for record in desktop_session_records(options.home_dir.as_deref()) {
+        let Some(current) = record.get("cliSessionId").and_then(Value::as_str)
+            .filter(|id| !id.is_empty()) else { continue };
+        let Some(prior_ids) = record.get("priorCliSessionIds").and_then(Value::as_array) else { continue };
+        for prior in prior_ids.iter().filter_map(Value::as_str).filter(|id| !id.is_empty() && *id != current) {
+            candidates.entry(prior.to_string()).or_default().insert(current.to_string());
+        }
+    }
+    candidates.into_iter().filter_map(|(prior, targets)| {
+        (targets.len() == 1).then(|| (prior, targets.into_iter().next().unwrap()))
+    }).collect()
+}
+
+/// Maps each Desktop session's current CLI session ID to its sidebar title.
+///
+/// Desktop usually repeats the title as a transcript `custom-title` record,
+/// but some sessions, such as those spawned from a project channel, keep it
+/// only in the session index.
+pub fn desktop_session_titles(home_dir: Option<&str>) -> HashMap<String, String> {
+    desktop_session_records(home_dir).into_iter().filter_map(|record| {
+        let id = record.get("cliSessionId").and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?;
+        let title = record.get("title").and_then(Value::as_str)
+            .map(str::trim).filter(|title| !title.is_empty())?;
+        Some((id.to_string(), title.to_string()))
+    }).collect()
+}
+
+/// Reads Claude Desktop's index records for local Code sessions.
+fn desktop_session_records(home_dir: Option<&str>) -> Vec<Value> {
+    let Some(home) = home_dir.map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from)) else {
-        return HashMap::new();
+        return Vec::new();
     };
     let mut pending = vec![home.join("Library/Application Support/Claude/claude-code-sessions")];
-    let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut records = Vec::new();
     while let Some(directory) = pending.pop() {
         let Ok(entries) = fs::read_dir(directory) else { continue };
         for entry in entries.filter_map(Result::ok) {
@@ -113,21 +144,13 @@ fn desktop_session_aliases(options: &LocalParseOptions) -> HashMap<String, Strin
             }
             let Some(record) = fs::read(&path).ok()
                 .and_then(|data| serde_json::from_slice::<Value>(&data).ok()) else { continue };
-            if !record.get("sessionId").and_then(Value::as_str)
+            if record.get("sessionId").and_then(Value::as_str)
                 .is_some_and(|id| id.starts_with("local_")) {
-                continue;
-            }
-            let Some(current) = record.get("cliSessionId").and_then(Value::as_str)
-                .filter(|id| !id.is_empty()) else { continue };
-            let Some(prior_ids) = record.get("priorCliSessionIds").and_then(Value::as_array) else { continue };
-            for prior in prior_ids.iter().filter_map(Value::as_str).filter(|id| !id.is_empty() && *id != current) {
-                candidates.entry(prior.to_string()).or_default().insert(current.to_string());
+                records.push(record);
             }
         }
     }
-    candidates.into_iter().filter_map(|(prior, targets)| {
-        (targets.len() == 1).then(|| (prior, targets.into_iter().next().unwrap()))
-    }).collect()
+    records
 }
 
 pub fn extract_request_detail(
@@ -145,6 +168,7 @@ pub fn extract_request_detail(
         )
     })?;
 
+    let mut prompts = PromptReader::new(session_path);
     let mut prompt = None;
     let mut output = Vec::new();
     let mut seen_messages = HashSet::new();
@@ -161,7 +185,7 @@ pub fn extract_request_detail(
 
         match entry.get("type").and_then(Value::as_str) {
             Some("user") if prompt.is_none() => {
-                prompt = human_prompt(&entry);
+                prompt = prompts.prompt(&entry);
             }
             Some("assistant") => {
                 let message = entry.get("message").unwrap_or(&entry);
@@ -261,6 +285,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut is_subagent = false;
     let mut agent = None;
     let mut workspace = fallback_workspace;
+    let mut prompts = PromptReader::new(path);
     let mut pending_prompt = None;
     let mut pending_turn_start = false;
     let mut request_started_at = None;
@@ -311,7 +336,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         if matches!(entry_type, Some("user" | "tool_result")) {
             request_started_at = entry_timestamp_ms(&entry).or(request_started_at);
             if entry_type == Some("user") {
-                if let Some(prompt) = human_prompt(&entry) {
+                if let Some(prompt) = prompts.prompt(&entry) {
                     pending_prompt = Some(prompt);
                     pending_turn_start = true;
                 }
@@ -499,34 +524,242 @@ fn cache_write_breakdown(usage: &Value) -> Option<CacheWriteBreakdown> {
     (breakdown.five_minute > 0 || breakdown.one_hour > 0).then_some(breakdown)
 }
 
-fn human_prompt(entry: &Value) -> Option<String> {
-    let content = entry
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .or_else(|| entry.get("content"))?;
-    match content {
-        Value::String(text) => human_text(text).map(str::to_string),
-        Value::Array(blocks) => {
-            let text = blocks
+/// Reads the prompt that opened each turn of one transcript.
+///
+/// Claude Desktop project channels wrap turns in XML envelopes. `<wake>`
+/// carries the channel message that woke the session. `<relay>` carries a
+/// coordinator session's note, sometimes with the user messages it cites.
+/// When it cites none, the human message behind it arrives as a `<wake>` with
+/// the same `current-time`, possibly queued after the relay turn starts, so
+/// those wakes are read from the whole file on first use.
+struct PromptReader<'a> {
+    path: &'a Path,
+    wake_prompts: Option<HashMap<String, String>>,
+}
+
+impl<'a> PromptReader<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            wake_prompts: None,
+        }
+    }
+
+    fn prompt(&mut self, entry: &Value) -> Option<String> {
+        // Claude Code adds meta user entries, such as a loaded skill's body or
+        // a pasted image's path, inside the turn they belong to. Only meta
+        // entries submitted as a prompt, like a coordinator relay or a
+        // scheduled task, open a turn of their own.
+        if entry.get("isMeta").and_then(Value::as_bool) == Some(true)
+            && entry.get("promptSource").is_none()
+        {
+            return None;
+        }
+        let content = entry
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| entry.get("content"))?;
+        match content {
+            Value::String(text) => self.text(text),
+            Value::Array(blocks) => {
+                let text = blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .filter_map(|text| self.text(text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        }
+    }
+
+    fn text(&mut self, text: &str) -> Option<String> {
+        let text = text.trim();
+        if text.is_empty()
+            || INTERNAL_USER_PREFIXES
                 .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .filter_map(human_text)
+                .any(|prefix| text.starts_with(prefix))
+        {
+            return None;
+        }
+        if let Some((_, body)) = leading_element(text, "wake") {
+            return wake_message(body);
+        }
+        if let Some((_, body)) = leading_element(text, "project_claude_message") {
+            return self.text(body);
+        }
+        if let Some((attributes, body)) = leading_element(text, "relay") {
+            return envelope_elements(body, "cited")
+                .filter(|(attributes, _)| attribute(attributes, "author") == Some("user"))
+                .last()
+                .and_then(|(_, body)| channel_message(body))
+                .or_else(|| {
+                    attribute(attributes, "current-time")
+                        .and_then(|current_time| self.wake_prompt(current_time))
+                })
+                .or_else(|| element_text(body, "note").map(|note| xml_unescape(&note)));
+        }
+        // A finished background task reports back with a `<task-notification>`;
+        // its summary, plus a Monitor event's output, is what the turn answers.
+        if let Some((_, body)) = leading_element(text, "task-notification") {
+            let text = ["summary", "event"]
+                .into_iter()
+                .filter_map(|name| element_text(body, name))
                 .collect::<Vec<_>>()
                 .join("\n");
-            (!text.is_empty()).then_some(text)
+            return (!text.is_empty()).then_some(text);
         }
-        _ => None,
+        Some(text.to_string())
+    }
+
+    fn wake_prompt(&mut self, current_time: &str) -> Option<String> {
+        let path = self.path;
+        self.wake_prompts
+            .get_or_insert_with(|| read_wake_prompts(path))
+            .get(current_time)
+            .cloned()
     }
 }
 
-fn human_text(text: &str) -> Option<&str> {
+/// Maps the `current-time` of each queued or delivered `<wake>` to its message.
+fn read_wake_prompts(path: &Path) -> HashMap<String, String> {
+    let mut prompts = HashMap::new();
+    let Ok(file) = fs::File::open(path) else {
+        return prompts;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("<wake") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let content = entry
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| entry.get("content"));
+        let Some(text) = message_content_text(content) else {
+            continue;
+        };
+        let Some((attributes, body)) = leading_element(text.trim(), "wake") else {
+            continue;
+        };
+        if let (Some(current_time), Some(message)) =
+            (attribute(attributes, "current-time"), wake_message(body))
+        {
+            prompts.entry(current_time.to_string()).or_insert(message);
+        }
+    }
+    prompts
+}
+
+/// Returns the channel message that triggered a `<wake>` envelope.
+fn wake_message(body: &str) -> Option<String> {
+    let messages = envelope_elements(body, "message").collect::<Vec<_>>();
+    messages
+        .iter()
+        .find(|(attributes, _)| attribute(attributes, "trigger") == Some("true"))
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|(attributes, _)| attribute(attributes, "from") == Some("human"))
+        })
+        .and_then(|(_, body)| channel_message(body))
+}
+
+/// Reads one channel message. A reply starts with a `<!-- reply N -->` marker
+/// and the quoted lines it answers; the text after them is the prompt.
+fn channel_message(body: &str) -> Option<String> {
+    let text = xml_unescape(&dedent(body)?);
+    let mut lines = text.lines().peekable();
+    if lines
+        .next_if(|line| line.starts_with("<!-- reply ") && line.ends_with("-->"))
+        .is_some()
+    {
+        while lines
+            .next_if(|line| line.starts_with('>') || line.trim().is_empty())
+            .is_some()
+        {}
+        let reply = lines.collect::<Vec<_>>().join("\n");
+        if !reply.trim().is_empty() {
+            return Some(reply.trim().to_string());
+        }
+    }
+    Some(text)
+}
+
+/// Returns the element `text` starts with when it opens with `<name ...>`.
+fn leading_element<'a>(text: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+    let rest = text.strip_prefix('<')?.strip_prefix(name)?;
+    if !rest.starts_with(|ch: char| ch == '>' || ch.is_whitespace()) {
+        return None;
+    }
+    envelope_elements(text, name).next()
+}
+
+/// Yields `(attributes, body)` for each `<name ...>body</name>` element.
+/// Envelopes never nest same-named elements, so the first closing tag ends
+/// the element.
+fn envelope_elements<'a>(
+    text: &'a str,
+    name: &str,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut rest = text;
+    std::iter::from_fn(move || loop {
+        let start = rest.find(&open)?;
+        let after = &rest[start + open.len()..];
+        if !after.starts_with(|ch: char| ch == '>' || ch.is_whitespace()) {
+            rest = after;
+            continue;
+        }
+        let open_end = after.find('>')?;
+        let body = &after[open_end + 1..];
+        let body_end = body.find(&close)?;
+        rest = &body[body_end + close.len()..];
+        return Some((&after[..open_end], &body[..body_end]));
+    })
+}
+
+fn element_text(text: &str, name: &str) -> Option<String> {
+    envelope_elements(text, name)
+        .next()
+        .and_then(|(_, body)| dedent(body))
+}
+
+fn attribute<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
+    let start = attributes.find(&format!(" {name}=\""))? + name.len() + 3;
+    let value = &attributes[start..];
+    value.find('"').map(|end| &value[..end])
+}
+
+/// Removes the indentation an envelope adds around element text.
+fn dedent(body: &str) -> Option<String> {
+    let indent = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start_matches([' ', '\t']).len())
+        .min()?;
+    let text = body
+        .lines()
+        .map(|line| line.get(indent..).unwrap_or("").trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
     let text = text.trim();
-    (!text.is_empty()
-        && !INTERNAL_USER_PREFIXES
-            .iter()
-            .any(|prefix| text.starts_with(prefix)))
-    .then_some(text)
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Desktop channel envelopes are XML, so their text arrives escaped.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn message_content_text(content: Option<&Value>) -> Option<String> {

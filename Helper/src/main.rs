@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{Days, NaiveDate, Utc};
 use tokenbar_helper::claude::{
+    desktop_session_titles as claude_desktop_session_titles,
     extract_request_detail as extract_claude_request_detail, parse_local_claude_messages,
     LocalParseOptions as ClaudeParseOptions,
 };
@@ -222,6 +223,11 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_claude_session_titles(&claude_messages));
+    for (session_id, title) in claude_desktop_session_titles(home_dir.as_deref()) {
+        session_titles
+            .entry(("claude".to_string(), session_id))
+            .or_insert(title);
+    }
     let antigravity_home_dir = home_dir.clone();
     let grok_messages = parse_local_grok_messages(GrokParseOptions {
         home_dir,
