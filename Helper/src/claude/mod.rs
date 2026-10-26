@@ -391,18 +391,26 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         let timestamp = entry_timestamp_ms(&entry).unwrap_or(fallback_timestamp);
         let request_id = entry.get("requestId").and_then(Value::as_str);
         let message_id = message.get("id").and_then(Value::as_str);
-        // Model time starts when the API call is sent; the request window still
-        // starts at the user or tool result entry that holds the prompt.
+        // The API call starts when it is sent; the request window still starts
+        // at the user or tool result entry that holds the prompt.
         let model_started_at = entry
             .get("requestRef")
             .and_then(Value::as_str)
             .and_then(|id| api_request_started_at.get(id).copied())
             .or(request_started_at);
-        let time_to_first_token_ms = model_started_at
-            .zip(message_id)
-            .and_then(|(model_started_at, message_id)| {
-                claude_time_to_first_token_ms(model_started_at, message_id)
+        // The message id encodes when the server began its response. As for
+        // Codex, generation time runs from there so the first-token wait stays
+        // out of TPS; without a valid response start it runs from the call.
+        let response_started_at = message_id
+            .and_then(|id| prefixed_uuid_v7_timestamp_ms(id, "msg_01"))
+            .filter(|started_at| {
+                *started_at <= timestamp
+                    && model_started_at.is_none_or(|call_started_at| *started_at >= call_started_at)
             });
+        let time_to_first_token_ms = model_started_at
+            .zip(response_started_at)
+            .map(|(model_started_at, response_started_at)| response_started_at - model_started_at);
+        let generation_started_at = response_started_at.or(model_started_at);
         let tokens = TokenBreakdown {
             input: integer(usage.get("input_tokens")).max(0),
             output: integer(usage.get("output_tokens")).max(0),
@@ -431,7 +439,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
                 cache_write_breakdown.as_ref(),
                 timestamp,
                 request_started_at,
-                model_started_at,
+                generation_started_at,
                 message.get("content"),
             );
             continue;
@@ -454,7 +462,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         unified.duration_ms = request_started_at
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
-        unified.model_duration_ms = model_started_at
+        unified.model_duration_ms = generation_started_at
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
         unified.time_to_first_token_ms = time_to_first_token_ms;
@@ -481,7 +489,7 @@ fn merge_streaming_duplicate(
     cache_write_breakdown: Option<&CacheWriteBreakdown>,
     timestamp: i64,
     request_started_at: Option<i64>,
-    model_started_at: Option<i64>,
+    generation_started_at: Option<i64>,
     content: Option<&Value>,
 ) {
     existing.tokens.input = existing.tokens.input.max(tokens.input);
@@ -501,16 +509,16 @@ fn merge_streaming_duplicate(
             .duration_ms
             .map(|duration| existing.timestamp.saturating_sub(duration))
             .or(request_started_at);
-        let model_start = existing
+        let generation_start = existing
             .model_duration_ms
             .map(|duration| existing.timestamp.saturating_sub(duration))
-            .or(model_started_at);
+            .or(generation_started_at);
         existing.timestamp = timestamp;
         existing.refresh_derived_fields();
         existing.duration_ms = start
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
-        existing.model_duration_ms = model_start
+        existing.model_duration_ms = generation_start
             .map(|started_at| timestamp.saturating_sub(started_at))
             .filter(|duration| *duration > 0);
         if let Some(preview) =
@@ -836,13 +844,6 @@ fn entry_timestamp_ms(entry: &Value) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|timestamp| timestamp.timestamp_millis())
-}
-
-fn claude_time_to_first_token_ms(request_started_at: i64, message_id: &str) -> Option<i64> {
-    let message_timestamp = prefixed_uuid_v7_timestamp_ms(message_id, "msg_01")?;
-    message_timestamp
-        .checked_sub(request_started_at)
-        .filter(|duration| *duration >= 0)
 }
 
 fn prefixed_uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<i64> {
