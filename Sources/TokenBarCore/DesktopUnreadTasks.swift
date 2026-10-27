@@ -273,7 +273,8 @@ struct DesktopUnreadTaskReader: Sendable {
                 platform: .codex,
                 id: thread.id,
                 title: thread.title,
-                startedAt: state.startedAt)
+                startedAt: state.startedAt,
+                activity: state.activity)
         }
         return (tasks, rollouts)
     }
@@ -463,6 +464,32 @@ struct DesktopUnreadTaskReader: Sendable {
         }
         guard let id = String(data: Data(value), encoding: .utf8), !id.isEmpty else { return .unknown }
         return id == "null" ? .none : .session(id)
+    }
+
+    /// When the running Claude Desktop launched. The tasks its sessions run in
+    /// the background end when it quits.
+    func claudeLaunchedAt() -> Date? {
+        var mib = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(getuid())]
+        var size = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return nil }
+        // Leave room for processes started between the two calls.
+        var processes = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 16)
+        size = processes.count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, u_int(mib.count), &processes, &size, nil, 0) == 0 else { return nil }
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        for process in processes.prefix(size / MemoryLayout<kinfo_proc>.stride) {
+            let name = withUnsafeBytes(of: process.kp_proc.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            guard name == "Claude",
+                  proc_pidpath(process.kp_proc.p_pid, &path, UInt32(path.count)) > 0,
+                  String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                      .hasSuffix(".app/Contents/MacOS/Claude")
+            else {
+                continue
+            }
+            let started = process.kp_proc.p_starttime
+            return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
+        }
+        return nil
     }
 
     /// Chromium prefixes localStorage values with 0 for UTF-16LE or 1 for Latin-1.
@@ -714,6 +741,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private let claudeTrackerStateURL: URL?
     private let turns = DesktopUnreadTurnReader()
     private let codexTurnStates = CodexTurnStateReader()
+    private let claudeBackgroundTasks = ClaudeBackgroundTaskReader()
+    private let claudeActivities = ClaudeActivityReader()
     private var stream: FSEventStreamRef?
     private var codexPaths: Set<String> = []
     private var codexSessionsPrefix: String?
@@ -725,6 +754,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var codexRunningIDs: Set<String> = []
     private var claudeRunningIDs: Set<String> = []
     private var claudeWaitingIDs: Set<String> = []
+    private var claudeBackgroundIDs: Set<String> = []
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
     }
@@ -936,7 +966,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             shownSession: self.reader.claudeShownSession,
             now: now)
         self.claudeTranscripts.watch(Set(transcripts.values.map(\.path)))
+        self.claudeBackgroundTasks.forget(except: Set(transcripts.values.map(\.path)))
+        self.claudeActivities.forget(except: Set(transcripts.values.map(\.path)))
         self.claudeRunningIDs = Set(running.map(\.id))
+        self.claudeBackgroundIDs = Set(running.filter(\.isInBackground).map(\.id))
         self.claudeWaitingIDs = waiting
         self.publish(.claude, self.claudeTasks(ids, sessions: sessions))
         self.publishRunning(.claude, running)
@@ -958,6 +991,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             return
         }
         self.claudeRunningIDs = Set(running.map(\.id))
+        self.claudeBackgroundIDs = Set(running.filter(\.isInBackground).map(\.id))
         self.publishRunning(.claude, running)
     }
 
@@ -984,15 +1018,18 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// Claude Desktop records only when a session last started or finished a
     /// turn, so its transcript tells which one it was. A turn longer than the
     /// candidate window is still caught while its transcript keeps growing.
-    /// Also returns the sessions whose turn waits for the user, however long
-    /// it waits, and the transcripts of recently active sessions, which a turn
-    /// that starts or ends there writes to.
+    /// A session whose turn ended runs while tasks it started in the
+    /// background do. Also returns the sessions whose turn waits for the user;
+    /// both are followed however long they wait. And returns the transcripts
+    /// of recently active sessions, which a turn that starts or ends there
+    /// writes to.
     private func claudeRunningTasks(
         _ sessions: [String: ClaudeSessionSnapshot],
         now: Date) -> (tasks: [DesktopRunningTask], waiting: Set<String>, transcripts: [String: URL])
     {
         var waiting = Set<String>()
         var transcripts: [String: URL] = [:]
+        lazy var claudeLaunchedAt = self.reader.claudeLaunchedAt()
         let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
             guard !session.isArchived,
                   let edge = session.lastTurnEdgeAt ?? session.lastActivityAt,
@@ -1004,29 +1041,46 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                           projectsDirectory: self.reader.claudeProjectsDirectory)
                   }),
                   // The transcript URL is cached, and a URL caches its resource
-                  // values, so the modification date comes from the file system.
-                  let activeAt = (try? FileManager.default.attributesOfItem(
-                      atPath: transcript.path))?[.modificationDate] as? Date,
+                  // values, so its size and modification date come from the
+                  // file system.
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: transcript.path),
+                  let size = (attributes[.size] as? NSNumber)?.uint64Value,
+                  let activeAt = attributes[.modificationDate] as? Date,
                   now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit
                       || self.claudeWaitingIDs.contains(id)
+                      || self.claudeBackgroundIDs.contains(id)
             else {
                 return nil
             }
             transcripts[id] = transcript
             switch self.turns.claudeTurnState(transcript: transcript) {
             case .running:
-                break
+                return DesktopRunningTask(
+                    platform: .claude,
+                    id: id,
+                    title: session.title,
+                    startedAt: session.lastTurnEdgeAt,
+                    activity: self.claudeActivities.activity(in: transcript, size: size))
             case .waitingForUser:
                 waiting.insert(id)
                 return nil
             case .ended:
-                return nil
+                guard let claudeLaunchedAt,
+                      let background = self.claudeBackgroundTasks.runningTasks(
+                          in: transcript,
+                          size: size,
+                          after: claudeLaunchedAt)
+                else {
+                    return nil
+                }
+                return DesktopRunningTask(
+                    platform: .claude,
+                    id: id,
+                    title: session.title,
+                    startedAt: background.startedAt,
+                    activity: background.activity,
+                    isInBackground: true)
             }
-            return DesktopRunningTask(
-                platform: .claude,
-                id: id,
-                title: session.title,
-                startedAt: session.lastTurnEdgeAt)
         }.sorted {
             ($0.startedAt ?? .distantPast, $0.id) > ($1.startedAt ?? .distantPast, $1.id)
         }

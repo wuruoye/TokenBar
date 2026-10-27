@@ -47,7 +47,10 @@ struct UnreadTasksProvider: TimelineProvider {
     func getTimeline(in context: Context, completion: @escaping (Timeline<UnreadTasksEntry>) -> Void) {
         let now = Date()
         let snapshot = UnreadWidgetStore.load()
-        guard let snapshot, snapshot.isTracking, !snapshot.tasks.isEmpty || !snapshot.running.isEmpty else {
+        guard let snapshot,
+              snapshot.isTracking,
+              !snapshot.tasks.isEmpty || !snapshot.running.isEmpty || !snapshot.background.isEmpty
+        else {
             completion(Timeline(entries: [UnreadTasksEntry(date: now, snapshot: snapshot)], policy: .never))
             return
         }
@@ -106,6 +109,9 @@ private struct SmallUnreadView: View {
     let snapshot: UnreadWidgetSnapshot
 
     var body: some View {
+        // Running tasks, or else background ones, share the bottom row.
+        let isInBackground = self.snapshot.running.isEmpty
+        let active = isInBackground ? self.snapshot.background : self.snapshot.running
         VStack(alignment: .leading, spacing: 4) {
             UnreadHeaderView(snapshot: self.snapshot, countSize: 24, showsPlatformCounts: false)
             PlatformCountsView(platforms: self.snapshot.platforms)
@@ -121,19 +127,19 @@ private struct SmallUnreadView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                 if let reply = task.reply {
-                    ReplyText(text: reply, lineLimit: self.snapshot.running.isEmpty ? 3 : 2)
+                    ReplyText(text: reply, lineLimit: active.isEmpty ? 3 : 2)
                 } else if let prompt = task.distinctPrompt {
-                    PromptText(text: prompt, lineLimit: self.snapshot.running.isEmpty ? 3 : 2)
+                    PromptText(text: prompt, lineLimit: active.isEmpty ? 3 : 2)
                 }
             } else {
                 CaughtUpLabel()
             }
-            if let running = self.snapshot.running.first {
-                RunningRowView(task: running, extraCount: self.snapshot.running.count - 1)
+            if let first = active.first {
+                RunningRowView(task: first, extraCount: active.count - 1, isInBackground: isInBackground)
                     .padding(.top, 2)
             }
         }
-        .widgetURL(self.snapshot.tasks.first?.openURL ?? self.snapshot.running.first?.openURL)
+        .widgetURL(self.snapshot.tasks.first?.openURL ?? active.first?.openURL)
     }
 }
 
@@ -146,9 +152,12 @@ private struct UnreadListView: View {
     }
 
     var body: some View {
-        let hasRunning = !self.snapshot.running.isEmpty
+        let hasRunning = !self.snapshot.running.isEmpty || !self.snapshot.background.isEmpty
         let rows = Array(self.snapshot.tasks.prefix(self.isLarge ? (hasRunning ? 3 : 4) : (hasRunning ? 1 : 2)))
-        let runningRows = Array(self.snapshot.running.prefix(self.isLarge ? 3 : 2))
+        // Background tasks get the rows running tasks leave.
+        let runningLimit = self.isLarge ? 3 : 2
+        let runningRows = Array(self.snapshot.running.prefix(runningLimit))
+        let backgroundRows = Array(self.snapshot.background.prefix(runningLimit - runningRows.count))
         VStack(alignment: .leading, spacing: 8) {
             UnreadHeaderView(snapshot: self.snapshot, countSize: 20, showsPlatformCounts: true)
             if rows.isEmpty {
@@ -180,7 +189,14 @@ private struct UnreadListView: View {
             if !runningRows.isEmpty {
                 RunningSectionView(
                     rows: runningRows,
-                    hiddenCount: self.snapshot.running.count - runningRows.count)
+                    hiddenCount: self.snapshot.running.count - runningRows.count,
+                    isInBackground: false)
+            }
+            if !backgroundRows.isEmpty {
+                RunningSectionView(
+                    rows: backgroundRows,
+                    hiddenCount: self.snapshot.background.count - backgroundRows.count,
+                    isInBackground: true)
             }
         }
     }
@@ -313,18 +329,21 @@ private struct TaskRowView: View {
     }
 }
 
-/// Running tasks sit below the unread ones, one title each.
+/// Running tasks, then background ones, sit below the unread ones, one title
+/// each.
 private struct RunningSectionView: View {
     let rows: [UnreadWidgetSnapshot.RunningItem]
     let hiddenCount: Int
+    let isInBackground: Bool
 
     var body: some View {
+        let title = self.isInBackground ? "Background" : "Running"
         VStack(alignment: .leading, spacing: 3) {
-            Text(self.hiddenCount > 0 ? "Running · \(self.rows.count + self.hiddenCount)" : "Running")
+            Text(self.hiddenCount > 0 ? "\(title) · \(self.rows.count + self.hiddenCount)" : title)
                 .font(.system(size: 10, weight: .semibold))
                 .mutedForeground()
             ForEach(self.rows) { task in
-                RunningRowView(task: task, extraCount: 0)
+                RunningRowView(task: task, extraCount: 0, isInBackground: self.isInBackground)
             }
         }
     }
@@ -333,11 +352,15 @@ private struct RunningSectionView: View {
 private struct RunningRowView: View {
     let task: UnreadWidgetSnapshot.RunningItem
     let extraCount: Int
+    let isInBackground: Bool
 
     var body: some View {
         let row = HStack(spacing: 6) {
             ZStack {
-                MinuteRing(tint: ProviderIcon.tint(for: self.task.platform))
+                // Work left in the background turns a muted ring.
+                MinuteRing(tint: self.isInBackground
+                    ? Color(nsColor: .tertiaryLabelColor)
+                    : ProviderIcon.tint(for: self.task.platform))
                     .frame(width: 16, height: 16)
                 PlatformIconView(platform: self.task.platform, size: 8, showsUnreadDot: false)
             }

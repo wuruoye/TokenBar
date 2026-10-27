@@ -58,12 +58,14 @@ public struct UnreadWidgetSnapshot: Codable, Equatable, Sendable {
         }
     }
 
-    /// A task still running a turn, listed by title alone.
+    /// A task still running a turn, listed by title and what it is doing.
     public struct RunningItem: Codable, Equatable, Identifiable, Sendable {
         public let platform: String
         public let taskID: String
         public let title: String
         public let startedAt: Date?
+        /// What the turn, or else its background tasks, is doing now.
+        public let activity: String?
 
         public var id: String {
             "\(self.platform)/\(self.taskID)"
@@ -73,11 +75,12 @@ public struct UnreadWidgetSnapshot: Codable, Equatable, Sendable {
             UnreadTaskLink.url(platform: self.platform, taskID: self.taskID)
         }
 
-        public init(platform: String, taskID: String, title: String, startedAt: Date?) {
+        public init(platform: String, taskID: String, title: String, startedAt: Date?, activity: String? = nil) {
             self.platform = platform
             self.taskID = taskID
             self.title = title
             self.startedAt = startedAt
+            self.activity = activity
         }
     }
 
@@ -89,6 +92,9 @@ public struct UnreadWidgetSnapshot: Codable, Equatable, Sendable {
     public let tasks: [Item]
     /// Every platform's running tasks, most recently started first.
     public let running: [RunningItem]
+    /// Read tasks whose turn ended while work it started in the background
+    /// still runs, most recently started first.
+    public let background: [RunningItem]
     /// The last tasks the user read, most recently read first.
     public let recent: [Item]
 
@@ -97,22 +103,26 @@ public struct UnreadWidgetSnapshot: Codable, Equatable, Sendable {
         platforms: [Platform],
         tasks: [Item],
         running: [RunningItem],
+        background: [RunningItem] = [],
         recent: [Item] = [])
     {
         self.isTracking = isTracking
         self.platforms = platforms
         self.tasks = tasks
         self.running = running
+        self.background = background
         self.recent = recent
     }
 
-    /// Snapshots written before running and recent tasks were shared have none.
+    /// Snapshots written before running, background, and recent tasks were
+    /// shared have none.
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.isTracking = try container.decode(Bool.self, forKey: .isTracking)
         self.platforms = try container.decode([Platform].self, forKey: .platforms)
         self.tasks = try container.decode([Item].self, forKey: .tasks)
         self.running = try container.decodeIfPresent([RunningItem].self, forKey: .running) ?? []
+        self.background = try container.decodeIfPresent([RunningItem].self, forKey: .background) ?? []
         self.recent = try container.decodeIfPresent([Item].self, forKey: .recent) ?? []
     }
 

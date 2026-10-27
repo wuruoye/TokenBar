@@ -161,6 +161,29 @@ final class DesktopUnreadTurnReader {
         return state
     }
 
+    /// A Claude tool call by what it says it does, or else by the file,
+    /// command, or search it works on.
+    static func claudeToolActivity(_ block: [String: Any]) -> String? {
+        guard let name = block["name"] as? String,
+              name != "ToolSearch",
+              let input = block["input"] as? [String: Any]
+        else {
+            return nil
+        }
+        if let description = (input["description"] as? String).flatMap(self.flattened) {
+            return description
+        }
+        if let path = input["file_path"] as? String ?? input["notebook_path"] as? String {
+            return "\(name) \(URL(fileURLWithPath: path).lastPathComponent)"
+        }
+        for key in ["command", "pattern", "query", "url"] {
+            if let line = (input[key] as? String)?.split(separator: "\n").first.flatMap({ self.flattened(String($0)) }) {
+                return "\(name) \(line)"
+            }
+        }
+        return nil
+    }
+
     /// Collapses whitespace so text fits the few lines a widget row has.
     static func flattened(_ text: String) -> String? {
         let words = text.split(whereSeparator: \.isWhitespace)

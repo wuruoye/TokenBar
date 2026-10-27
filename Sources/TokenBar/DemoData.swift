@@ -1099,12 +1099,22 @@ enum DemoPreviewRenderer {
                     platform: "codex",
                     taskID: "demo-codex-running",
                     title: "Profile the activity helper",
-                    startedAt: now.addingTimeInterval(-95)),
+                    startedAt: now.addingTimeInterval(-95),
+                    activity: "Sampling the helper while it scans a week of logs"),
                 .init(
                     platform: "claude",
                     taskID: "demo-claude-running",
                     title: "Migrate the daily loads",
-                    startedAt: now.addingTimeInterval(-640)),
+                    startedAt: now.addingTimeInterval(-640),
+                    activity: "Run the backfill for October"),
+            ],
+            background: [
+                .init(
+                    platform: "claude",
+                    taskID: "demo-claude-background",
+                    title: "Watch the release rollout",
+                    startedAt: now.addingTimeInterval(-1_500),
+                    activity: "Watch the release until it reaches 100%"),
             ],
             recent: [
                 .init(
@@ -1139,6 +1149,7 @@ enum DemoPreviewRenderer {
                 platforms: state.snapshot.platforms.map { .init(id: $0.id, name: $0.name, unreadCount: 0) },
                 tasks: [],
                 running: state.snapshot.running,
+                background: state.snapshot.background,
                 recent: state.snapshot.recent)
         }
         // `automatic` widens while anything is unread.

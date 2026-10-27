@@ -101,10 +101,10 @@ final class UnreadWidgetPublisher {
         from previous: UnreadWidgetSnapshot,
         in next: UnreadWidgetSnapshot) -> UnreadWidgetSnapshot
     {
-        let current = Set(next.tasks.map(\.id) + next.running.map(\.id))
+        let current = Set(next.tasks.map(\.id) + next.running.map(\.id) + next.background.map(\.id))
         let platforms = Set(next.platforms.map(\.id))
         let now = ContinuousClock.now
-        for task in previous.running where !current.contains(task.id) {
+        for task in previous.running + previous.background where !current.contains(task.id) {
             let item = UnreadWidgetSnapshot.Item(
                 platform: task.platform,
                 taskID: task.taskID,
@@ -144,6 +144,7 @@ final class UnreadWidgetPublisher {
             platforms: next.platforms,
             tasks: next.tasks,
             running: next.running,
+            background: next.background,
             recent: Array(recent))
     }
 
@@ -158,18 +159,25 @@ final class UnreadWidgetPublisher {
     }
 
     /// Matches the menu bar, which hides Claude's unread count with its section.
-    /// A task that started another turn is listed as running, not unread.
+    /// A task that started another turn is listed as running, not unread, while
+    /// one whose turn ended with tasks left in the background is listed under
+    /// those once it is read.
     static func snapshot(
         of unreadTasks: DesktopUnreadTaskMonitor,
         settings: TokenBarSettings) -> UnreadWidgetSnapshot
     {
         let platforms: [TokenPlatform] = settings.showsClaude ? [.codex, .claude] : [.codex]
-        let running = platforms
+        let unread = platforms.flatMap { unreadTasks.tasks[$0] ?? [] }
+        let unreadIDs = Set(unread.map { "\($0.platform.rawValue)/\($0.id)" })
+        let active = platforms
             .flatMap { unreadTasks.running[$0] ?? [] }
             .sorted { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
+        let running = active.filter { !$0.isInBackground }
+        let background = active.filter {
+            $0.isInBackground && !unreadIDs.contains("\($0.platform.rawValue)/\($0.id)")
+        }
         let runningIDs = Set(running.map { "\($0.platform.rawValue)/\($0.id)" })
-        let tasks = platforms
-            .flatMap { unreadTasks.tasks[$0] ?? [] }
+        let tasks = unread
             .filter { !runningIDs.contains("\($0.platform.rawValue)/\($0.id)") }
             .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
         return UnreadWidgetSnapshot(
@@ -193,24 +201,46 @@ final class UnreadWidgetPublisher {
                     },
                     updatedAt: task.updatedAt)
             },
-            running: running.map { task in
-                UnreadWidgetSnapshot.RunningItem(
-                    platform: task.platform.rawValue,
-                    taskID: task.id,
-                    title: task.title ?? "\(task.platform.displayName) task",
-                    startedAt: task.startedAt)
-            })
+            running: running.map(Self.runningItem),
+            background: background.map(Self.runningItem))
     }
 
+    private static func runningItem(_ task: DesktopRunningTask) -> UnreadWidgetSnapshot.RunningItem {
+        UnreadWidgetSnapshot.RunningItem(
+            platform: task.platform.rawValue,
+            taskID: task.id,
+            title: task.title ?? "\(task.platform.displayName) task",
+            startedAt: task.startedAt,
+            activity: task.activity)
+    }
+
+    /// What a task is doing changes with every step it takes, more often than
+    /// the widget may reload, so only the card shows it.
     private func publish(_ snapshot: UnreadWidgetSnapshot) {
-        guard self.sharesWithWidget, snapshot != self.published else { return }
+        let shared = snapshot.withoutActivity
+        guard self.sharesWithWidget, shared != self.published else { return }
         do {
-            try UnreadWidgetStore.save(snapshot)
+            try UnreadWidgetStore.save(shared)
         } catch {
             NSLog("TokenBar could not share unread tasks with its widget: %@", String(describing: error))
             return
         }
-        self.published = snapshot
+        self.published = shared
         WidgetCenter.shared.reloadTimelines(ofKind: UnreadWidgetStore.widgetKind)
+    }
+}
+
+private extension UnreadWidgetSnapshot {
+    var withoutActivity: UnreadWidgetSnapshot {
+        let strip = { (task: RunningItem) in
+            RunningItem(platform: task.platform, taskID: task.taskID, title: task.title, startedAt: task.startedAt)
+        }
+        return UnreadWidgetSnapshot(
+            isTracking: self.isTracking,
+            platforms: self.platforms,
+            tasks: self.tasks,
+            running: self.running.map(strip),
+            background: self.background.map(strip),
+            recent: self.recent)
     }
 }

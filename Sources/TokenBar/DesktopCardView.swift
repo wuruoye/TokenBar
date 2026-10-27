@@ -4,9 +4,10 @@ import TokenBarCore
 import TokenBarWidgetData
 
 /// The desktop card's content: unread tasks with their replies, then running
-/// tasks and the tasks read last, laid out for the card's widget size so
-/// nothing scrolls or is cut off. While anything is unread the card breathes
-/// with a soft red glow, and each running task turns a ring.
+/// tasks, tasks whose work runs on in the background, and the tasks read last,
+/// laid out for the card's widget size so nothing scrolls or is cut off. While
+/// anything is unread the card breathes with a soft red glow, and each running
+/// task turns a ring.
 struct DesktopCardView: View {
     enum DragPhase {
         case changed
@@ -109,8 +110,8 @@ struct DesktopCardView: View {
         }
     }
 
-    /// The count, then the newest unread task, with running tasks summed up at
-    /// the bottom.
+    /// The count, then the newest unread task, with running tasks, or else
+    /// background ones, summed up at the bottom.
     @ViewBuilder
     private func smallContent(_ snapshot: UnreadWidgetSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -129,7 +130,7 @@ struct DesktopCardView: View {
                         }
                         Text(task.title)
                             .font(.system(size: 12, weight: .semibold))
-                            .lineLimit(snapshot.running.isEmpty ? 3 : 2)
+                            .lineLimit(snapshot.running.isEmpty && snapshot.background.isEmpty ? 3 : 2)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .contentShape(Rectangle())
@@ -141,13 +142,7 @@ struct DesktopCardView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            if !snapshot.running.isEmpty {
-                RunningSummaryRow(running: snapshot.running, animates: self.state.isVisible) {
-                    if let task = snapshot.running.first {
-                        self.open(task.platform, task.taskID)
-                    }
-                }
-            }
+            self.summaryRow(snapshot)
         }
     }
 
@@ -155,7 +150,7 @@ struct DesktopCardView: View {
     /// unread, the tasks read last take their place.
     @ViewBuilder
     private func mediumContent(_ snapshot: UnreadWidgetSnapshot) -> some View {
-        let limit = snapshot.running.isEmpty ? 2 : 1
+        let limit = snapshot.running.isEmpty && snapshot.background.isEmpty ? 2 : 1
         let rows = Array(snapshot.tasks.prefix(limit))
         VStack(alignment: .leading, spacing: CardMetrics.headerSpacing) {
             CardHeader(snapshot: snapshot, animates: self.state.isVisible)
@@ -180,23 +175,29 @@ struct DesktopCardView: View {
                 }
             }
             Spacer(minLength: 0)
-            if !snapshot.running.isEmpty {
-                RunningSummaryRow(running: snapshot.running, animates: self.state.isVisible) {
-                    if let task = snapshot.running.first {
-                        self.open(task.platform, task.taskID)
-                    }
-                }
+            self.summaryRow(snapshot)
+        }
+    }
+
+    @ViewBuilder
+    private func summaryRow(_ snapshot: UnreadWidgetSnapshot) -> some View {
+        let isInBackground = snapshot.running.isEmpty
+        let tasks = isInBackground ? snapshot.background : snapshot.running
+        if let task = tasks.first {
+            RunningSummaryRow(running: tasks, isInBackground: isInBackground, animates: self.state.isVisible) {
+                self.open(task.platform, task.taskID)
             }
         }
     }
 
-    /// Full unread rows, then the running tasks, then the tasks read last, as
-    /// many of each as fit.
+    /// Full unread rows, then the running tasks, the background ones, and the
+    /// tasks read last, as many of each as fit.
     @ViewBuilder
     private func listContent(_ snapshot: UnreadWidgetSnapshot, height: CGFloat) -> some View {
         let fit = CardMetrics.fit(
             unread: snapshot.tasks.count,
             running: snapshot.running.count,
+            background: snapshot.background.count,
             recent: snapshot.recent.count,
             height: height)
         VStack(alignment: .leading, spacing: CardMetrics.sectionGap) {
@@ -207,7 +208,10 @@ struct DesktopCardView: View {
                 self.unreadRows(Array(snapshot.tasks.prefix(fit.unread)))
             }
             if fit.running > 0 {
-                self.runningSection(snapshot, rows: Array(snapshot.running.prefix(fit.running)))
+                self.runningSection(snapshot.running, rows: fit.running, isInBackground: false)
+            }
+            if fit.background > 0 {
+                self.runningSection(snapshot.background, rows: fit.background, isInBackground: true)
             }
             if fit.recent > 0 {
                 self.compactSection("Recently read", rows: Array(snapshot.recent.prefix(fit.recent)), isUnread: false)
@@ -215,29 +219,40 @@ struct DesktopCardView: View {
         }
     }
 
-    /// Running tasks, the unread titles without room for a full row, and the
-    /// tasks read last in a column a medium widget wide, then the unread rows
-    /// beside it while the card is wide enough.
+    /// Running tasks, background ones, the unread titles without room for a
+    /// full row, and the tasks read last in a column a medium widget wide, then
+    /// the unread rows beside it while the card is wide enough. Sections later
+    /// in the column give way first.
     @ViewBuilder
     private func columnContent(_ snapshot: UnreadWidgetSnapshot, height: CGFloat, showsUnread: Bool) -> some View {
         let unreadCount = showsUnread
             ? min(snapshot.tasks.count, CardMetrics.rows(fitting: height, rowHeight: CardMetrics.unreadRowHeight))
             : 0
         let more = Array(snapshot.tasks.dropFirst(unreadCount))
-        let fit = CardMetrics.sections([snapshot.running.count, more.count, snapshot.recent.count], height: height)
+        let fit = CardMetrics.sections(
+            [
+                (snapshot.running.count, CardMetrics.runningRowHeight),
+                (snapshot.background.count, CardMetrics.runningRowHeight),
+                (more.count, CardMetrics.compactRowHeight),
+                (snapshot.recent.count, CardMetrics.compactRowHeight),
+            ],
+            height: height)
         HStack(alignment: .top, spacing: CardMetrics.columnGap) {
             VStack(alignment: .leading, spacing: CardMetrics.sectionGap) {
-                if snapshot.running.isEmpty, more.isEmpty, snapshot.recent.isEmpty {
+                if snapshot.running.isEmpty, snapshot.background.isEmpty, more.isEmpty, snapshot.recent.isEmpty {
                     CaughtUpRow(isCaughtUp: snapshot.tasks.isEmpty)
                 }
                 if fit[0] > 0 {
-                    self.runningSection(snapshot, rows: Array(snapshot.running.prefix(fit[0])))
+                    self.runningSection(snapshot.running, rows: fit[0], isInBackground: false)
                 }
                 if fit[1] > 0 {
-                    self.compactSection("More unread", rows: Array(more.prefix(fit[1])), isUnread: true)
+                    self.runningSection(snapshot.background, rows: fit[1], isInBackground: true)
                 }
                 if fit[2] > 0 {
-                    self.compactSection("Recently read", rows: Array(snapshot.recent.prefix(fit[2])), isUnread: false)
+                    self.compactSection("More unread", rows: Array(more.prefix(fit[2])), isUnread: true)
+                }
+                if fit[3] > 0 {
+                    self.compactSection("Recently read", rows: Array(snapshot.recent.prefix(fit[3])), isUnread: false)
                 }
             }
             .frame(width: CardMetrics.columnWidth, alignment: .topLeading)
@@ -285,15 +300,15 @@ struct DesktopCardView: View {
 
     @ViewBuilder
     private func runningSection(
-        _ snapshot: UnreadWidgetSnapshot,
-        rows: [UnreadWidgetSnapshot.RunningItem]) -> some View
+        _ tasks: [UnreadWidgetSnapshot.RunningItem],
+        rows: Int,
+        isInBackground: Bool) -> some View
     {
+        let title = isInBackground ? "Background" : "Running"
         VStack(alignment: .leading, spacing: 0) {
-            SectionLabel(text: snapshot.running.count > rows.count
-                ? "Running · \(snapshot.running.count)"
-                : "Running")
-            ForEach(rows) { task in
-                RunningCardRow(task: task, animates: self.state.isVisible) {
+            SectionLabel(text: tasks.count > rows ? "\(title) · \(tasks.count)" : title)
+            ForEach(tasks.prefix(rows)) { task in
+                RunningCardRow(task: task, isInBackground: isInBackground, animates: self.state.isVisible) {
                     self.open(task.platform, task.taskID)
                 }
                 .transition(Self.rowTransition)
@@ -308,7 +323,9 @@ private enum CardMetrics {
     static let headerSpacing: CGFloat = 8
     /// A title, two reply lines, the prompt and project line, and a divider.
     static let unreadRowHeight: CGFloat = 86
-    static let runningRowHeight: CGFloat = 28
+    /// A title and what the task is doing.
+    static let runningRowHeight: CGFloat = 40
+    static let compactRowHeight: CGFloat = 28
     static let sectionLabelHeight: CGFloat = 18
     static let sectionGap: CGFloat = 10
     static let caughtUpHeight: CGFloat = 28
@@ -321,42 +338,54 @@ private enum CardMetrics {
         max(0, Int(height / rowHeight))
     }
 
-    static func sectionHeight(rows: Int) -> CGFloat {
-        self.sectionLabelHeight + CGFloat(rows) * self.runningRowHeight
+    static func sectionHeight(rows: Int, rowHeight: CGFloat) -> CGFloat {
+        self.sectionLabelHeight + CGFloat(rows) * rowHeight
     }
 
-    static func runningRows(fitting height: CGFloat) -> Int {
-        self.rows(fitting: height - self.sectionLabelHeight, rowHeight: self.runningRowHeight)
-    }
-
-    /// Splits the height between unread rows, a running section, and the tasks
-    /// read last. Unread rows come first, but up to two running rows always
-    /// keep their place.
+    /// Splits the height between unread rows, the running and background
+    /// sections, and the tasks read last. Unread rows come first, but up to two
+    /// running rows always keep their place.
     static func fit(
         unread: Int,
         running: Int,
+        background: Int,
         recent: Int,
-        height: CGFloat) -> (unread: Int, running: Int, recent: Int)
+        height: CGFloat) -> (unread: Int, running: Int, background: Int, recent: Int)
     {
         let reservedRunning = min(running, 2)
-        let runningSpace = reservedRunning > 0 ? self.sectionGap + self.sectionHeight(rows: reservedRunning) : 0
+        let runningSpace = reservedRunning > 0
+            ? self.sectionGap + self.sectionHeight(rows: reservedRunning, rowHeight: self.runningRowHeight)
+            : 0
         let unreadRows = min(unread, self.rows(fitting: height - runningSpace, rowHeight: self.unreadRowHeight))
         let used = unread == 0 && recent == 0
             ? self.caughtUpHeight
             : CGFloat(unreadRows) * self.unreadRowHeight
-        let sections = self.sections([running, recent], height: height, used: used)
-        return (unreadRows, sections[0], sections[1])
+        let sections = self.sections(
+            [
+                (running, self.runningRowHeight),
+                (background, self.runningRowHeight),
+                (recent, self.compactRowHeight),
+            ],
+            height: height,
+            used: used)
+        return (unreadRows, sections[0], sections[1], sections[2])
     }
 
-    /// How many rows of each compact section fit below `used`, in order.
-    static func sections(_ counts: [Int], height: CGFloat, used: CGFloat = 0) -> [Int] {
+    /// How many rows of each titled section fit below `used`, in order.
+    static func sections(
+        _ sections: [(count: Int, rowHeight: CGFloat)],
+        height: CGFloat,
+        used: CGFloat = 0) -> [Int]
+    {
         var used = used
-        return counts.map { count in
-            guard count > 0 else { return 0 }
+        return sections.map { section in
+            guard section.count > 0 else { return 0 }
             let gap = used > 0 ? self.sectionGap : 0
-            let rows = min(count, self.runningRows(fitting: height - used - gap))
+            let rows = min(
+                section.count,
+                self.rows(fitting: height - used - gap - self.sectionLabelHeight, rowHeight: section.rowHeight))
             if rows > 0 {
-                used += gap + self.sectionHeight(rows: rows)
+                used += gap + self.sectionHeight(rows: rows, rowHeight: section.rowHeight)
             }
             return rows
         }
@@ -394,6 +423,7 @@ private struct CaughtUpRow: View {
 /// The first running task's title with a spinning ring, and how many more run.
 private struct RunningSummaryRow: View {
     let running: [UnreadWidgetSnapshot.RunningItem]
+    let isInBackground: Bool
     let animates: Bool
     let action: () -> Void
 
@@ -402,7 +432,9 @@ private struct RunningSummaryRow: View {
             Button(action: self.action) {
                 HStack(spacing: 6) {
                     ZStack {
-                        SpinningRing(tint: CardAccent.tint(for: first.platform), animates: self.animates)
+                        SpinningRing(
+                            tint: CardAccent.ringTint(for: first.platform, isInBackground: self.isInBackground),
+                            animates: self.animates)
                             .frame(width: 18, height: 18)
                         CardPlatformIcon(platform: first.platform, size: 12)
                     }
@@ -449,7 +481,7 @@ private struct CompactTaskRow: View {
                 Spacer(minLength: 4)
                 CardTimeText(date: self.task.updatedAt)
             }
-            .frame(height: CardMetrics.runningRowHeight)
+            .frame(height: CardMetrics.compactRowHeight)
             .modifier(RowHighlight(isHovered: self.isHovered))
         }
         .buttonStyle(.plain)
@@ -627,6 +659,7 @@ private struct UnreadCardRow: View {
 
 private struct RunningCardRow: View {
     let task: UnreadWidgetSnapshot.RunningItem
+    let isInBackground: Bool
     let animates: Bool
     let action: () -> Void
     @State private var isHovered = false
@@ -635,21 +668,33 @@ private struct RunningCardRow: View {
         Button(action: self.action) {
             HStack(spacing: CardGrid.spacing) {
                 ZStack {
-                    SpinningRing(tint: CardAccent.tint(for: self.task.platform), animates: self.animates)
+                    SpinningRing(
+                        tint: CardAccent.ringTint(for: self.task.platform, isInBackground: self.isInBackground),
+                        animates: self.animates)
                         .frame(width: 20, height: 20)
                     CardPlatformIcon(platform: self.task.platform, size: 14)
                 }
                 .frame(width: CardGrid.iconColumn)
-                Text(self.task.title)
-                    .font(.system(size: 12))
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if let startedAt = self.task.startedAt {
-                    ElapsedMinutesText(since: startedAt)
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(self.task.title)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        if let startedAt = self.task.startedAt {
+                            ElapsedMinutesText(since: startedAt)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let activity = self.task.activity {
+                        Text(activity)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
-            .padding(.vertical, 4)
+            .frame(height: CardMetrics.runningRowHeight)
             .modifier(RowHighlight(isHovered: self.isHovered))
         }
         .buttonStyle(.plain)
@@ -1040,5 +1085,10 @@ private enum CardAccent {
         platform == TokenPlatform.claude.rawValue
             ? Color(red: 0.85, green: 0.47, blue: 0.34)
             : .primary
+    }
+
+    /// Work left in the background turns a muted ring.
+    static func ringTint(for platform: String, isInBackground: Bool) -> Color {
+        isInBackground ? Color(nsColor: .tertiaryLabelColor) : self.tint(for: platform)
     }
 }
