@@ -7,8 +7,8 @@ import TokenBarWidgetData
 /// The four macOS desktop widget sizes the card can take, or the one that
 /// fits what it shows.
 enum DesktopCardSize: String, CaseIterable, Identifiable {
-    /// The large widget's width, with the shortest grid height that shows
-    /// every row.
+    /// A medium widget's width, which widens to an extra-large one while
+    /// anything is unread, with the shortest grid height that shows every row.
     case automatic
     case small
     case medium
@@ -151,16 +151,18 @@ final class DesktopCardController {
         guard snapshot != self.state.snapshot else { return }
         self.pendingShrink?.cancel()
         self.pendingShrink = nil
-        // A taller card makes room before new rows slide in; a shorter one
-        // waits until the rows that leave have faded out.
+        // A card grows to make room before new rows slide in, and shrinks only
+        // after the rows that leave have faded out.
         let points = self.points(for: snapshot)
-        if points.height > self.state.points.height {
-            self.resizeCard(to: points)
+        let current = self.state.points
+        let grown = CGSize(width: max(points.width, current.width), height: max(points.height, current.height))
+        if grown != current {
+            self.resizeCard(to: grown)
         }
         withAnimation(.smooth(duration: Self.rowAnimation)) {
             self.state.snapshot = snapshot
         }
-        if points.height < self.state.points.height {
+        if points != grown {
             self.pendingShrink = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(Self.rowAnimation))
                 guard let self, !Task.isCancelled else { return }
@@ -314,7 +316,8 @@ final class DesktopCardController {
     }
 
     /// The size the card takes for `snapshot`: its widget size, or for
-    /// `automatic` the shortest grid height that shows every row and still
+    /// `automatic` the width that fits the unread column when anything is
+    /// unread and the shortest grid height that shows every row and still
     /// fits on the screen.
     private func points(for snapshot: UnreadWidgetSnapshot) -> CGSize {
         let points = self.state.size.points
@@ -328,7 +331,8 @@ final class DesktopCardController {
         while height < needed, height + Self.gridStep <= limit {
             height += Self.gridStep
         }
-        return CGSize(width: points.width, height: height)
+        let width = snapshot.tasks.isEmpty ? points.width : DesktopCardSize.extraLarge.points.width
+        return CGSize(width: width, height: height)
     }
 
     /// Resizes the card on the grid spot nearest where the user put it. The

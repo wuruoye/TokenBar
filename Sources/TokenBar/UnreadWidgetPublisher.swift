@@ -15,6 +15,14 @@ final class UnreadWidgetPublisher {
     /// short delay lets one widget reload cover both.
     private static let coalescingDelay: Duration = .milliseconds(400)
     static let recentLimit = 2
+    /// Read tasks kept beyond the ones shown, so one that runs again comes back
+    /// once it is done.
+    private static let readHistoryLimit = 10
+    private static let readHistoryKey = "TokenBar.unreadWidget.readHistory"
+    /// A turn that ends in the window the user is looking at never becomes
+    /// unread, while the unread mark of one that ends elsewhere can trail the
+    /// end of the turn by a moment.
+    private static let finishGrace: Duration = .seconds(3)
 
     private(set) var snapshot = UnreadWidgetSnapshot(isTracking: true, platforms: [], tasks: [], running: [])
 
@@ -23,6 +31,11 @@ final class UnreadWidgetPublisher {
     @ObservationIgnored private let sharesWithWidget = UnreadWidgetStore.appGroupIdentifier != nil
     @ObservationIgnored private var published: UnreadWidgetSnapshot?
     @ObservationIgnored private var pendingPublish: Task<Void, Never>?
+    /// Tasks the user read, most recently read first, kept across launches.
+    @ObservationIgnored private var readHistory: [UnreadWidgetSnapshot.Item] = []
+    /// Tasks whose turn ended without becoming unread yet.
+    @ObservationIgnored private var finishedTurns: [String: (item: UnreadWidgetSnapshot.Item, at: ContinuousClock.Instant)] = [:]
+    @ObservationIgnored private var pendingSettle: Task<Void, Never>?
     @ObservationIgnored private var isStarted = false
 
     init(unreadTasks: DesktopUnreadTaskMonitor, settings: TokenBarSettings) {
@@ -33,15 +46,8 @@ final class UnreadWidgetPublisher {
     func start() {
         guard !self.isStarted else { return }
         self.isStarted = true
-        // The tasks read last stay listed after TokenBar restarts.
-        if self.sharesWithWidget, let saved = UnreadWidgetStore.load() {
-            self.snapshot = UnreadWidgetSnapshot(
-                isTracking: true,
-                platforms: [],
-                tasks: [],
-                running: [],
-                recent: saved.recent)
-        }
+        self.readHistory = UserDefaults.standard.data(forKey: Self.readHistoryKey)
+            .flatMap { try? JSONDecoder().decode([UnreadWidgetSnapshot.Item].self, from: $0) } ?? []
         self.observe()
         self.schedulePublish()
     }
@@ -51,6 +57,8 @@ final class UnreadWidgetPublisher {
         self.isStarted = false
         self.pendingPublish?.cancel()
         self.pendingPublish = nil
+        self.pendingSettle?.cancel()
+        self.pendingSettle = nil
         self.publish(UnreadWidgetSnapshot(
             isTracking: false,
             platforms: [],
@@ -80,24 +88,56 @@ final class UnreadWidgetPublisher {
             guard let self, !Task.isCancelled, self.isStarted else { return }
             self.pendingPublish = nil
             let next = Self.snapshot(of: self.unreadTasks, settings: self.settings)
-            self.snapshot = self.keepingRecent(from: self.snapshot, in: next)
+            self.snapshot = self.recordingReads(from: self.snapshot, in: next)
             self.publish(self.snapshot)
         }
     }
 
     /// A task that leaves the unread list without starting another turn was
-    /// read. It stays listed until it is unread or running again, or newer
-    /// reads push it out.
-    private func keepingRecent(
+    /// read, and so was a turn that ended in the window the user was looking
+    /// at, which never becomes unread. A read task is listed while it is
+    /// neither unread nor running, until newer reads push it out.
+    private func recordingReads(
         from previous: UnreadWidgetSnapshot,
         in next: UnreadWidgetSnapshot) -> UnreadWidgetSnapshot
     {
         let current = Set(next.tasks.map(\.id) + next.running.map(\.id))
         let platforms = Set(next.platforms.map(\.id))
-        let read = previous.tasks.filter { !current.contains($0.id) }
-        var seen = Set<String>()
-        let recent = (read + previous.recent)
-            .filter { !current.contains($0.id) && platforms.contains($0.platform) && seen.insert($0.id).inserted }
+        let now = ContinuousClock.now
+        for task in previous.running where !current.contains(task.id) {
+            let item = UnreadWidgetSnapshot.Item(
+                platform: task.platform,
+                taskID: task.taskID,
+                title: task.title,
+                prompt: nil,
+                reply: nil,
+                turnDuration: nil,
+                workspaceName: nil,
+                updatedAt: Date())
+            self.finishedTurns[task.id] = (item, now)
+        }
+        self.finishedTurns = self.finishedTurns.filter { id, finished in
+            !current.contains(id) && platforms.contains(finished.item.platform)
+        }
+        let settled = self.finishedTurns.values
+            .filter { now - $0.at >= Self.finishGrace }
+            .map(\.item)
+        for item in settled {
+            self.finishedTurns[item.id] = nil
+        }
+        if !self.finishedTurns.isEmpty {
+            self.scheduleSettle()
+        }
+        let read = previous.tasks.filter { !current.contains($0.id) && platforms.contains($0.platform) }
+            + settled
+        if !read.isEmpty {
+            let readIDs = Set(read.map(\.id))
+            self.readHistory = Array((read + self.readHistory.filter { !readIDs.contains($0.id) })
+                .prefix(Self.readHistoryLimit))
+            UserDefaults.standard.set(try? JSONEncoder().encode(self.readHistory), forKey: Self.readHistoryKey)
+        }
+        let recent = self.readHistory
+            .filter { !current.contains($0.id) && platforms.contains($0.platform) }
             .prefix(Self.recentLimit)
         return UnreadWidgetSnapshot(
             isTracking: next.isTracking,
@@ -105,6 +145,16 @@ final class UnreadWidgetPublisher {
             tasks: next.tasks,
             running: next.running,
             recent: Array(recent))
+    }
+
+    private func scheduleSettle() {
+        guard self.pendingSettle == nil else { return }
+        self.pendingSettle = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.finishGrace)
+            guard let self, !Task.isCancelled, self.isStarted else { return }
+            self.pendingSettle = nil
+            self.schedulePublish()
+        }
     }
 
     /// Matches the menu bar, which hides Claude's unread count with its section.

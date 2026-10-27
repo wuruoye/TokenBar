@@ -567,6 +567,10 @@ struct ClaudeUnreadTracker {
     struct Override: Codable, Equatable {
         var isUnread: Bool
         var since: Date
+        /// For a turn the transcript shows ended: the turns Claude had recorded
+        /// then. Claude records the turn and updates its store only after the
+        /// session's stop hooks run, so until then the store cannot overrule it.
+        var recordedTurns: Int?
     }
 
     /// The parts of a session record whose changes are read or unread events.
@@ -622,9 +626,17 @@ struct ClaudeUnreadTracker {
         self.hasBaseline = true
 
         let overrides = self.state.overrides.filter { id, override in
-            override.isUnread != store.contains(id)
-                && storeCommittedAt <= override.since.addingTimeInterval(Self.storeCommitMargin)
-                && now < override.since.addingTimeInterval(Self.overrideLifetime)
+            guard override.isUnread != store.contains(id),
+                  now < override.since.addingTimeInterval(Self.overrideLifetime)
+            else {
+                return false
+            }
+            if let recordedTurns = override.recordedTurns,
+               (sessions[id]?.completedTurns ?? .max) <= recordedTurns
+            {
+                return true
+            }
+            return storeCommittedAt <= override.since.addingTimeInterval(Self.storeCommitMargin)
         }
         self.state.overrides = overrides
         return store.union(overrides.keys).filter { id in
@@ -663,7 +675,10 @@ struct ClaudeUnreadTracker {
             if session.completedTurns > previous.completedTurns {
                 self.state.overrides[id] = Override(isUnread: id != shownID, since: session.modifiedAt)
             } else if finishedTurns.contains(id) {
-                self.state.overrides[id] = Override(isUnread: id != shownID, since: now)
+                self.state.overrides[id] = Override(
+                    isUnread: id != shownID,
+                    since: now,
+                    recordedTurns: session.completedTurns)
             }
         }
     }

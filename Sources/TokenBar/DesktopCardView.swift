@@ -27,13 +27,12 @@ struct DesktopCardView: View {
     let hide: () -> Void
     @State private var isHovered = false
 
-    /// The height that shows every row of `snapshot` in the list layout.
+    /// The height that shows every row of `snapshot` in the column layout.
     static func automaticHeight(for snapshot: UnreadWidgetSnapshot) -> CGFloat {
         self.padding * 2 + CardMetrics.headerHeight + CardMetrics.headerSpacing
-            + CardMetrics.listHeight(
-                unread: snapshot.tasks.count,
-                running: snapshot.running.count,
-                recent: snapshot.recent.count)
+            + max(
+                CardMetrics.listHeight(unread: 0, running: snapshot.running.count, recent: snapshot.recent.count),
+                CGFloat(snapshot.tasks.count) * CardMetrics.unreadRowHeight)
     }
 
     var body: some View {
@@ -100,19 +99,20 @@ struct DesktopCardView: View {
             self.smallContent(snapshot)
         case .medium:
             self.mediumContent(snapshot)
-        case .automatic, .large:
+        case .large:
             VStack(alignment: .leading, spacing: CardMetrics.headerSpacing) {
                 CardHeader(snapshot: snapshot, animates: self.state.isVisible)
                 self.listContent(
                     snapshot,
                     height: inner.height - CardMetrics.headerHeight - CardMetrics.headerSpacing)
             }
-        case .extraLarge:
+        case .automatic, .extraLarge:
             VStack(alignment: .leading, spacing: CardMetrics.headerSpacing) {
                 CardHeader(snapshot: snapshot, animates: self.state.isVisible)
-                self.twoColumnContent(
+                self.columnContent(
                     snapshot,
-                    height: inner.height - CardMetrics.headerHeight - CardMetrics.headerSpacing)
+                    height: inner.height - CardMetrics.headerHeight - CardMetrics.headerSpacing,
+                    showsUnread: inner.width > CardMetrics.columnWidth)
             }
         }
     }
@@ -223,22 +223,21 @@ struct DesktopCardView: View {
         }
     }
 
-    /// Unread rows on the left; running tasks, the remaining unread titles,
-    /// and the tasks read last on the right.
+    /// Running tasks, the unread titles without room for a full row, and the
+    /// tasks read last in a column a medium widget wide, then the unread rows
+    /// beside it while the card is wide enough.
     @ViewBuilder
-    private func twoColumnContent(_ snapshot: UnreadWidgetSnapshot, height: CGFloat) -> some View {
-        let unreadCount = min(snapshot.tasks.count, CardMetrics.rows(fitting: height, rowHeight: CardMetrics.unreadRowHeight))
+    private func columnContent(_ snapshot: UnreadWidgetSnapshot, height: CGFloat, showsUnread: Bool) -> some View {
+        let unreadCount = showsUnread
+            ? min(snapshot.tasks.count, CardMetrics.rows(fitting: height, rowHeight: CardMetrics.unreadRowHeight))
+            : 0
         let more = Array(snapshot.tasks.dropFirst(unreadCount))
         let fit = CardMetrics.sections([snapshot.running.count, more.count, snapshot.recent.count], height: height)
-        HStack(alignment: .top, spacing: 16) {
-            VStack(alignment: .leading, spacing: 0) {
-                if snapshot.tasks.isEmpty {
-                    CaughtUpRow()
-                }
-                self.unreadRows(Array(snapshot.tasks.prefix(unreadCount)))
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        HStack(alignment: .top, spacing: CardMetrics.columnGap) {
             VStack(alignment: .leading, spacing: CardMetrics.sectionGap) {
+                if snapshot.running.isEmpty, more.isEmpty, snapshot.recent.isEmpty {
+                    CaughtUpRow(isCaughtUp: snapshot.tasks.isEmpty)
+                }
                 if fit[0] > 0 {
                     self.runningSection(snapshot, rows: Array(snapshot.running.prefix(fit[0])))
                 }
@@ -249,7 +248,12 @@ struct DesktopCardView: View {
                     self.compactSection("Recently read", rows: Array(snapshot.recent.prefix(fit[2])), isUnread: false)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(width: CardMetrics.columnWidth, alignment: .topLeading)
+            .frame(maxHeight: .infinity, alignment: .top)
+            if showsUnread {
+                self.unreadRows(Array(snapshot.tasks.prefix(unreadCount)))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
         }
     }
 
@@ -316,6 +320,10 @@ private enum CardMetrics {
     static let sectionLabelHeight: CGFloat = 18
     static let sectionGap: CGFloat = 10
     static let caughtUpHeight: CGFloat = 28
+    /// A medium widget's width inside the card's padding, so the column keeps
+    /// its width when the card widens beside it.
+    static let columnWidth: CGFloat = 316
+    static let columnGap: CGFloat = 28
 
     static func rows(fitting height: CGFloat, rowHeight: CGFloat) -> Int {
         max(0, Int(height / rowHeight))
@@ -387,11 +395,14 @@ private struct SectionLabel: View {
 }
 
 private struct CaughtUpRow: View {
+    /// False when tasks are unread but none runs.
+    var isCaughtUp = true
+
     var body: some View {
         HStack(spacing: CardGrid.spacing) {
-            Image(systemName: "checkmark.circle")
+            Image(systemName: self.isCaughtUp ? "checkmark.circle" : "pause.circle")
                 .frame(width: CardGrid.iconColumn)
-            Text("All caught up")
+            Text(self.isCaughtUp ? "All caught up" : "Nothing running")
         }
         .font(.system(size: 12, weight: .medium))
         .foregroundStyle(.secondary)
