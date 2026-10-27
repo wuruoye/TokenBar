@@ -8,6 +8,14 @@ struct DesktopUnreadTurn: Equatable, Sendable {
     var duration: TimeInterval?
 }
 
+/// Where the latest turn of a Claude session stands.
+enum ClaudeTurnState: Equatable, Sendable {
+    case running
+    /// The turn is paused on a question or a plan the user has to answer.
+    case waitingForUser
+    case ended
+}
+
 /// Reads the last turn of a Codex or Claude task from the end of its transcript.
 /// Unread tasks have finished, so each transcript is read once per size and
 /// modification date. Confined to the unread watcher's queue.
@@ -28,6 +36,8 @@ final class DesktopUnreadTurnReader {
     private static let maximumScannedBytes: UInt64 = 32 << 20
     private static let chunkSize: UInt64 = 256 << 10
     private static let maximumTextLength = 280
+    /// Claude tools that pause the turn until the user answers.
+    private static let claudeUserInputTools: Set<String> = ["AskUserQuestion", "ExitPlanMode"]
 
     private var cache: [String: CachedTurn] = [:]
     private var claudeTranscripts: [String: URL] = [:]
@@ -95,8 +105,8 @@ final class DesktopUnreadTurnReader {
                 let text = (message["content"] as? String) ?? Self.textBlocks(message["content"])
                 return Self.claudeHumanText(text).map { .prompt($0, at: at) }
             case "assistant":
-                return Self.replySummary(Self.textBlocks(message["content"]))
-                    .map { .reply($0, at: at, duration: nil) }
+                let text = Self.textBlocks(message["content"]) ?? Self.claudeUserInput(message["content"])
+                return Self.replySummary(text).map { .reply($0, at: at, duration: nil) }
             default:
                 return nil
             }
@@ -105,10 +115,11 @@ final class DesktopUnreadTurnReader {
 
     /// A finished Claude turn ends with an assistant message that stopped for a
     /// reason other than a tool call, or with the result of a tool that ends
-    /// the turn. Other tool results, prompts, and a reply still streaming
-    /// belong to a turn in progress.
-    func claudeTurnIsRunning(transcript: URL) -> Bool {
-        var isRunning = false
+    /// the turn. A call to a tool that asks the user waits for the answer.
+    /// Other tool results, prompts, and a reply still streaming belong to a
+    /// turn in progress.
+    func claudeTurnState(transcript: URL) -> ClaudeTurnState {
+        var state = ClaudeTurnState.ended
         Self.scanBackward(in: transcript, markers: ["\"type\":\"user\"", "\"type\":\"assistant\""].map { Data($0.utf8) }) { line in
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   object["isSidechain"] as? Bool != true,
@@ -119,29 +130,35 @@ final class DesktopUnreadTurnReader {
             }
             switch object["type"] as? String {
             case "assistant":
-                let stopReason = message["stop_reason"] as? String
-                isRunning = stopReason == nil || stopReason == "tool_use"
+                switch message["stop_reason"] as? String {
+                case nil:
+                    state = .running
+                case "tool_use":
+                    state = Self.claudeUserInput(message["content"]) == nil ? .running : .waitingForUser
+                default:
+                    state = .ended
+                }
                 return true
             case "user":
                 // A tool can end the turn with its result, without another reply.
                 let meta = (object["mcpMeta"] as? [String: Any])?["_meta"] as? [String: Any]
                 if meta?["claude/endTurn"] as? Bool == true {
-                    isRunning = false
+                    state = .ended
                     return true
                 }
                 // Interruptions and local slash commands end or bypass a turn.
                 if let text = (message["content"] as? String) ?? Self.textBlocks(message["content"]) {
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    isRunning = !trimmed.hasPrefix("[Request interrupted") && !trimmed.hasPrefix("<")
+                    state = trimmed.hasPrefix("[Request interrupted") || trimmed.hasPrefix("<") ? .ended : .running
                 } else {
-                    isRunning = true
+                    state = .running
                 }
                 return true
             default:
                 return false
             }
         }
-        return isRunning
+        return state
     }
 
     /// Collapses whitespace so text fits the few lines a widget row has.
@@ -168,6 +185,23 @@ final class DesktopUnreadTurnReader {
         let texts = blocks
             .filter { ($0["type"] as? String)?.lowercased() == "text" }
             .compactMap { $0["text"] as? String }
+        return texts.isEmpty ? nil : texts.joined(separator: "\n")
+    }
+
+    /// The questions or plan in a call to a Claude tool that asks the user.
+    private static func claudeUserInput(_ content: Any?) -> String? {
+        guard let blocks = content as? [[String: Any]] else { return nil }
+        let texts = blocks.compactMap { block -> String? in
+            guard block["type"] as? String == "tool_use",
+                  let name = block["name"] as? String,
+                  self.claudeUserInputTools.contains(name)
+            else {
+                return nil
+            }
+            let input = block["input"] as? [String: Any]
+            let questions = (input?["questions"] as? [[String: Any]] ?? []).compactMap { $0["question"] as? String }
+            return questions.isEmpty ? input?["plan"] as? String ?? name : questions.joined(separator: "\n")
+        }
         return texts.isEmpty ? nil : texts.joined(separator: "\n")
     }
 

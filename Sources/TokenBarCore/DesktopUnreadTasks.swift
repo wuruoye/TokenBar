@@ -595,6 +595,10 @@ struct ClaudeUnreadTracker {
     private(set) var sessions: [String: ClaudeSessionSnapshot] = [:]
     private(set) var state: State
     private var hasBaseline: Bool
+    /// Sessions whose turn waits for the user. Claude neither records such a
+    /// turn nor marks the session unread, so a guess about one holds while it
+    /// waits.
+    private var waiting: Set<String> = []
 
     init(restoring state: State? = nil) {
         self.state = state ?? State()
@@ -602,35 +606,45 @@ struct ClaudeUnreadTracker {
     }
 
     var nextExpiry: Date? {
-        self.state.overrides.values.map { $0.since.addingTimeInterval(Self.overrideLifetime) }.min()
+        self.state.overrides
+            .filter { !self.waiting.contains($0.key) }
+            .values.map { $0.since.addingTimeInterval(Self.overrideLifetime) }.min()
     }
 
     /// Returns the IDs of the sessions the sidebar shows as unread.
     /// `finishedTurns` are sessions whose transcript just finished a turn,
-    /// which Claude records only after the session's stop hooks run.
+    /// which Claude records only after the session's stop hooks run, or paused
+    /// it to wait for the user, which `waiting` lists.
     mutating func update(
         store: Set<String>,
         storeCommittedAt: Date,
         sessions: [String: ClaudeSessionSnapshot],
         finishedTurns: Set<String> = [],
+        waiting: Set<String> = [],
         shownSession: () -> ClaudeShownSession,
         now: Date) -> Set<String>
     {
         if self.hasBaseline {
-            self.recordEvents(in: sessions, finishedTurns: finishedTurns, shownSession: shownSession, now: now)
+            // A session first found waiting, as at launch, just paused its turn.
+            self.recordEvents(
+                in: sessions,
+                finishedTurns: finishedTurns.union(waiting.subtracting(self.waiting)),
+                shownSession: shownSession,
+                now: now)
         }
         self.sessions = sessions
         self.state.progress = sessions.mapValues {
             Progress(completedTurns: $0.completedTurns, lastFocusedAt: $0.lastFocusedAt)
         }
         self.hasBaseline = true
+        self.waiting = waiting
 
         let overrides = self.state.overrides.filter { id, override in
-            guard override.isUnread != store.contains(id),
-                  now < override.since.addingTimeInterval(Self.overrideLifetime)
-            else {
-                return false
+            guard override.isUnread != store.contains(id) else { return false }
+            if waiting.contains(id) {
+                return true
             }
+            guard now < override.since.addingTimeInterval(Self.overrideLifetime) else { return false }
             if let recordedTurns = override.recordedTurns,
                (sessions[id]?.completedTurns ?? .max) <= recordedTurns
             {
@@ -710,6 +724,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var claudeRereadScheduled = false
     private var codexRunningIDs: Set<String> = []
     private var claudeRunningIDs: Set<String> = []
+    private var claudeWaitingIDs: Set<String> = []
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
     }
@@ -911,16 +926,18 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     private func recountClaude(sessions: [String: ClaudeSessionSnapshot]) {
         let now = Date()
-        let (running, transcripts) = self.claudeRunningTasks(sessions, now: now)
+        let (running, waiting, transcripts) = self.claudeRunningTasks(sessions, now: now)
         let ids = self.claudeTracker.update(
             store: self.reader.claudeUnreadStore(),
             storeCommittedAt: self.reader.claudeStoreCommittedAt(),
             sessions: sessions,
             finishedTurns: self.claudeFinishedTurns(running: running, transcripts: transcripts),
+            waiting: waiting,
             shownSession: self.reader.claudeShownSession,
             now: now)
         self.claudeTranscripts.watch(Set(transcripts.values.map(\.path)))
         self.claudeRunningIDs = Set(running.map(\.id))
+        self.claudeWaitingIDs = waiting
         self.publish(.claude, self.claudeTasks(ids, sessions: sessions))
         self.publishRunning(.claude, running)
         self.saveClaudeTracker()
@@ -929,12 +946,14 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     /// Transcripts change throughout a turn, so they are read against the
     /// session records already loaded, and the unread state is recounted only
-    /// when a turn ends.
+    /// when a turn ends or starts or stops waiting for the user.
     private func recountClaudeRunning() {
         guard !self.isStopped else { return }
         let sessions = self.claudeTracker.sessions
-        let (running, transcripts) = self.claudeRunningTasks(sessions, now: Date())
-        guard self.claudeFinishedTurns(running: running, transcripts: transcripts).isEmpty else {
+        let (running, waiting, transcripts) = self.claudeRunningTasks(sessions, now: Date())
+        guard self.claudeFinishedTurns(running: running, transcripts: transcripts).isEmpty,
+              waiting == self.claudeWaitingIDs
+        else {
             self.recountClaude(sessions: sessions)
             return
         }
@@ -942,8 +961,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.publishRunning(.claude, running)
     }
 
-    /// Sessions that were running and whose transcript now ends their turn,
-    /// unlike one that went quiet or was archived.
+    /// Sessions that were running and whose transcript now ends their turn or
+    /// waits for the user, unlike one that went quiet or was archived.
     private func claudeFinishedTurns(
         running: [DesktopRunningTask],
         transcripts: [String: URL]) -> Set<String>
@@ -965,12 +984,14 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// Claude Desktop records only when a session last started or finished a
     /// turn, so its transcript tells which one it was. A turn longer than the
     /// candidate window is still caught while its transcript keeps growing.
-    /// Also returns the transcripts of recently active sessions, which a turn
+    /// Also returns the sessions whose turn waits for the user, however long
+    /// it waits, and the transcripts of recently active sessions, which a turn
     /// that starts or ends there writes to.
     private func claudeRunningTasks(
         _ sessions: [String: ClaudeSessionSnapshot],
-        now: Date) -> (tasks: [DesktopRunningTask], transcripts: [String: URL])
+        now: Date) -> (tasks: [DesktopRunningTask], waiting: Set<String>, transcripts: [String: URL])
     {
+        var waiting = Set<String>()
         var transcripts: [String: URL] = [:]
         let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
             guard !session.isArchived,
@@ -987,11 +1008,20 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                   let activeAt = (try? FileManager.default.attributesOfItem(
                       atPath: transcript.path))?[.modificationDate] as? Date,
                   now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit
+                      || self.claudeWaitingIDs.contains(id)
             else {
                 return nil
             }
             transcripts[id] = transcript
-            guard self.turns.claudeTurnIsRunning(transcript: transcript) else { return nil }
+            switch self.turns.claudeTurnState(transcript: transcript) {
+            case .running:
+                break
+            case .waitingForUser:
+                waiting.insert(id)
+                return nil
+            case .ended:
+                return nil
+            }
             return DesktopRunningTask(
                 platform: .claude,
                 id: id,
@@ -1000,7 +1030,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }.sorted {
             ($0.startedAt ?? .distantPast, $0.id) > ($1.startedAt ?? .distantPast, $1.id)
         }
-        return (tasks, transcripts)
+        return (tasks, waiting, transcripts)
     }
 
     private func claudeTasks(
