@@ -860,8 +860,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                           workspacePath: session.workspacePath,
                           projectsDirectory: self.reader.claudeProjectsDirectory)
                   }),
-                  let activeAt = try? transcript.resourceValues(
-                      forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  // The transcript URL is cached, and a URL caches its resource
+                  // values, so the modification date comes from the file system.
+                  let activeAt = (try? FileManager.default.attributesOfItem(
+                      atPath: transcript.path))?[.modificationDate] as? Date,
                   now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit,
                   self.turns.claudeTurnIsRunning(transcript: transcript)
             else {
