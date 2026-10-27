@@ -55,6 +55,7 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private var watcher: DesktopUnreadTaskWatcher?
 
     @ObservationIgnored private let claudeTrackerStateURL: URL?
+    @ObservationIgnored private var isClaudeActive = true
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -80,6 +81,16 @@ public final class DesktopUnreadTaskMonitor {
         self.tasks[platform]?.count ?? 0
     }
 
+    public nonisolated static let claudeBundleIdentifier = "com.anthropic.claudefordesktop"
+
+    /// Claude counts a turn that ends in the session its window shows as read,
+    /// even while another app is in front, so TokenBar keeps such a turn unread
+    /// until Claude comes to the front on it.
+    public func setClaudeIsActive(_ isActive: Bool) {
+        self.isClaudeActive = isActive
+        self.watcher?.setClaudeActive(isActive)
+    }
+
     public func start() {
         guard self.watcher == nil else { return }
         let watcher = DesktopUnreadTaskWatcher(
@@ -96,6 +107,7 @@ public final class DesktopUnreadTaskMonitor {
                 }
             })
         self.watcher = watcher
+        watcher.setClaudeActive(self.isClaudeActive)
         watcher.start()
     }
 
@@ -598,6 +610,10 @@ struct ClaudeUnreadTracker {
         /// then. Claude records the turn and updates its store only after the
         /// session's stop hooks run, so until then the store cannot overrule it.
         var recordedTurns: Int?
+        /// The turn ended in the session Claude's window showed while another
+        /// app was in front. Claude counts that as read, so the session stays
+        /// unread until Claude comes to the front on it or the user opens it.
+        var untilSeen: Bool?
     }
 
     /// The parts of a session record whose changes are read or unread events.
@@ -634,20 +650,22 @@ struct ClaudeUnreadTracker {
 
     var nextExpiry: Date? {
         self.state.overrides
-            .filter { !self.waiting.contains($0.key) }
+            .filter { !self.waiting.contains($0.key) && $0.value.untilSeen != true }
             .values.map { $0.since.addingTimeInterval(Self.overrideLifetime) }.min()
     }
 
     /// Returns the IDs of the sessions the sidebar shows as unread.
     /// `finishedTurns` are sessions whose transcript just finished a turn,
     /// which Claude records only after the session's stop hooks run, or paused
-    /// it to wait for the user, which `waiting` lists.
+    /// it to wait for the user, which `waiting` lists. `isClaudeActive` tells
+    /// whether Claude is the app in front.
     mutating func update(
         store: Set<String>,
         storeCommittedAt: Date,
         sessions: [String: ClaudeSessionSnapshot],
         finishedTurns: Set<String> = [],
         waiting: Set<String> = [],
+        isClaudeActive: Bool = true,
         shownSession: () -> ClaudeShownSession,
         now: Date) -> Set<String>
     {
@@ -656,8 +674,16 @@ struct ClaudeUnreadTracker {
             self.recordEvents(
                 in: sessions,
                 finishedTurns: finishedTurns.union(waiting.subtracting(self.waiting)),
+                isClaudeActive: isClaudeActive,
                 shownSession: shownSession,
                 now: now)
+        }
+        if isClaudeActive,
+           self.state.overrides.values.contains(where: { $0.untilSeen == true }),
+           case let .session(id) = shownSession(),
+           self.state.overrides[id]?.untilSeen == true
+        {
+            self.state.overrides[id] = Override(isUnread: false, since: now)
         }
         self.sessions = sessions
         self.state.progress = sessions.mapValues {
@@ -667,6 +693,9 @@ struct ClaudeUnreadTracker {
         self.waiting = waiting
 
         let overrides = self.state.overrides.filter { id, override in
+            if override.untilSeen == true {
+                return sessions[id] != nil
+            }
             guard override.isUnread != store.contains(id) else { return false }
             if waiting.contains(id) {
                 return true
@@ -689,6 +718,7 @@ struct ClaudeUnreadTracker {
     private mutating func recordEvents(
         in sessions: [String: ClaudeSessionSnapshot],
         finishedTurns: Set<String>,
+        isClaudeActive: Bool,
         shownSession: () -> ClaudeShownSession,
         now: Date)
     {
@@ -713,13 +743,18 @@ struct ClaudeUnreadTracker {
                     isUnread: false,
                     since: Date(timeIntervalSince1970: TimeInterval(session.lastFocusedAt) / 1000))
             }
+            let isUnseen = id == shownID && !isClaudeActive
             if session.completedTurns > previous.completedTurns {
-                self.state.overrides[id] = Override(isUnread: id != shownID, since: session.modifiedAt)
+                self.state.overrides[id] = Override(
+                    isUnread: id != shownID || isUnseen,
+                    since: session.modifiedAt,
+                    untilSeen: isUnseen ? true : nil)
             } else if finishedTurns.contains(id) {
                 self.state.overrides[id] = Override(
-                    isUnread: id != shownID,
+                    isUnread: id != shownID || isUnseen,
                     since: now,
-                    recordedTurns: session.completedTurns)
+                    recordedTurns: session.completedTurns,
+                    untilSeen: isUnseen ? true : nil)
             }
         }
     }
@@ -755,6 +790,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var claudeRunningIDs: Set<String> = []
     private var claudeWaitingIDs: Set<String> = []
     private var claudeBackgroundIDs: Set<String> = []
+    private var isClaudeActive = true
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
     }
@@ -802,6 +838,17 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     func refresh() {
         self.queue.async {
             self.recount(DesktopUnreadTaskReader.platforms)
+        }
+    }
+
+    /// Claude coming to the front shows the user the session in its window.
+    func setClaudeActive(_ isActive: Bool) {
+        self.queue.async {
+            guard isActive != self.isClaudeActive else { return }
+            self.isClaudeActive = isActive
+            if isActive, !self.isStopped {
+                self.recount([.claude])
+            }
         }
     }
 
@@ -963,6 +1010,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             sessions: sessions,
             finishedTurns: self.claudeFinishedTurns(running: running, transcripts: transcripts),
             waiting: waiting,
+            isClaudeActive: self.isClaudeActive,
             shownSession: self.reader.claudeShownSession,
             now: now)
         self.claudeTranscripts.watch(Set(transcripts.values.map(\.path)))

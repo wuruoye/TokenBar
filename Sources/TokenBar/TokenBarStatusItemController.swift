@@ -83,6 +83,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private var startupTask: Task<Void, Never>?
     private var shortcutMonitor: MenuTrackingShortcutMonitor?
     private var syncSettingsSignature: SyncSettingsSignature
+    private var claudeActivationObserver: (any NSObjectProtocol)?
     private var monitorsCodexMemory: Bool
 
     init(
@@ -132,6 +133,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     func start() {
+        self.observeClaudeActivation()
         self.unreadTasks.start()
         self.unreadWidget.start()
         let desktopCard = DesktopCardController(
@@ -158,7 +160,30 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
     }
 
+    /// The unread tracker hears whether Claude is the app in front.
+    private func observeClaudeActivation() {
+        self.updateClaudeActivation()
+        self.claudeActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main)
+        { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateClaudeActivation()
+            }
+        }
+    }
+
+    private func updateClaudeActivation() {
+        self.unreadTasks.setClaudeIsActive(
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == DesktopUnreadTaskMonitor.claudeBundleIdentifier)
+    }
+
     func tearDown() {
+        if let observer = self.claudeActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            self.claudeActivationObserver = nil
+        }
         self.desktopCard?.stop()
         self.desktopCard = nil
         self.unreadWidget.stop()
