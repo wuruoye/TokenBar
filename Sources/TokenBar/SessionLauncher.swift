@@ -79,6 +79,51 @@ struct SessionLauncher {
         }
     }
 
+    /// Unread tasks already carry the ID each app's own deep link takes.
+    func openUnreadTask(platform: TokenPlatform, id: String) throws {
+        let url = try Self.deepLink(platform: platform, id: id)
+        guard self.openURL(url) else {
+            throw SessionLauncherError.applicationUnavailable(platform)
+        }
+    }
+
+    /// Builds the link that shows a Codex thread or Claude Desktop session in
+    /// its app.
+    static func deepLink(platform: TokenPlatform, id: String) throws -> URL {
+        var components = URLComponents()
+        switch platform {
+        case .codex:
+            guard let threadID = self.codexThreadID(from: id) else {
+                throw SessionLauncherError.invalidSessionID
+            }
+            components.scheme = "codex"
+            components.host = "threads"
+            components.path = "/\(threadID)"
+        case .claude:
+            guard Self.isSafePathIdentifier(id) else {
+                throw SessionLauncherError.invalidSessionID
+            }
+            components.scheme = "claude"
+            // `code/continue` switches to a local session inside the running
+            // app, as its notification does. `claude-code-desktop/<id>`
+            // reloads the whole window first.
+            if Self.isClaudeLocalSessionID(id) {
+                components.host = "code"
+                components.path = "/continue"
+                components.queryItems = [URLQueryItem(name: "session", value: id)]
+            } else {
+                components.host = "claude.ai"
+                components.path = "/claude-code-desktop/\(id)"
+            }
+        default:
+            throw SessionLauncherError.unsupportedPlatform(platform)
+        }
+        guard let url = components.url else {
+            throw SessionLauncherError.invalidSessionID
+        }
+        return url
+    }
+
     static func deepLink(
         for session: SessionSummary,
         claudeDesktopSessionID: String? = nil) throws -> URL
@@ -90,36 +135,26 @@ struct SessionLauncher {
             throw SessionLauncherError.invalidSessionID
         }
 
-        var components = URLComponents()
         switch session.platformID {
         case .codex:
-            guard let threadID = self.codexThreadID(from: sessionID) else {
-                throw SessionLauncherError.invalidSessionID
-            }
-            components.scheme = "codex"
-            components.host = "threads"
-            components.path = "/\(threadID)"
+            return try self.deepLink(platform: .codex, id: sessionID)
         case .claude:
-            components.scheme = "claude"
-            components.host = "claude.ai"
             if let desktopSessionID = claudeDesktopSessionID?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             {
-                guard Self.isSafePathIdentifier(desktopSessionID) else {
-                    throw SessionLauncherError.invalidSessionID
-                }
-                components.path = "/claude-code-desktop/\(desktopSessionID)"
-            } else {
-                components.path = "/local_sessions"
+                return try self.deepLink(platform: .claude, id: desktopSessionID)
             }
+            var components = URLComponents()
+            components.scheme = "claude"
+            components.host = "claude.ai"
+            components.path = "/local_sessions"
+            guard let url = components.url else {
+                throw SessionLauncherError.invalidSessionID
+            }
+            return url
         default:
             throw SessionLauncherError.unsupportedPlatform(session.platformID)
         }
-
-        guard let url = components.url else {
-            throw SessionLauncherError.invalidSessionID
-        }
-        return url
     }
 
     private static func codexThreadID(from sessionID: String) -> String? {
@@ -129,6 +164,17 @@ struct SessionLauncher {
         guard sessionID.count >= 36 else { return nil }
         let suffix = String(sessionID.suffix(36))
         return UUID(uuidString: suffix) == nil ? nil : suffix
+    }
+
+    /// Claude Desktop's `code/continue` link accepts `local_` followed by up to
+    /// 64 letters, digits, and hyphens.
+    private static func isClaudeLocalSessionID(_ value: String) -> Bool {
+        guard value.hasPrefix("local_") else { return false }
+        let suffix = value.dropFirst("local_".count)
+        return (1...64).contains(suffix.count)
+            && suffix.unicodeScalars.allSatisfy {
+                ($0.isASCII && CharacterSet.alphanumerics.contains($0)) || $0 == "-"
+            }
     }
 
     private static func isSafePathIdentifier(_ value: String) -> Bool {

@@ -1,10 +1,13 @@
 import AppKit
 import TokenBarCore
+import TokenBarWidgetData
 
 @MainActor
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let memoryTelemetryController = MemoryTelemetryController()
-    let activitySyncController = ActivitySyncController(settings: .shared)
+    let activitySyncController = ActivitySyncController(
+        settings: .shared,
+        credentials: TokenBarAppDelegate.activitySyncCredentials())
     private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private let openRouterPricingCatalog = OpenRouterPricingCatalogUpdater()
@@ -57,6 +60,21 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     private var statusController: TokenBarStatusItemController?
     private var settingsWindowController: SettingsWindowController?
     private var previewTask: Task<Void, Never>?
+    private var pendingUnreadTaskLinks: [URL] = []
+
+    /// Debug previews and demo runs are unsigned builds, so reading the real
+    /// Keychain item would ask the user for their password.
+    private static func activitySyncCredentials() -> any ActivitySyncCredentialStoring {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if environment["TOKENBAR_DEMO_MODE"] == "1"
+            || environment.keys.contains(where: { $0.hasPrefix("TOKENBAR_RENDER_") })
+        {
+            return DemoActivitySyncCredentialStore()
+        }
+        #endif
+        return KeychainActivitySyncCredentialStore()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
@@ -107,6 +125,11 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             NSApplication.shared.terminate(nil)
             return
         }
+        if let previewPath = environment["TOKENBAR_RENDER_DESKTOP_CARD_PREVIEW"] {
+            try? DemoPreviewRenderer.renderDesktopCard(path: previewPath)
+            NSApplication.shared.terminate(nil)
+            return
+        }
         if let previewPath = environment["TOKENBAR_RENDER_STATUS_PREVIEW"] {
             try? DemoPreviewRenderer.renderStatus(path: previewPath)
             NSApplication.shared.terminate(nil)
@@ -134,10 +157,27 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
             },
             requestDetailService: requestDetailService)
         self.statusController = controller
+        self.application(NSApplication.shared, open: self.pendingUnreadTaskLinks)
+        self.pendingUnreadTaskLinks = []
         self.model.quotaResetHandler = { [weak self] event in
             self?.handleQuotaReset(event)
         }
         controller.start()
+    }
+
+    /// The widget opens a clicked task through a `tokenbar://` link, which also
+    /// launches TokenBar first when it is not running.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let statusController = self.statusController else {
+            self.pendingUnreadTaskLinks += urls
+            return
+        }
+        for url in urls {
+            guard let link = UnreadTaskLink.parse(url) else { continue }
+            statusController.openUnreadTask(
+                platform: TokenPlatform(rawValue: link.platform),
+                id: link.taskID)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -176,10 +216,6 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         let platform = self.statusController == nil ? TokenPlatform.codex : self.model.scope.platform
         let origin = self.statusController?.celebrationOriginPoint(for: platform)
         self.confettiOverlayController.play(originInScreen: origin)
-    }
-
-    func refreshActivity() async {
-        await self.model.refreshActivity()
     }
 
     private func handleQuotaReset(_ event: QuotaResetEvent) {

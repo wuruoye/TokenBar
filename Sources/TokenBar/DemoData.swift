@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import SwiftUI
 import TokenBarCore
+import TokenBarWidgetData
 
 struct DemoQuotaProvider: QuotaProviding {
     let platform = TokenPlatform.codex
@@ -922,6 +923,84 @@ enum DemoPreviewRenderer {
         try self.render(view: canvas, scale: 2, path: path)
     }
 
+    static func renderDesktopCard(path: String) throws {
+        let state = DesktopCardState()
+        let now = Date()
+        state.snapshot = UnreadWidgetSnapshot(
+            isTracking: true,
+            platforms: [
+                .init(id: "codex", name: "Codex", unreadCount: 2),
+                .init(id: "claude", name: "Claude", unreadCount: 1),
+            ],
+            tasks: [
+                .init(
+                    platform: "claude",
+                    taskID: "demo-claude",
+                    title: "Add a desktop widget",
+                    prompt: "Show unread tasks on the desktop with a short summary of each reply.",
+                    reply: "The widget now lists each unread task with its title, your last prompt, and the opening of the reply.",
+                    turnDuration: 252,
+                    workspaceName: "TokenBar",
+                    updatedAt: now.addingTimeInterval(-300)),
+                .init(
+                    platform: "codex",
+                    taskID: "demo-codex-1",
+                    title: "Fix weekly pace rounding",
+                    prompt: "The pace marker is off by one day after the weekly reset.",
+                    reply: "Fixed: the pace now counts days from the reset time instead of midnight.",
+                    turnDuration: 48,
+                    workspaceName: "TokenBar",
+                    updatedAt: now.addingTimeInterval(-1_800)),
+                .init(
+                    platform: "codex",
+                    taskID: "demo-codex-2",
+                    title: "Review sync server logs",
+                    prompt: "Check why the Linux client stopped uploading yesterday.",
+                    reply: "Its token expired at 18:02; uploads resume after you sign in again.",
+                    turnDuration: 4_380,
+                    workspaceName: "Sync",
+                    updatedAt: now.addingTimeInterval(-7_200)),
+            ],
+            running: [
+                .init(
+                    platform: "codex",
+                    taskID: "demo-codex-running",
+                    title: "Profile the activity helper",
+                    startedAt: now.addingTimeInterval(-95)),
+                .init(
+                    platform: "claude",
+                    taskID: "demo-claude-running",
+                    title: "Migrate the daily loads",
+                    startedAt: now.addingTimeInterval(-640)),
+            ])
+        // `TOKENBAR_DEMO_CARD_CAUGHT_UP=1` previews the card with nothing unread.
+        if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_CARD_CAUGHT_UP"] == "1" {
+            state.snapshot = UnreadWidgetSnapshot(
+                isTracking: true,
+                platforms: state.snapshot.platforms.map { .init(id: $0.id, name: $0.name, unreadCount: 0) },
+                tasks: [],
+                running: state.snapshot.running)
+        }
+        let content = DesktopCardView(
+            state: state,
+            open: { _, _ in },
+            drag: { _ in },
+            resize: { _ in },
+            resetSize: {},
+            hide: {})
+            .background(LinearGradient(
+                colors: [Color(red: 0.36, green: 0.42, blue: 0.58), Color(red: 0.62, green: 0.48, blue: 0.40)],
+                startPoint: .top,
+                endPoint: .bottom))
+        let host = NSHostingView(rootView: content)
+        // `TOKENBAR_DEMO_DARK=1` previews the card in dark mode.
+        if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_DARK"] == "1" {
+            host.appearance = NSAppearance(named: .darkAqua)
+        }
+        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        try self.render(view: host, scale: 2, path: path)
+    }
+
     static func renderStatus(path: String) throws {
         let statusImage = StatusLabelRenderer.layout(
             codexToday: "359M",
@@ -997,7 +1076,7 @@ private final class DemoRowPreviewCanvas: NSView {
     }
 }
 
-private struct DemoActivitySyncCredentialStore: ActivitySyncCredentialStoring {
+struct DemoActivitySyncCredentialStore: ActivitySyncCredentialStoring {
     func loadToken() throws -> String? { "demo-token" }
     func saveToken(_: String?) throws {}
 }

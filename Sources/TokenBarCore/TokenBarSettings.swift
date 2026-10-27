@@ -105,6 +105,7 @@ public final class TokenBarSettings {
     public static let defaultShowsAntigravity = true
     public static let defaultUsesWeekdayWeeklyPacing = false
     public static let defaultShowsFullRequestContentOnHover = true
+    public static let defaultShowsDesktopCard = false
     public static let defaultMonitorsCodexMemory = true
     public static let defaultResetCelebration = TokenBarResetCelebration.off
     public static let defaultSyncEnabled = false
@@ -163,6 +164,14 @@ public final class TokenBarSettings {
             self.defaults.set(
                 self.usesWeekdayWeeklyPacing,
                 forKey: self.keys.usesWeekdayWeeklyPacing)
+        }
+    }
+
+    public var showsDesktopCard: Bool {
+        didSet {
+            self.defaults.set(
+                self.showsDesktopCard,
+                forKey: self.keys.showsDesktopCard)
         }
     }
 
@@ -239,6 +248,9 @@ public final class TokenBarSettings {
         self.showsFullRequestContentOnHover = defaults.object(
             forKey: self.keys.showsFullRequestContentOnHover) as? Bool
             ?? Self.defaultShowsFullRequestContentOnHover
+        self.showsDesktopCard = defaults.object(
+            forKey: self.keys.showsDesktopCard) as? Bool
+            ?? Self.defaultShowsDesktopCard
         self.monitorsCodexMemory = defaults.object(
             forKey: self.keys.monitorsCodexMemory) as? Bool
             ?? Self.defaultMonitorsCodexMemory
@@ -266,6 +278,7 @@ public final class TokenBarSettings {
         self.showsAntigravity = Self.defaultShowsAntigravity
         self.usesWeekdayWeeklyPacing = Self.defaultUsesWeekdayWeeklyPacing
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
+        self.showsDesktopCard = Self.defaultShowsDesktopCard
         self.monitorsCodexMemory = Self.defaultMonitorsCodexMemory
         self.resetCelebration = Self.defaultResetCelebration
         self.syncEnabled = Self.defaultSyncEnabled
@@ -283,6 +296,7 @@ public final class TokenBarSettings {
         let showsAntigravity: String
         let usesWeekdayWeeklyPacing: String
         let showsFullRequestContentOnHover: String
+        let showsDesktopCard: String
         let monitorsCodexMemory: String
         let resetCelebration: String
         let syncEnabled: String
@@ -300,6 +314,7 @@ public final class TokenBarSettings {
             self.showsAntigravity = "\(prefix).showsAntigravity"
             self.usesWeekdayWeeklyPacing = "\(prefix).usesWeekdayWeeklyPacing"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
+            self.showsDesktopCard = "\(prefix).showsDesktopCard"
             self.monitorsCodexMemory = "\(prefix).monitorsCodexMemory"
             self.resetCelebration = "\(prefix).resetCelebration"
             self.syncEnabled = "\(prefix).syncEnabled"
