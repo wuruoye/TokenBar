@@ -1105,21 +1105,55 @@ enum DemoPreviewRenderer {
                     taskID: "demo-claude-running",
                     title: "Migrate the daily loads",
                     startedAt: now.addingTimeInterval(-640)),
+            ],
+            recent: [
+                .init(
+                    platform: "codex",
+                    taskID: "demo-codex-read",
+                    title: "Bump the helper's Rust edition",
+                    prompt: nil,
+                    reply: nil,
+                    turnDuration: nil,
+                    workspaceName: "TokenBar",
+                    updatedAt: now.addingTimeInterval(-2_700)),
+                .init(
+                    platform: "claude",
+                    taskID: "demo-claude-read",
+                    title: "Draft the release notes",
+                    prompt: nil,
+                    reply: nil,
+                    turnDuration: nil,
+                    workspaceName: "TokenBar",
+                    updatedAt: now.addingTimeInterval(-5_400)),
             ])
+        // `TOKENBAR_DEMO_CARD_SIZE` picks automatic, small, medium, large, or extraLarge.
+        if let size = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_CARD_SIZE"]
+            .flatMap(DesktopCardSize.init(rawValue:))
+        {
+            state.size = size
+        }
         // `TOKENBAR_DEMO_CARD_CAUGHT_UP=1` previews the card with nothing unread.
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_CARD_CAUGHT_UP"] == "1" {
             state.snapshot = UnreadWidgetSnapshot(
                 isTracking: true,
                 platforms: state.snapshot.platforms.map { .init(id: $0.id, name: $0.name, unreadCount: 0) },
                 tasks: [],
-                running: state.snapshot.running)
+                running: state.snapshot.running,
+                recent: state.snapshot.recent)
+        }
+        // `automatic` takes the shortest grid height that shows every row.
+        state.points = state.size.points
+        if state.size == .automatic {
+            while state.points.height < DesktopCardView.automaticHeight(for: state.snapshot) {
+                state.points.height += 180
+            }
         }
         let content = DesktopCardView(
             state: state,
             open: { _, _ in },
             drag: { _ in },
             resize: { _ in },
-            resetSize: {},
+            setSize: { _ in },
             hide: {})
             .background(LinearGradient(
                 colors: [Color(red: 0.36, green: 0.42, blue: 0.58), Color(red: 0.62, green: 0.48, blue: 0.40)],
@@ -1130,7 +1164,11 @@ enum DemoPreviewRenderer {
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_DARK"] == "1" {
             host.appearance = NSAppearance(named: .darkAqua)
         }
-        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        host.frame = NSRect(
+            origin: .zero,
+            size: CGSize(
+                width: state.points.width + DesktopCardView.glowRoom * 2,
+                height: state.points.height + DesktopCardView.glowRoom * 2))
         try self.render(view: host, scale: 2, path: path)
     }
 

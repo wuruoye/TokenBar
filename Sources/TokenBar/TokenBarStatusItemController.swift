@@ -135,7 +135,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.unreadTasks.start()
         self.unreadWidget.start()
         let desktopCard = DesktopCardController(
-            unreadTasks: self.unreadTasks,
+            publisher: self.unreadWidget,
             settings: self.settings,
             openTask: { [weak self] platform, id in
                 self?.openUnreadTask(platform: platform, id: id)

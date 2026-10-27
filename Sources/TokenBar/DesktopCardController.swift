@@ -4,6 +4,46 @@ import SwiftUI
 import TokenBarCore
 import TokenBarWidgetData
 
+/// The four macOS desktop widget sizes the card can take, or the one that
+/// fits what it shows.
+enum DesktopCardSize: String, CaseIterable, Identifiable {
+    /// The large widget's width, with the shortest grid height that shows
+    /// every row.
+    case automatic
+    case small
+    case medium
+    case large
+    case extraLarge
+
+    var id: String {
+        self.rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .small: "Small"
+        case .medium: "Medium"
+        case .large: "Large"
+        case .extraLarge: "Extra Large"
+        }
+    }
+
+    static let fixedSizes: [DesktopCardSize] = [.small, .medium, .large, .extraLarge]
+
+    /// The visible size of a desktop widget of this size; for `automatic`, its
+    /// shortest size.
+    var points: CGSize {
+        switch self {
+        case .automatic: CGSize(width: 344, height: 164)
+        case .small: CGSize(width: 164, height: 164)
+        case .medium: CGSize(width: 344, height: 164)
+        case .large: CGSize(width: 344, height: 344)
+        case .extraLarge: CGSize(width: 704, height: 344)
+        }
+    }
+}
+
 /// What the desktop card shows and whether its animations should run.
 @MainActor
 @Observable
@@ -12,33 +52,36 @@ final class DesktopCardState {
     /// False while other windows cover the card or its Space is not shown, so
     /// the animations stop drawing.
     var isVisible = true
-    /// The size the user dragged the card to. Without one, the card's height
-    /// follows its rows.
-    var cardSize: CGSize?
-    /// A card snapped to the bottom edge grows upward as rows arrive.
-    var anchorsBottom = false
+    var size = DesktopCardSize.automatic
+    /// The size the card lays its rows out for.
+    var points = DesktopCardSize.automatic.points
 }
 
 /// Shows the unread and running desktop tasks in a card on the desktop. Unlike
 /// a WidgetKit widget, TokenBar draws it, so it can animate freely. The card
-/// sits above the desktop icons and below every app window.
+/// sits above the desktop icons and below every app window, and follows the
+/// desktop widget rules: widget sizes, on the widget grid, never on top of a
+/// system widget.
 @MainActor
 final class DesktopCardController {
     private enum Defaults {
-        /// `[x, y, anchorsBottom]`: the card's left edge, and its bottom edge
-        /// when anchored there or its top edge otherwise.
-        static let placement = "TokenBar.desktopCard.placement"
-        static let size = "TokenBar.desktopCard.size"
+        /// `[x, y]`: the card's top-left corner where the user put it. A card
+        /// that grows past the screen or into a widget moves away from it.
+        static let origin = "TokenBar.desktopCard.origin"
+        static let size = "TokenBar.desktopCard.widgetSize"
+        /// `[x, y, anchorsBottom]` from cards that sized themselves to their
+        /// rows: the left edge, and the top edge when not anchored to the bottom.
+        static let legacyPlacement = "TokenBar.desktopCard.placement"
     }
 
-    /// The card's distance from the screen's usable edges once it snaps.
-    private static let margin: CGFloat = 20
-    /// A card released this close to an edge snaps to it.
-    private static let snapDistance: CGFloat = 100
-    private static let minimumSize = CGSize(width: 260, height: 140)
-    private static let maximumWidth: CGFloat = 720
+    /// Desktop widgets sit this far apart, and their windows reach half of it
+    /// past what they draw.
+    private static let widgetGap: CGFloat = 16
+    private static let gridStep = DesktopCardSize.small.points.width + widgetGap
+    /// How long rows take to animate in or out.
+    private static let rowAnimation: TimeInterval = 0.35
 
-    private let unreadTasks: DesktopUnreadTaskMonitor
+    private let publisher: UnreadWidgetPublisher
     private let settings: TokenBarSettings
     private let openTask: (TokenPlatform, String) -> Void
     private let state = DesktopCardState()
@@ -48,27 +91,21 @@ final class DesktopCardController {
     private var screenObserver: NSObjectProtocol?
     private var dragStart: (mouse: NSPoint, card: NSRect)?
     private var resizeStart: (mouse: NSPoint, card: NSRect)?
-    private var pendingShrink: DispatchWorkItem?
+    private var pendingShrink: Task<Void, Never>?
     private var isStarted = false
 
-    /// How long rows take to animate in or out.
-    private static let rowAnimation: TimeInterval = 0.35
-
-    private var anchorsBottom: Bool {
-        get { self.state.anchorsBottom }
-        set { self.state.anchorsBottom = newValue }
-    }
-
+    /// The card shows the widget's snapshot, which also remembers the tasks
+    /// read last.
     init(
-        unreadTasks: DesktopUnreadTaskMonitor,
+        publisher: UnreadWidgetPublisher,
         settings: TokenBarSettings,
         openTask: @escaping (TokenPlatform, String) -> Void)
     {
-        self.unreadTasks = unreadTasks
+        self.publisher = publisher
         self.settings = settings
         self.openTask = openTask
-        if let size = UserDefaults.standard.array(forKey: Defaults.size) as? [Double], size.count == 2 {
-            self.state.cardSize = CGSize(width: size[0], height: size[1])
+        if let size = UserDefaults.standard.string(forKey: Defaults.size).flatMap(DesktopCardSize.init(rawValue:)) {
+            self.state.size = size
         }
     }
 
@@ -81,15 +118,15 @@ final class DesktopCardController {
 
     func stop() {
         self.isStarted = false
+        self.pendingShrink?.cancel()
+        self.pendingShrink = nil
         self.closePanel()
     }
 
     private func observe() {
         withObservationTracking {
             _ = self.settings.showsDesktopCard
-            _ = self.settings.showsClaude
-            _ = self.unreadTasks.tasks
-            _ = self.unreadTasks.running
+            _ = self.publisher.snapshot
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isStarted else { return }
@@ -104,19 +141,32 @@ final class DesktopCardController {
             self.closePanel()
             return
         }
-        let snapshot = UnreadWidgetPublisher.snapshot(of: self.unreadTasks, settings: self.settings)
+        let snapshot = self.publisher.snapshot
         guard self.panel != nil else {
             self.state.snapshot = snapshot
+            self.state.points = self.points(for: snapshot)
             self.openPanel()
             return
         }
         guard snapshot != self.state.snapshot else { return }
+        self.pendingShrink?.cancel()
+        self.pendingShrink = nil
+        // A taller card makes room before new rows slide in; a shorter one
+        // waits until the rows that leave have faded out.
+        let points = self.points(for: snapshot)
+        if points.height > self.state.points.height {
+            self.resizeCard(to: points)
+        }
         withAnimation(.smooth(duration: Self.rowAnimation)) {
             self.state.snapshot = snapshot
         }
-        // SwiftUI lays out the new rows before the card takes their height.
-        DispatchQueue.main.async { [weak self] in
-            self?.fitToContent()
+        if points.height < self.state.points.height {
+            self.pendingShrink = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(Self.rowAnimation))
+                guard let self, !Task.isCancelled else { return }
+                self.pendingShrink = nil
+                self.resizeCard(to: self.points(for: self.state.snapshot))
+            }
         }
     }
 
@@ -134,22 +184,27 @@ final class DesktopCardController {
             resize: { [weak self] phase in
                 self?.resize(phase)
             },
-            resetSize: { [weak self] in
-                self?.resetSize()
+            setSize: { [weak self] size in
+                self?.setSize(size)
             },
             hide: { [weak self] in
                 self?.settings.showsDesktopCard = false
             })
         let hostingView = NSHostingView(rootView: view)
-        // The controller sizes the window from the card's ideal size; SwiftUI
-        // must not also pin the window's minimum and maximum to it.
-        hostingView.sizingOptions = [.intrinsicContentSize]
+        // The controller sizes the window; SwiftUI must not pin it.
+        hostingView.sizingOptions = []
         let panel = DesktopCardPanel(contentView: hostingView)
         self.hostingView = hostingView
         self.panel = panel
-        let size = self.contentSize()
-        let card = self.savedCard(size: size) ?? self.defaultCard(size: size)
-        panel.setFrame(Self.panelFrame(for: card), display: false)
+        let size = self.state.points
+        if let saved = self.savedTopLeft() {
+            let card = self.placed(NSRect(x: saved.x, y: saved.y - size.height, width: size.width, height: size.height))
+            panel.setFrame(Self.panelFrame(for: card), display: false)
+        } else {
+            let card = self.placed(self.defaultCard(size: size))
+            panel.setFrame(Self.panelFrame(for: card), display: false)
+            self.save(card)
+        }
         panel.orderFrontRegardless()
 
         self.occlusionObserver = NotificationCenter.default.addObserver(
@@ -168,7 +223,8 @@ final class DesktopCardController {
             queue: .main)
         { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.settle(animated: false)
+                guard let self else { return }
+                self.resizeCard(to: self.points(for: self.state.snapshot), animated: false)
             }
         }
     }
@@ -186,49 +242,12 @@ final class DesktopCardController {
 
     // MARK: Geometry
 
-    /// The card's own size, without the glow room around it.
-    private func contentSize() -> CGSize {
-        if let size = self.state.cardSize {
-            return size
-        }
-        let fitting = self.hostingView?.fittingSize ?? CGSize(width: DesktopCardView.width, height: 120)
-        let glow = DesktopCardView.glowRoom * 2
-        return CGSize(width: fitting.width - glow, height: fitting.height - glow)
-    }
-
     private var card: NSRect? {
         self.panel.map { $0.frame.insetBy(dx: DesktopCardView.glowRoom, dy: DesktopCardView.glowRoom) }
     }
 
     private static func panelFrame(for card: NSRect) -> NSRect {
         card.insetBy(dx: -DesktopCardView.glowRoom, dy: -DesktopCardView.glowRoom)
-    }
-
-    /// Keeps the anchored edge in place while the height follows the rows. The
-    /// transparent window grows before new rows animate in and shrinks only
-    /// after old rows have animated out, so the card itself moves smoothly.
-    private func fitToContent() {
-        guard let panel = self.panel, let card = self.card else { return }
-        let size = self.contentSize()
-        guard size != card.size else { return }
-        self.pendingShrink?.cancel()
-        self.pendingShrink = nil
-        let resize = { [weak self] in
-            guard let self, let card = self.card else { return }
-            let size = self.contentSize()
-            let y = self.anchorsBottom ? card.minY : card.maxY - size.height
-            panel.setFrame(
-                Self.panelFrame(for: NSRect(x: card.minX, y: y, width: size.width, height: size.height)),
-                display: true)
-            self.settle(animated: false)
-        }
-        guard size.height < card.height else {
-            resize()
-            return
-        }
-        let shrink = DispatchWorkItem(block: resize)
-        self.pendingShrink = shrink
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.rowAnimation + 0.05, execute: shrink)
     }
 
     private func move(_ phase: DesktopCardView.DragPhase) {
@@ -247,117 +266,212 @@ final class DesktopCardController {
         }
     }
 
-    /// The bottom-right corner follows the pointer while the top-left corner
-    /// stays put.
+    /// The bottom-right corner picks the widget size nearest the pointer, the
+    /// way a desktop widget steps between sizes.
     private func resize(_ phase: DesktopCardView.DragPhase) {
-        guard let panel = self.panel, let card = self.card else { return }
+        guard let card = self.card else { return }
         let mouse = NSEvent.mouseLocation
         switch phase {
         case .changed:
             let start = self.resizeStart ?? (mouse, card)
             self.resizeStart = start
-            let screenHeight = (panel.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-            let size = CGSize(
-                width: min(max(start.card.width + mouse.x - start.mouse.x, Self.minimumSize.width), Self.maximumWidth),
-                height: min(
-                    max(start.card.height - (mouse.y - start.mouse.y), Self.minimumSize.height),
-                    screenHeight - Self.margin * 2))
-            self.state.cardSize = size
-            panel.setFrame(
-                Self.panelFrame(for: NSRect(
-                    x: start.card.minX,
-                    y: start.card.maxY - size.height,
-                    width: size.width,
-                    height: size.height)),
-                display: true)
+            let wanted = CGSize(
+                width: start.card.width + mouse.x - start.mouse.x,
+                height: start.card.height - (mouse.y - start.mouse.y))
+            let nearest = DesktopCardSize.fixedSizes.min { lhs, rhs in
+                Self.distance(lhs.points, wanted) < Self.distance(rhs.points, wanted)
+            } ?? self.state.size
+            if nearest.points != self.state.points || nearest != self.state.size {
+                self.apply(nearest, topLeft: NSPoint(x: start.card.minX, y: start.card.maxY))
+            }
         case .ended:
             self.resizeStart = nil
-            if let size = self.state.cardSize {
-                UserDefaults.standard.set([size.width, size.height], forKey: Defaults.size)
-            }
+            UserDefaults.standard.set(self.state.size.rawValue, forKey: Defaults.size)
             self.settle(animated: true)
         }
     }
 
-    private func resetSize() {
-        self.state.cardSize = nil
-        UserDefaults.standard.removeObject(forKey: Defaults.size)
-        DispatchQueue.main.async { [weak self] in
-            self?.fitToContent()
+    private func setSize(_ size: DesktopCardSize) {
+        guard size != self.state.size else { return }
+        self.state.size = size
+        UserDefaults.standard.set(size.rawValue, forKey: Defaults.size)
+        self.resizeCard(to: self.points(for: self.state.snapshot))
+    }
+
+    /// Changes the size with the card's top-left corner in place.
+    private func apply(_ size: DesktopCardSize, topLeft: NSPoint) {
+        guard let panel = self.panel else { return }
+        let points = size.points
+        self.state.size = size
+        self.state.points = points
+        panel.setFrame(
+            Self.panelFrame(for: NSRect(
+                x: topLeft.x,
+                y: topLeft.y - points.height,
+                width: points.width,
+                height: points.height)),
+            display: true)
+    }
+
+    /// The size the card takes for `snapshot`: its widget size, or for
+    /// `automatic` the shortest grid height that shows every row and still
+    /// fits on the screen.
+    private func points(for snapshot: UnreadWidgetSnapshot) -> CGSize {
+        let points = self.state.size.points
+        guard self.state.size == .automatic else { return points }
+        let needed = DesktopCardView.automaticHeight(for: snapshot)
+        let screen = self.card.flatMap { card in
+            NSScreen.screens.first { $0.frame.contains(NSPoint(x: card.midX, y: card.midY)) }
+        } ?? NSScreen.screens.first
+        let limit = screen.map { $0.visibleFrame.height - Self.widgetGap * 2 } ?? .greatestFiniteMagnitude
+        var height = points.height
+        while height < needed, height + Self.gridStep <= limit {
+            height += Self.gridStep
+        }
+        return CGSize(width: points.width, height: height)
+    }
+
+    /// Resizes the card on the grid spot nearest where the user put it. The
+    /// card keeps that place, so it returns there once it is short enough.
+    private func resizeCard(to points: CGSize, animated: Bool = true) {
+        guard let card = self.card else { return }
+        let home = self.savedTopLeft() ?? NSPoint(x: card.minX, y: card.maxY)
+        self.state.points = points
+        let target = self.placed(NSRect(
+            x: home.x,
+            y: home.y - points.height,
+            width: points.width,
+            height: points.height))
+        self.setCard(target, animated: animated)
+    }
+
+    private func setCard(_ card: NSRect, animated: Bool) {
+        guard let panel = self.panel else { return }
+        let frame = Self.panelFrame(for: card)
+        guard frame != panel.frame else { return }
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().setFrame(frame, display: true)
+            }
+        } else {
+            panel.setFrame(frame, display: true)
         }
     }
 
-    /// Snaps the card to nearby screen edges, keeps it on a screen, and
-    /// remembers where it went.
+    private static func distance(_ lhs: CGSize, _ rhs: CGSize) -> CGFloat {
+        hypot(lhs.width - rhs.width, lhs.height - rhs.height)
+    }
+
+    /// Moves the card onto the nearest free spot of the widget grid and
+    /// remembers it.
     private func settle(animated: Bool) {
-        guard let panel = self.panel, let card = self.card else { return }
-        let target = self.snapped(card)
-        let frame = Self.panelFrame(for: target)
-        if frame != panel.frame {
-            if animated {
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.2
-                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    panel.animator().setFrame(frame, display: true)
+        guard let card = self.card else { return }
+        let target = self.placed(card)
+        self.setCard(target, animated: animated)
+        self.save(target)
+    }
+
+    private func savedTopLeft() -> NSPoint? {
+        let defaults = UserDefaults.standard
+        if let values = defaults.array(forKey: Defaults.origin) as? [Double], values.count == 2 {
+            return NSPoint(x: values[0], y: values[1])
+        }
+        if let values = defaults.array(forKey: Defaults.legacyPlacement) as? [Double], values.count == 3, values[2] == 0 {
+            return NSPoint(x: values[0], y: values[1])
+        }
+        return nil
+    }
+
+    private func save(_ card: NSRect) {
+        UserDefaults.standard.set([card.minX, card.maxY], forKey: Defaults.origin)
+    }
+
+    /// The grid spot nearest `card` on the screen under its center where the
+    /// card fits on screen and clears every system widget by the widget gap.
+    private func placed(_ card: NSRect) -> NSRect {
+        let center = NSPoint(x: card.midX, y: card.midY)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(center) })
+            ?? NSScreen.screens.first
+        else {
+            return card
+        }
+        let area = screen.visibleFrame.insetBy(dx: Self.widgetGap, dy: Self.widgetGap)
+        let widgets = Self.systemWidgetFrames().filter { screen.frame.intersects($0) }
+        // Share the system widgets' grid; without any, start at the top-left
+        // corner of the usable area.
+        let anchor = widgets.first.map { NSPoint(x: $0.minX, y: $0.maxY) } ?? NSPoint(x: area.minX, y: area.maxY)
+        let step = Self.gridStep
+        let size = card.size
+        let columns = Int(floor((area.minX - anchor.x) / step))...Int(ceil((area.maxX - anchor.x) / step))
+        let rows = Int(floor((anchor.y - area.maxY) / step))...Int(ceil((anchor.y - area.minY) / step))
+
+        var best: NSRect?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for column in columns {
+            for row in rows {
+                let spot = NSRect(
+                    x: anchor.x + CGFloat(column) * step,
+                    y: anchor.y - CGFloat(row) * step - size.height,
+                    width: size.width,
+                    height: size.height)
+                guard area.contains(spot),
+                      !widgets.contains(where: {
+                          $0.insetBy(dx: -Self.widgetGap / 2, dy: -Self.widgetGap / 2).intersects(spot)
+                      })
+                else {
+                    continue
                 }
-            } else {
-                panel.setFrame(frame, display: true)
+                let distance = hypot(spot.minX - card.minX, spot.maxY - card.maxY)
+                if distance < bestDistance {
+                    best = spot
+                    bestDistance = distance
+                }
             }
         }
-        UserDefaults.standard.set(
-            [target.minX, self.anchorsBottom ? target.minY : target.maxY, self.anchorsBottom ? 1 : 0],
-            forKey: Defaults.placement)
-    }
-
-    /// Pulls the card inside the usable area of the screen under its center,
-    /// then snaps each axis to an edge within `snapDistance`. A card off every
-    /// screen goes back to the default corner.
-    private func snapped(_ card: NSRect) -> NSRect {
-        let center = NSPoint(x: card.midX, y: card.midY)
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(center) }) else {
-            return self.defaultCard(size: card.size)
-        }
-        let area = screen.visibleFrame.insetBy(dx: Self.margin, dy: Self.margin)
-        var result = card
-        result.origin.x = min(max(result.minX, area.minX), max(area.maxX - result.width, area.minX))
-        result.origin.y = min(max(result.minY, area.minY), max(area.maxY - result.height, area.minY))
-
-        if result.minX - area.minX < Self.snapDistance {
-            result.origin.x = area.minX
-        } else if area.maxX - result.maxX < Self.snapDistance {
-            result.origin.x = area.maxX - result.width
-        }
-        self.anchorsBottom = false
-        if area.maxY - result.maxY < Self.snapDistance {
-            result.origin.y = area.maxY - result.height
-        } else if result.minY - area.minY < Self.snapDistance {
-            result.origin.y = area.minY
-            self.anchorsBottom = true
-        }
-        return result
+        return best ?? card
     }
 
     /// The top-right corner of the screen with the menu bar.
     private func defaultCard(size: CGSize) -> NSRect {
         let visible = (NSScreen.screens.first ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        self.anchorsBottom = false
         return NSRect(
-            x: visible.maxX - Self.margin - size.width,
-            y: visible.maxY - Self.margin - size.height,
+            x: visible.maxX - Self.widgetGap - size.width,
+            y: visible.maxY - Self.widgetGap - size.height,
             width: size.width,
             height: size.height)
     }
 
-    private func savedCard(size: CGSize) -> NSRect? {
-        guard let values = UserDefaults.standard.array(forKey: Defaults.placement) as? [Double],
-              values.count == 3
+    /// What each system desktop widget draws, in screen coordinates. The
+    /// widgets are Notification Center windows just above the desktop icons,
+    /// each reaching half the widget gap past what it draws.
+    private static func systemWidgetFrames() -> [NSRect] {
+        guard let primaryHeight = NSScreen.screens.first?.frame.height,
+              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
         else {
-            return nil
+            return []
         }
-        self.anchorsBottom = values[2] == 1
-        let y = self.anchorsBottom ? values[1] : values[1] - size.height
-        return self.snapped(NSRect(x: values[0], y: y, width: size.width, height: size.height))
+        let widgetLevel = Int(CGWindowLevelForKey(.desktopIconWindow)) + 2
+        let sizes = Set(DesktopCardSize.fixedSizes.flatMap {
+            [$0.points.width + self.widgetGap, $0.points.height + self.widgetGap]
+        })
+        return windows.compactMap { window -> NSRect? in
+            guard window[kCGWindowLayer as String] as? Int == widgetLevel,
+                  let pid = window[kCGWindowOwnerPID as String] as? pid_t,
+                  NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.notificationcenterui",
+                  let bounds = window[kCGWindowBounds as String] as? [String: Double],
+                  let x = bounds["X"], let y = bounds["Y"],
+                  let width = bounds["Width"], let height = bounds["Height"],
+                  sizes.contains(width), sizes.contains(height)
+            else {
+                return nil
+            }
+            // Window bounds are measured from the top-left of the primary screen.
+            return NSRect(x: x, y: primaryHeight - y - height, width: width, height: height)
+                .insetBy(dx: self.widgetGap / 2, dy: self.widgetGap / 2)
+        }
     }
 }
 
@@ -366,7 +480,7 @@ final class DesktopCardController {
 private final class DesktopCardPanel: NSPanel {
     init(contentView: NSView) {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            contentRect: NSRect(x: 0, y: 0, width: 344, height: 344),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false)

@@ -89,21 +89,31 @@ public struct UnreadWidgetSnapshot: Codable, Equatable, Sendable {
     public let tasks: [Item]
     /// Every platform's running tasks, most recently started first.
     public let running: [RunningItem]
+    /// The last tasks the user read, most recently read first.
+    public let recent: [Item]
 
-    public init(isTracking: Bool, platforms: [Platform], tasks: [Item], running: [RunningItem]) {
+    public init(
+        isTracking: Bool,
+        platforms: [Platform],
+        tasks: [Item],
+        running: [RunningItem],
+        recent: [Item] = [])
+    {
         self.isTracking = isTracking
         self.platforms = platforms
         self.tasks = tasks
         self.running = running
+        self.recent = recent
     }
 
-    /// Snapshots written before running tasks were shared have none.
+    /// Snapshots written before running and recent tasks were shared have none.
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.isTracking = try container.decode(Bool.self, forKey: .isTracking)
         self.platforms = try container.decode([Platform].self, forKey: .platforms)
         self.tasks = try container.decode([Item].self, forKey: .tasks)
         self.running = try container.decodeIfPresent([RunningItem].self, forKey: .running) ?? []
+        self.recent = try container.decodeIfPresent([Item].self, forKey: .recent) ?? []
     }
 
     public var unreadCount: Int {

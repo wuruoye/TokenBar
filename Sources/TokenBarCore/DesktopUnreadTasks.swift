@@ -54,8 +54,22 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private let reader: DesktopUnreadTaskReader
     @ObservationIgnored private var watcher: DesktopUnreadTaskWatcher?
 
-    public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+    @ObservationIgnored private let claudeTrackerStateURL: URL?
+
+    public init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        claudeTrackerStateURL: URL? = DesktopUnreadTaskMonitor.defaultClaudeTrackerStateURL())
+    {
         self.reader = DesktopUnreadTaskReader(environment: environment)
+        self.claudeTrackerStateURL = claudeTrackerStateURL
+    }
+
+    public nonisolated static func defaultClaudeTrackerStateURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("TokenBar", isDirectory: true)
+            .appendingPathComponent("claude-unread-state.json", isDirectory: false)
     }
 
     public var counts: [TokenPlatform: Int] {
@@ -70,6 +84,7 @@ public final class DesktopUnreadTaskMonitor {
         guard self.watcher == nil else { return }
         let watcher = DesktopUnreadTaskWatcher(
             reader: self.reader,
+            claudeTrackerStateURL: self.claudeTrackerStateURL,
             publish: { [weak self] platform, tasks in
                 Task { @MainActor [weak self] in
                     self?.accept(tasks, for: platform)
@@ -235,11 +250,15 @@ struct DesktopUnreadTaskReader: Sendable {
     }
 
     /// Codex threads that ran a turn since a moment, which includes every
-    /// thread still running one.
-    func codexRunningTasks(states: CodexTurnStateReader, now: Date) -> [DesktopRunningTask] {
+    /// thread still running one, and the rollouts their next turn writes to.
+    func codexRunningTasks(
+        states: CodexTurnStateReader,
+        now: Date) -> (tasks: [DesktopRunningTask], rollouts: Set<String>)
+    {
         let threads = self.visibleCodexThreads(.updatedSince(now.addingTimeInterval(-24 * 60 * 60)))
-        states.forget(except: Set(threads.compactMap(\.rolloutPath)))
-        return threads.compactMap { thread in
+        let rollouts = Set(threads.compactMap(\.rolloutPath))
+        states.forget(except: rollouts)
+        let tasks = threads.compactMap { thread -> DesktopRunningTask? in
             guard let path = thread.rolloutPath,
                   let attributes = try? FileManager.default.attributesOfItem(atPath: path),
                   let size = (attributes[.size] as? NSNumber)?.uint64Value,
@@ -256,6 +275,7 @@ struct DesktopUnreadTaskReader: Sendable {
                 title: thread.title,
                 startedAt: state.startedAt)
         }
+        return (tasks, rollouts)
     }
 
     private enum CodexThreadFilter {
@@ -544,20 +564,22 @@ struct ClaudeSessionSnapshot: Equatable, Sendable {
 /// read. Each guess lasts until the store agrees, Chromium commits the store after
 /// the event, or it expires.
 struct ClaudeUnreadTracker {
-    private enum Override {
-        case unread(since: Date)
-        case read(since: Date)
+    struct Override: Codable, Equatable {
+        var isUnread: Bool
+        var since: Date
+    }
 
-        var since: Date {
-            switch self {
-            case let .unread(since), let .read(since):
-                since
-            }
-        }
+    /// The parts of a session record whose changes are read or unread events.
+    struct Progress: Codable, Equatable {
+        var completedTurns: Int
+        var lastFocusedAt: Int64
+    }
 
-        var isUnread: Bool {
-            if case .unread = self { true } else { false }
-        }
+    /// Kept across launches, so a guess the store has not caught up with and a
+    /// turn that finished while TokenBar was not running still count.
+    struct State: Codable, Equatable {
+        var progress: [String: Progress] = [:]
+        var overrides: [String: Override] = [:]
     }
 
     /// A commit this long after an event already includes it.
@@ -567,33 +589,44 @@ struct ClaudeUnreadTracker {
     static let overrideLifetime: TimeInterval = 600
 
     private(set) var sessions: [String: ClaudeSessionSnapshot] = [:]
-    private var overrides: [String: Override] = [:]
-    private var hasBaseline = false
+    private(set) var state: State
+    private var hasBaseline: Bool
+
+    init(restoring state: State? = nil) {
+        self.state = state ?? State()
+        self.hasBaseline = state != nil
+    }
 
     var nextExpiry: Date? {
-        self.overrides.values.map { $0.since.addingTimeInterval(Self.overrideLifetime) }.min()
+        self.state.overrides.values.map { $0.since.addingTimeInterval(Self.overrideLifetime) }.min()
     }
 
     /// Returns the IDs of the sessions the sidebar shows as unread.
+    /// `finishedTurns` are sessions whose transcript just finished a turn,
+    /// which Claude records only after the session's stop hooks run.
     mutating func update(
         store: Set<String>,
         storeCommittedAt: Date,
         sessions: [String: ClaudeSessionSnapshot],
+        finishedTurns: Set<String> = [],
         shownSession: () -> ClaudeShownSession,
         now: Date) -> Set<String>
     {
         if self.hasBaseline {
-            self.recordEvents(in: sessions, shownSession: shownSession)
+            self.recordEvents(in: sessions, finishedTurns: finishedTurns, shownSession: shownSession, now: now)
         }
         self.sessions = sessions
+        self.state.progress = sessions.mapValues {
+            Progress(completedTurns: $0.completedTurns, lastFocusedAt: $0.lastFocusedAt)
+        }
         self.hasBaseline = true
 
-        let overrides = self.overrides.filter { id, override in
+        let overrides = self.state.overrides.filter { id, override in
             override.isUnread != store.contains(id)
                 && storeCommittedAt <= override.since.addingTimeInterval(Self.storeCommitMargin)
                 && now < override.since.addingTimeInterval(Self.overrideLifetime)
         }
-        self.overrides = overrides
+        self.state.overrides = overrides
         return store.union(overrides.keys).filter { id in
             guard let session = sessions[id], !session.isArchived else { return false }
             return overrides[id]?.isUnread ?? store.contains(id)
@@ -602,14 +635,16 @@ struct ClaudeUnreadTracker {
 
     private mutating func recordEvents(
         in sessions: [String: ClaudeSessionSnapshot],
-        shownSession: () -> ClaudeShownSession)
+        finishedTurns: Set<String>,
+        shownSession: () -> ClaudeShownSession,
+        now: Date)
     {
-        let finishedTurn = sessions.contains { id, session in
-            session.completedTurns > (self.sessions[id]?.completedTurns ?? .max)
+        let completedTurn = sessions.contains { id, session in
+            session.completedTurns > (self.state.progress[id]?.completedTurns ?? .max)
         }
         // Without Claude's log, assume the window still shows the session
         // shown last.
-        let shownID: String? = switch finishedTurn ? shownSession() : .unknown {
+        let shownID: String? = switch completedTurn || !finishedTurns.isEmpty ? shownSession() : .unknown {
         case let .session(id): id
         case .none: nil
         case .unknown:
@@ -619,15 +654,16 @@ struct ClaudeUnreadTracker {
                 .key
         }
         for (id, session) in sessions {
-            guard let previous = self.sessions[id] else { continue }
+            guard let previous = self.state.progress[id] else { continue }
             if session.lastFocusedAt > previous.lastFocusedAt {
-                self.overrides[id] = .read(
+                self.state.overrides[id] = Override(
+                    isUnread: false,
                     since: Date(timeIntervalSince1970: TimeInterval(session.lastFocusedAt) / 1000))
             }
             if session.completedTurns > previous.completedTurns {
-                self.overrides[id] = id == shownID
-                    ? .read(since: session.modifiedAt)
-                    : .unread(since: session.modifiedAt)
+                self.state.overrides[id] = Override(isUnread: id != shownID, since: session.modifiedAt)
+            } else if finishedTurns.contains(id) {
+                self.state.overrides[id] = Override(isUnread: id != shownID, since: now)
             }
         }
     }
@@ -641,9 +677,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// Running tasks are also rechecked on this interval, which catches an app
     /// that quit mid-turn and never wrote the turn's end.
     private static let runningRefreshInterval: TimeInterval = 60
+    /// A turn appends to its rollout or transcript many times a second.
+    private static let appendCoalescingDelay: TimeInterval = 0.3
 
     private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask]) -> Void
     private let publishRunning: @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void
+    private let claudeTrackerStateURL: URL?
     private let turns = DesktopUnreadTurnReader()
     private let codexTurnStates = CodexTurnStateReader()
     private var stream: FSEventStreamRef?
@@ -651,23 +690,35 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var codexSessionsPrefix: String?
     private var claudePrefixes: [String] = []
     private var claudeTracker = ClaudeUnreadTracker()
+    private var savedClaudeTrackerState: ClaudeUnreadTracker.State?
     private var claudeRecountScheduledAt: Date?
     private var claudeRereadScheduled = false
     private var codexRunningIDs: Set<String> = []
+    private var claudeRunningIDs: Set<String> = []
+    private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
+        self?.scheduleAppendRecount(of: .codex)
+    }
+    private lazy var claudeTranscripts = AppendedFileWatcher(queue: self.queue) { [weak self] in
+        self?.scheduleAppendRecount(of: .claude)
+    }
+    private var appendRecountsScheduled: Set<TokenPlatform> = []
     private var isStopped = false
 
     init(
         reader: DesktopUnreadTaskReader,
+        claudeTrackerStateURL: URL?,
         publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask]) -> Void,
         publishRunning: @escaping @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void)
     {
         self.reader = reader
+        self.claudeTrackerStateURL = claudeTrackerStateURL
         self.publish = publish
         self.publishRunning = publishRunning
     }
 
     func start() {
         self.queue.async {
+            self.restoreClaudeTracker()
             self.startStream()
             self.recount(DesktopUnreadTaskReader.platforms)
             self.recountCodexRunning()
@@ -678,6 +729,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     func stop() {
         self.queue.sync {
             self.isStopped = true
+            self.codexRollouts.watch([])
+            self.claudeTranscripts.watch([])
             guard let stream = self.stream else { return }
             FSEventStreamStop(stream)
             FSEventStreamInvalidate(stream)
@@ -737,7 +790,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             &context,
             roots as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            1.0,
+            0.3,
             FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents))
         else {
             return
@@ -774,7 +827,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             }
         }
         self.recount(DesktopUnreadTaskReader.platforms.filter { changed.contains($0) })
-        if codexRolloutChanged {
+        // Codex marks a thread unread as its turn ends, and a new thread
+        // creates its rollout before the vnode watch covers it.
+        if changed.contains(.codex) || codexRolloutChanged {
             self.recountCodexRunning()
         }
         if changed.contains(.claude) {
@@ -793,6 +848,21 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func scheduleAppendRecount(of platform: TokenPlatform) {
+        guard self.appendRecountsScheduled.insert(platform).inserted else { return }
+        self.queue.asyncAfter(deadline: .now() + Self.appendCoalescingDelay) {
+            self.appendRecountsScheduled.remove(platform)
+            switch platform {
+            case .codex:
+                self.recountCodexRunning()
+            case .claude:
+                self.recountClaudeRunning()
+            default:
+                break
+            }
+        }
+    }
+
     private func recount(_ platforms: [TokenPlatform]) {
         guard !self.isStopped else { return }
         for platform in platforms {
@@ -800,18 +870,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             case .codex:
                 self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns))
             case .claude:
-                let storeCommittedAt = self.reader.claudeStoreCommittedAt()
-                let store = self.reader.claudeUnreadStore()
-                let sessions = self.reader.claudeSessions(reusing: self.claudeTracker.sessions)
-                let ids = self.claudeTracker.update(
-                    store: store,
-                    storeCommittedAt: storeCommittedAt,
-                    sessions: sessions,
-                    shownSession: self.reader.claudeShownSession,
-                    now: Date())
-                self.publish(.claude, self.claudeTasks(ids, sessions: sessions))
-                self.publishRunning(.claude, self.claudeRunningTasks(sessions, now: Date()))
-                self.scheduleClaudeExpiryRecount()
+                self.recountClaude(sessions: self.reader.claudeSessions(reusing: self.claudeTracker.sessions))
             default:
                 continue
             }
@@ -822,7 +881,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// the unread state is read then and once more after Codex writes it.
     private func recountCodexRunning() {
         guard !self.isStopped else { return }
-        let running = self.reader.codexRunningTasks(states: self.codexTurnStates, now: Date())
+        let (running, rollouts) = self.reader.codexRunningTasks(states: self.codexTurnStates, now: Date())
+        self.codexRollouts.watch(rollouts)
         let runningIDs = Set(running.map(\.id))
         let finishedTurn = !self.codexRunningIDs.subtracting(runningIDs).isEmpty
         self.codexRunningIDs = runningIDs
@@ -834,11 +894,55 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func recountClaude(sessions: [String: ClaudeSessionSnapshot]) {
+        let now = Date()
+        let (running, transcripts) = self.claudeRunningTasks(sessions, now: now)
+        let ids = self.claudeTracker.update(
+            store: self.reader.claudeUnreadStore(),
+            storeCommittedAt: self.reader.claudeStoreCommittedAt(),
+            sessions: sessions,
+            finishedTurns: self.claudeFinishedTurns(running: running, transcripts: transcripts),
+            shownSession: self.reader.claudeShownSession,
+            now: now)
+        self.claudeTranscripts.watch(Set(transcripts.values.map(\.path)))
+        self.claudeRunningIDs = Set(running.map(\.id))
+        self.publish(.claude, self.claudeTasks(ids, sessions: sessions))
+        self.publishRunning(.claude, running)
+        self.saveClaudeTracker()
+        self.scheduleClaudeExpiryRecount()
+    }
+
+    /// Transcripts change throughout a turn, so they are read against the
+    /// session records already loaded, and the unread state is recounted only
+    /// when a turn ends.
+    private func recountClaudeRunning() {
+        guard !self.isStopped else { return }
+        let sessions = self.claudeTracker.sessions
+        let (running, transcripts) = self.claudeRunningTasks(sessions, now: Date())
+        guard self.claudeFinishedTurns(running: running, transcripts: transcripts).isEmpty else {
+            self.recountClaude(sessions: sessions)
+            return
+        }
+        self.claudeRunningIDs = Set(running.map(\.id))
+        self.publishRunning(.claude, running)
+    }
+
+    /// Sessions that were running and whose transcript now ends their turn,
+    /// unlike one that went quiet or was archived.
+    private func claudeFinishedTurns(
+        running: [DesktopRunningTask],
+        transcripts: [String: URL]) -> Set<String>
+    {
+        self.claudeRunningIDs
+            .subtracting(running.map(\.id))
+            .filter { transcripts[$0] != nil }
+    }
+
     private func scheduleRunningRefresh() {
         self.queue.asyncAfter(deadline: .now() + Self.runningRefreshInterval) {
             guard !self.isStopped else { return }
             self.recountCodexRunning()
-            self.publishRunning(.claude, self.claudeRunningTasks(self.claudeTracker.sessions, now: Date()))
+            self.recountClaudeRunning()
             self.scheduleRunningRefresh()
         }
     }
@@ -846,11 +950,14 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// Claude Desktop records only when a session last started or finished a
     /// turn, so its transcript tells which one it was. A turn longer than the
     /// candidate window is still caught while its transcript keeps growing.
+    /// Also returns the transcripts of recently active sessions, which a turn
+    /// that starts or ends there writes to.
     private func claudeRunningTasks(
         _ sessions: [String: ClaudeSessionSnapshot],
-        now: Date) -> [DesktopRunningTask]
+        now: Date) -> (tasks: [DesktopRunningTask], transcripts: [String: URL])
     {
-        sessions.compactMap { id, session -> DesktopRunningTask? in
+        var transcripts: [String: URL] = [:]
+        let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
             guard !session.isArchived,
                   let edge = session.lastTurnEdgeAt ?? session.lastActivityAt,
                   now.timeIntervalSince(edge) < 6 * 60 * 60,
@@ -864,11 +971,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                   // values, so the modification date comes from the file system.
                   let activeAt = (try? FileManager.default.attributesOfItem(
                       atPath: transcript.path))?[.modificationDate] as? Date,
-                  now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit,
-                  self.turns.claudeTurnIsRunning(transcript: transcript)
+                  now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit
             else {
                 return nil
             }
+            transcripts[id] = transcript
+            guard self.turns.claudeTurnIsRunning(transcript: transcript) else { return nil }
             return DesktopRunningTask(
                 platform: .claude,
                 id: id,
@@ -877,6 +985,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }.sorted {
             ($0.startedAt ?? .distantPast, $0.id) > ($1.startedAt ?? .distantPast, $1.id)
         }
+        return (tasks, transcripts)
     }
 
     private func claudeTasks(
@@ -918,9 +1027,81 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func restoreClaudeTracker() {
+        guard let url = self.claudeTrackerStateURL,
+              let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(ClaudeUnreadTracker.State.self, from: data)
+        else {
+            return
+        }
+        self.claudeTracker = ClaudeUnreadTracker(restoring: state)
+        self.savedClaudeTrackerState = state
+    }
+
+    private func saveClaudeTracker() {
+        guard let url = self.claudeTrackerStateURL,
+              self.claudeTracker.state != self.savedClaudeTrackerState
+        else {
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try JSONEncoder().encode(self.claudeTracker.state).write(to: url, options: [.atomic])
+            self.savedClaudeTrackerState = self.claudeTracker.state
+        } catch {
+            NSLog("TokenBar could not save the Claude unread state: %@", String(describing: error))
+        }
+    }
+
     private static func canonicalPath(_ url: URL) -> String? {
         guard let resolved = realpath(url.path, nil) else { return nil }
         defer { free(resolved) }
         return String(cString: resolved)
+    }
+}
+
+/// Watches files that an app appends to while keeping them open, such as Codex
+/// rollouts. FSEvents reports those writes only once the file is closed, while a
+/// vnode source sees each one.
+final class AppendedFileWatcher {
+    private let queue: DispatchQueue
+    private let onChange: () -> Void
+    private var sources: [String: DispatchSourceFileSystemObject] = [:]
+
+    init(queue: DispatchQueue, onChange: @escaping () -> Void) {
+        self.queue = queue
+        self.onChange = onChange
+    }
+
+    /// Watches exactly `paths`. Call on `queue`.
+    func watch(_ paths: Set<String>) {
+        for (path, source) in self.sources where !paths.contains(path) {
+            source.cancel()
+            self.sources[path] = nil
+        }
+        for path in paths where self.sources[path] == nil {
+            let descriptor = open(path, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .extend, .delete, .rename],
+                queue: self.queue)
+            source.setEventHandler { [weak self, weak source] in
+                guard let self, let source else { return }
+                // A replaced file is watched again by path on the next call.
+                if !source.data.isDisjoint(with: [.delete, .rename]) {
+                    source.cancel()
+                    self.sources[path] = nil
+                }
+                self.onChange()
+            }
+            source.setCancelHandler {
+                close(descriptor)
+            }
+            source.resume()
+            self.sources[path] = source
+        }
     }
 }
