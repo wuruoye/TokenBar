@@ -27,14 +27,6 @@ struct DesktopCardView: View {
     let hide: () -> Void
     @State private var isHovered = false
 
-    /// The height that shows every row of `snapshot` in the column layout.
-    static func automaticHeight(for snapshot: UnreadWidgetSnapshot) -> CGFloat {
-        self.padding * 2 + CardMetrics.headerHeight + CardMetrics.headerSpacing
-            + max(
-                CardMetrics.listHeight(unread: 0, running: snapshot.running.count, recent: snapshot.recent.count),
-                CGFloat(snapshot.tasks.count) * CardMetrics.unreadRowHeight)
-    }
-
     var body: some View {
         let snapshot = self.state.snapshot
         let size = self.state.points
@@ -368,17 +360,6 @@ private enum CardMetrics {
             }
             return rows
         }
-    }
-
-    /// The height of every row in the list layout.
-    static func listHeight(unread: Int, running: Int, recent: Int) -> CGFloat {
-        let parts = [
-            unread > 0 ? CGFloat(unread) * self.unreadRowHeight : nil,
-            running > 0 ? self.sectionHeight(rows: running) : nil,
-            recent > 0 ? self.sectionHeight(rows: recent) : nil,
-        ].compactMap { $0 }
-        guard !parts.isEmpty else { return self.caughtUpHeight }
-        return parts.reduce(0, +) + CGFloat(parts.count - 1) * self.sectionGap
     }
 }
 

@@ -7,8 +7,8 @@ import TokenBarWidgetData
 /// The four macOS desktop widget sizes the card can take, or the one that
 /// fits what it shows.
 enum DesktopCardSize: String, CaseIterable, Identifiable {
-    /// A medium widget's width, which widens to an extra-large one while
-    /// anything is unread, with the shortest grid height that shows every row.
+    /// A large widget, which widens to an extra-large one while anything is
+    /// unread.
     case automatic
     case small
     case medium
@@ -32,10 +32,10 @@ enum DesktopCardSize: String, CaseIterable, Identifiable {
     static let fixedSizes: [DesktopCardSize] = [.small, .medium, .large, .extraLarge]
 
     /// The visible size of a desktop widget of this size; for `automatic`, its
-    /// shortest size.
+    /// size while nothing is unread.
     var points: CGSize {
         switch self {
-        case .automatic: CGSize(width: 344, height: 164)
+        case .automatic: CGSize(width: 344, height: 344)
         case .small: CGSize(width: 164, height: 164)
         case .medium: CGSize(width: 344, height: 164)
         case .large: CGSize(width: 344, height: 344)
@@ -316,23 +316,12 @@ final class DesktopCardController {
     }
 
     /// The size the card takes for `snapshot`: its widget size, or for
-    /// `automatic` the width that fits the unread column when anything is
-    /// unread and the shortest grid height that shows every row and still
-    /// fits on the screen.
+    /// `automatic` the extra-large widget while anything is unread.
     private func points(for snapshot: UnreadWidgetSnapshot) -> CGSize {
-        let points = self.state.size.points
-        guard self.state.size == .automatic else { return points }
-        let needed = DesktopCardView.automaticHeight(for: snapshot)
-        let screen = self.card.flatMap { card in
-            NSScreen.screens.first { $0.frame.contains(NSPoint(x: card.midX, y: card.midY)) }
-        } ?? NSScreen.screens.first
-        let limit = screen.map { $0.visibleFrame.height - Self.widgetGap * 2 } ?? .greatestFiniteMagnitude
-        var height = points.height
-        while height < needed, height + Self.gridStep <= limit {
-            height += Self.gridStep
+        guard self.state.size == .automatic, !snapshot.tasks.isEmpty else {
+            return self.state.size.points
         }
-        let width = snapshot.tasks.isEmpty ? points.width : DesktopCardSize.extraLarge.points.width
-        return CGSize(width: width, height: height)
+        return DesktopCardSize.extraLarge.points
     }
 
     /// Resizes the card on the grid spot nearest where the user put it. The

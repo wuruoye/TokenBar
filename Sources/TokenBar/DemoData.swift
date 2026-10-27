@@ -1141,17 +1141,10 @@ enum DemoPreviewRenderer {
                 running: state.snapshot.running,
                 recent: state.snapshot.recent)
         }
-        // `automatic` widens while anything is unread and takes the shortest
-        // grid height that shows every row.
-        state.points = state.size.points
-        if state.size == .automatic {
-            if !state.snapshot.tasks.isEmpty {
-                state.points.width = DesktopCardSize.extraLarge.points.width
-            }
-            while state.points.height < DesktopCardView.automaticHeight(for: state.snapshot) {
-                state.points.height += 180
-            }
-        }
+        // `automatic` widens while anything is unread.
+        state.points = state.size == .automatic && !state.snapshot.tasks.isEmpty
+            ? DesktopCardSize.extraLarge.points
+            : state.size.points
         let content = DesktopCardView(
             state: state,
             open: { _, _ in },
