@@ -44,7 +44,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.badgeField.isHidden = true
         self.configureLabel(
             self.costField,
-            font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold))
+            font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold))
         self.costField.alignment = .right
         self.costField.lineBreakMode = .byClipping
         self.costField.cell?.truncatesLastVisibleLine = false
@@ -116,21 +116,18 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             height: 12)
 
         let availableRight = self.bounds.width - trailing - chevronWidth - chevronGap
-        let measuredTrailingWidth = ceil(
-            (self.trailingField.stringValue as NSString).size(withAttributes: [
-                .font: self.trailingField.font ?? NSFont.systemFont(ofSize: 10.5),
-            ]).width)
-        let trailingWidth = min(112, measuredTrailingWidth + 6)
-        let trailingX = availableRight - trailingWidth
-        self.trailingField.frame = NSRect(
-            x: trailingX,
-            y: 22,
-            width: trailingWidth,
-            height: 16)
 
-        let titleRight = self.trailingField.stringValue.isEmpty
-            ? availableRight
-            : trailingX - 8
+        // Top line: title and badge, with the cost at the right edge.
+        let hasCost = !self.costField.stringValue.isEmpty
+        let costWidth = hasCost
+            ? min(84, self.measuredWidth(self.costField) + 6)
+            : 0
+        self.costField.frame = NSRect(
+            x: availableRight - costWidth,
+            y: 21,
+            width: costWidth,
+            height: 17)
+        let titleRight = hasCost ? availableRight - costWidth - 8 : availableRight
         let titleAreaWidth = max(0, titleRight - leading)
         if self.badgeField.isHidden {
             self.titleField.frame = NSRect(
@@ -140,19 +137,10 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
                 height: 17)
             self.badgeField.frame = .zero
         } else {
-            let badgeHorizontalPadding: CGFloat = 14
-            let measuredBadgeWidth = ceil(
-                (self.badgeField.stringValue as NSString).size(withAttributes: [
-                    .font: self.badgeField.font ?? NSFont.systemFont(ofSize: 8.5),
-                ]).width) + badgeHorizontalPadding
-            let badgeWidth = min(50, measuredBadgeWidth)
+            let badgeWidth = min(50, self.measuredWidth(self.badgeField) + 12)
             let badgeGap: CGFloat = 6
             let maxTitleWidth = max(0, titleAreaWidth - badgeWidth - badgeGap)
-            let measuredTitleWidth = ceil(
-                (self.titleField.stringValue as NSString).size(withAttributes: [
-                    .font: self.titleField.font ?? NSFont.systemFont(ofSize: 12.5),
-                ]).width) + 6
-            let titleWidth = min(maxTitleWidth, measuredTitleWidth)
+            let titleWidth = min(maxTitleWidth, self.measuredWidth(self.titleField) + 6)
             self.titleField.frame = NSRect(
                 x: leading,
                 y: 21,
@@ -164,19 +152,17 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
                 width: badgeWidth,
                 height: 13)
         }
-        let hasCost = !self.costField.stringValue.isEmpty
-        let measuredCostWidth = hasCost
-            ? ceil((self.costField.stringValue as NSString).size(withAttributes: [
-                .font: self.costField.font ?? NSFont.systemFont(ofSize: 10.5),
-            ]).width) + 8
-            : 0
-        let costWidth = min(80, measuredCostWidth)
-        self.costField.frame = NSRect(
-            x: availableRight - costWidth,
+
+        // Bottom line: details, with the time at the right edge.
+        let trailingWidth = self.trailingField.stringValue.isEmpty
+            ? 0
+            : min(112, self.measuredWidth(self.trailingField) + 6)
+        self.trailingField.frame = NSRect(
+            x: availableRight - trailingWidth,
             y: 4,
-            width: costWidth,
+            width: trailingWidth,
             height: 15)
-        let detailRight = hasCost ? availableRight - costWidth - 4 : availableRight
+        let detailRight = trailingWidth > 0 ? availableRight - trailingWidth - 6 : availableRight
         self.detailField.frame = NSRect(
             x: leading,
             y: 4,
@@ -252,6 +238,12 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.isMenuHighlighted = highlighted
         self.updateColors()
         self.needsDisplay = true
+    }
+
+    private func measuredWidth(_ field: NSTextField) -> CGFloat {
+        ceil((field.stringValue as NSString).size(withAttributes: [
+            .font: field.font ?? NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+        ]).width)
     }
 
     private func configureLabel(_ field: NSTextField, font: NSFont) {

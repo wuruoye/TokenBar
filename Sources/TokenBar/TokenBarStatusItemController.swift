@@ -638,7 +638,12 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         }
         self.rootMenu.addItem(.separator())
 
-        self.rootMenu.addItem(.sectionHeader(title: "Recent Sessions"))
+        let sessionsHeader = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
+        sessionsHeader.view = FixedMenuHostingView(
+            rootView: AnyView(MenuSectionHeaderView(title: "Recent Sessions")),
+            width: Self.menuWidth,
+            height: MenuSectionHeaderView.height)
+        self.rootMenu.addItem(sessionsHeader)
         self.addSessionItems()
         self.rootMenu.addItem(.separator())
 

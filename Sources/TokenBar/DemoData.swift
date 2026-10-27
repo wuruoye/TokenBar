@@ -860,7 +860,7 @@ enum DemoPreviewRenderer {
             .scoped(to: model.scope.platform)
             .sessionMenu(limit: nil).visibleSessions ?? []).prefix(6))
         let separatorHeight: CGFloat = 11
-        let sectionHeaderHeight: CGFloat = 22
+        let sectionHeaderHeight = MenuSectionHeaderView.height
         let footerRows = 3
         let height = 12 + dashboardHeight + separatorHeight + sectionHeaderHeight
             + TokenMenuRowView.rowHeight * CGFloat(sessions.count)
@@ -885,13 +885,14 @@ enum DemoPreviewRenderer {
         dashboardView.image = dashboardRenderer.nsImage
         place(dashboardView, height: dashboardHeight)
         place(DemoMenuSeparatorView(), height: separatorHeight)
-        let sectionHeader = NSTextField(labelWithString: "Recent Sessions")
-        sectionHeader.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        sectionHeader.textColor = .secondaryLabelColor
-        let sectionHeaderContainer = NSView()
-        sectionHeaderContainer.addSubview(sectionHeader)
-        sectionHeader.frame = NSRect(x: 14, y: 3, width: width - 28, height: 16)
-        place(sectionHeaderContainer, height: sectionHeaderHeight)
+        let sectionHeaderRenderer = ImageRenderer(content: MenuSectionHeaderView(title: "Recent Sessions")
+            .frame(width: width, height: sectionHeaderHeight)
+            .environment(\.colorScheme, isDark ? .dark : .light))
+        sectionHeaderRenderer.scale = 2
+        let sectionHeader = NSImageView()
+        sectionHeader.imageScaling = .scaleAxesIndependently
+        sectionHeader.image = sectionHeaderRenderer.nsImage
+        place(sectionHeader, height: sectionHeaderHeight)
         for session in sessions {
             let row = TokenMenuRowView(width: width)
             row.configure(

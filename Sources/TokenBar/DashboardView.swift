@@ -2,13 +2,14 @@ import Charts
 import SwiftUI
 import TokenBarCore
 
-/// Card geometry shared by the dropdown. Card content starts 16pt from the menu edge,
-/// the same inset as native menu item text, and cards line up with row highlights.
+/// Geometry shared by the dropdown. Text starts 16pt from the menu edge like native
+/// menu items; panels sit 6pt in so their edges line up with row highlights.
 enum DashboardLayout {
-    static let cardInset: CGFloat = 6
-    static let cardPadding: CGFloat = 10
-    static let cardGap: CGFloat = 6
-    static let cardRadius: CGFloat = 10
+    static let textInset: CGFloat = 16
+    static let panelInset: CGFloat = 6
+    static let panelPadding: CGFloat = 10
+    static let panelRadius: CGFloat = 10
+    static let sectionGap: CGFloat = 14
 }
 
 struct DashboardSummaryView: View {
@@ -55,15 +56,12 @@ struct DashboardSummaryView: View {
 }
 
 struct DashboardOverviewView: View {
-    static let headerHeight: CGFloat = 40
-    static let stackedHeaderHeight: CGFloat = 62
+    static let headerHeight: CGFloat = 42
     static let compactHeaderHeight: CGFloat = 30
-    private static let unavailableWeeklyHeight: CGFloat = 20
-    fileprivate static let weeklyQuotaHeight: CGFloat = 76
-    fileprivate static let fiveHourQuotaHeight: CGFloat = 34
-    fileprivate static let resetCreditsHeight: CGFloat = 16
-    fileprivate static let quotaBlockSpacing: CGFloat = 12
-    static let todayHeight: CGFloat = 152
+    fileprivate static let gaugeRowHeight: CGFloat = 66
+    fileprivate static let resetCreditsHeight: CGFloat = 26
+    fileprivate static let quotaPlaceholderHeight: CGFloat = 20
+    static let todayHeight: CGFloat = 138
 
     @Bindable var model: DashboardModel
     let showsClaude: Bool
@@ -91,24 +89,21 @@ struct DashboardOverviewView: View {
         showsGrok: Bool,
         showsAntigravity: Bool) -> CGFloat
     {
-        switch DashboardScope.visibleScopes(
+        DashboardScope.visibleScopes(
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity).count
-        {
-        case ...1: self.compactHeaderHeight
-        case 2: self.headerHeight
-        default: self.stackedHeaderHeight
-        }
+            showsAntigravity: showsAntigravity).count > 1
+            ? self.headerHeight
+            : self.compactHeaderHeight
     }
 
     static func contentHeight(
         quota: QuotaSnapshot?,
         providesQuota: Bool = true) -> CGFloat
     {
-        (providesQuota ? self.quotaHeight(quota: quota) + DashboardLayout.cardGap : 0)
+        (providesQuota ? self.quotaHeight(quota: quota) + DashboardLayout.sectionGap : 0)
             + self.todayHeight
-            + DashboardLayout.cardGap
+            + DashboardLayout.sectionGap
     }
 
     static func quotaHeight(
@@ -116,16 +111,9 @@ struct DashboardOverviewView: View {
         hasFiveHour: Bool,
         hasResetCredits: Bool) -> CGFloat
     {
-        var blocks = [hasWeekly ? self.weeklyQuotaHeight : self.unavailableWeeklyHeight]
-        if hasFiveHour {
-            blocks.append(self.fiveHourQuotaHeight)
-        }
-        if hasResetCredits {
-            blocks.append(self.resetCreditsHeight)
-        }
-        return blocks.reduce(0, +)
-            + self.quotaBlockSpacing * CGFloat(blocks.count - 1)
-            + DashboardLayout.cardPadding * 2
+        (hasWeekly || hasFiveHour ? self.gaugeRowHeight : self.quotaPlaceholderHeight)
+            + (hasResetCredits ? self.resetCreditsHeight : 0)
+            + DashboardLayout.panelPadding * 2
     }
 
     static func quotaHeight(quota: QuotaSnapshot?) -> CGFloat {
@@ -157,6 +145,8 @@ struct DashboardOverviewView: View {
     }
 }
 
+// MARK: - Header
+
 struct DashboardHeaderView: View {
     @Bindable var model: DashboardModel
     let showsClaude: Bool
@@ -170,67 +160,59 @@ struct DashboardHeaderView: View {
             showsClaude: self.showsClaude,
             showsGrok: self.showsGrok,
             showsAntigravity: self.showsAntigravity)
-        Group {
-            switch scopes.count {
-            case ...1:
-                HStack(spacing: 8) {
-                    self.title
-                    Spacer(minLength: 8)
-                    self.status
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 7)
-            case 2:
-                HStack(spacing: 8) {
-                    self.selector(scopes: scopes, fillsWidth: false)
-                    Spacer(minLength: 8)
-                    self.status
-                }
-                .padding(.leading, DashboardLayout.cardInset)
-                .padding(.trailing, 16)
-                .padding(.top, 8)
-            default:
-                VStack(spacing: 6) {
-                    HStack(spacing: 8) {
-                        self.title
-                        Spacer(minLength: 8)
-                        self.status
-                    }
-                    .frame(height: 16)
-                    .padding(.horizontal, 10)
-                    self.selector(scopes: scopes, fillsWidth: true)
-                }
-                .padding(.horizontal, DashboardLayout.cardInset)
-                .padding(.top, 8)
-            }
-        }
-        .frame(maxHeight: .infinity, alignment: .top)
-    }
-
-    private var title: some View {
-        Text("TokenBar")
-            .font(.system(size: 13, weight: .semibold))
-    }
-
-    private var status: some View {
         HStack(spacing: 6) {
-            if self.model.isRefreshing {
-                ProgressView()
-                    .controlSize(.mini)
+            if scopes.count > 1 {
+                ForEach(scopes) { scope in
+                    PlatformTab(
+                        scope: scope,
+                        remainingPercent: self.weeklyRemaining(for: scope),
+                        isSelected: self.model.scope == scope,
+                        showsName: scopes.count <= 2 || self.model.scope == scope,
+                        accentColor: self.accentColor)
+                        .onTapGesture {
+                            self.select(scope)
+                        }
+                }
+            } else {
+                Text("TokenBar")
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.leading, DashboardLayout.textInset - DashboardLayout.panelInset)
             }
-            Text(self.updatedText)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            Spacer(minLength: 6)
+            if scopes.count <= 2 {
+                if self.model.isRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Text(self.updatedText)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .help(self.updatedHelp)
+            }
         }
+        .padding(.leading, DashboardLayout.panelInset)
+        .padding(.trailing, DashboardLayout.textInset)
+        .padding(.top, scopes.count > 1 ? 10 : 7)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .accessibilityElement(children: .contain)
     }
 
-    private func selector(scopes: [DashboardScope], fillsWidth: Bool) -> some View {
-        DashboardScopeSelector(
-            selection: self.model.scope,
-            scopes: scopes,
-            fillsWidth: fillsWidth)
-        { scope in
+    private func weeklyRemaining(for scope: DashboardScope) -> Double? {
+        guard self.model.providesQuota(for: scope.platform),
+              let weekly = self.model.quotaState(for: scope.platform).value?.weekly,
+              weekly.usageKnown
+        else {
+            return nil
+        }
+        return weekly.remainingPercent.clamped(to: 0 ... 100)
+    }
+
+    private func select(_ scope: DashboardScope) {
+        guard self.model.scope != scope else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
             if let onSelectScope = self.onSelectScope {
                 onSelectScope(scope)
             } else {
@@ -243,93 +225,22 @@ struct DashboardHeaderView: View {
         guard let date = self.model.activitySnapshot?.generatedAt else {
             return self.model.activity.isRefreshing ? "Refreshing…" : "Waiting for data"
         }
-        return "Updated \(date.compactPastText)"
+        return date.compactPastText
+    }
+
+    private var updatedHelp: String {
+        guard let date = self.model.activitySnapshot?.generatedAt else { return "" }
+        return "Activity updated \(date.formatted(date: .omitted, time: .shortened))"
     }
 }
 
-struct DashboardOverviewContentView: View {
-    @Bindable var model: DashboardModel
-    let usesWeekdayWeeklyPacing: Bool
-    let accentColor: Color
-
-    var body: some View {
-        let platform = self.model.scope.platform
-        let quotaState = self.model.quotaState(for: platform)
-        VStack(spacing: DashboardLayout.cardGap) {
-            if self.model.providesQuota(for: platform) {
-                QuotaCard(
-                    state: quotaState,
-                    activity: self.model.visibleActivity,
-                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                    accentColor: self.accentColor)
-                    .frame(height: DashboardOverviewView.quotaHeight(quota: quotaState.value))
-            }
-            TodayCard(
-                state: self.model.visibleActivity,
-                weeklyQuotaUsage: self.model.weeklyQuotaUsageToday(for: platform),
-                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                accentColor: self.accentColor)
-                .frame(height: DashboardOverviewView.todayHeight)
-        }
-        .padding(.bottom, DashboardLayout.cardGap)
-        .background(Color.clear)
-    }
-}
-
-/// Rounded, lightly filled panel that groups one topic in the dropdown.
-struct DashboardCard<Content: View>: View {
-    @ViewBuilder let content: Content
-
-    var body: some View {
-        self.content
-            .padding(DashboardLayout.cardPadding)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background {
-                let shape = RoundedRectangle(cornerRadius: DashboardLayout.cardRadius, style: .continuous)
-                shape
-                    .fill(Color.primary.opacity(0.045))
-                    .overlay(shape.strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5))
-            }
-            .padding(.horizontal, DashboardLayout.cardInset)
-    }
-}
-
-private struct DashboardScopeSelector: View {
-    let selection: DashboardScope
-    let scopes: [DashboardScope]
-    let fillsWidth: Bool
-    let onSelect: (DashboardScope) -> Void
-
-    var body: some View {
-        HStack(spacing: 2) {
-            ForEach(self.scopes) { scope in
-                DashboardScopeSegment(
-                    scope: scope,
-                    isSelected: self.selection == scope,
-                    fillsWidth: self.fillsWidth)
-                    .onTapGesture {
-                        guard self.selection != scope else { return }
-                        var transaction = Transaction(animation: nil)
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            self.onSelect(scope)
-                        }
-                    }
-            }
-        }
-        .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.primary.opacity(0.07)))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Platform")
-    }
-}
-
-private struct DashboardScopeSegment: View {
+/// Platform switch that also previews each platform's weekly headroom.
+private struct PlatformTab: View {
     let scope: DashboardScope
+    let remainingPercent: Double?
     let isSelected: Bool
-    let fillsWidth: Bool
+    let showsName: Bool
+    let accentColor: Color
 
     var body: some View {
         HStack(spacing: 5) {
@@ -339,68 +250,202 @@ private struct DashboardScopeSegment: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: 12, height: 12)
+                    .foregroundStyle(self.isSelected ? Color.primary : Color.secondary)
             }
-            Text(self.scope.displayName)
-                .font(.system(size: 11.5, weight: self.isSelected ? .semibold : .medium))
-                .lineLimit(1)
-                .minimumScaleFactor(0.85)
+            if self.showsName {
+                Text(self.scope.displayName)
+                    .font(.system(size: 12, weight: self.isSelected ? .semibold : .medium))
+                    .foregroundStyle(self.isSelected ? Color.primary : Color.secondary)
+                    .lineLimit(1)
+            }
+            if let remainingPercent {
+                Text("\(Int(remainingPercent.rounded()))%")
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(QuotaStatus(remainingPercent: remainingPercent).textColor(
+                        normal: self.isSelected ? .secondary : .tertiary))
+            }
         }
-        .foregroundStyle(self.isSelected ? Color.primary : Color.secondary)
-        .padding(.horizontal, self.fillsWidth ? 4 : 11)
-        .frame(maxWidth: self.fillsWidth ? .infinity : nil)
-        .frame(height: 22)
+        .padding(.horizontal, 10)
+        .frame(height: 26)
         .background {
             if self.isSelected {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(TokenBarVisualStyle.selectedSegmentColor)
-                    .shadow(color: .black.opacity(0.14), radius: 0.5, y: 0.5)
+                Capsule(style: .continuous)
+                    .fill(Color.primary.opacity(0.08))
             }
         }
-        .contentShape(Rectangle())
-        .accessibilityAddTraits(self.isSelected ? .isSelected : [])
+        .contentShape(Capsule())
+        .help(self.helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(self.isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var helpText: String {
+        guard let remainingPercent else { return self.scope.displayName }
+        return "\(self.scope.displayName): \(Int(remainingPercent.rounded()))% of the weekly quota left"
     }
 }
 
-private struct QuotaCard: View {
-    let state: DashboardSourceState<QuotaSnapshot>
-    let activity: DashboardSourceState<ActivitySnapshot>
+// MARK: - Overview
+
+struct DashboardOverviewContentView: View {
+    @Bindable var model: DashboardModel
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
     var body: some View {
-        DashboardCard {
-            VStack(alignment: .leading, spacing: DashboardOverviewView.quotaBlockSpacing) {
-                if let snapshot = self.state.value, let weekly = snapshot.weekly {
-                    WeeklyQuotaBlock(
-                        window: weekly,
-                        measuredAt: snapshot.updatedAt,
-                        activity: self.activity,
-                        warning: self.warningText(snapshot),
-                        usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                        accentColor: self.accentColor)
-                        .frame(height: DashboardOverviewView.weeklyQuotaHeight, alignment: .top)
+        let platform = self.model.scope.platform
+        let quotaState = self.model.quotaState(for: platform)
+        VStack(spacing: DashboardLayout.sectionGap) {
+            if self.model.providesQuota(for: platform) {
+                QuotaPanel(
+                    state: quotaState,
+                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                    accentColor: self.accentColor)
+                    .frame(height: DashboardOverviewView.quotaHeight(quota: quotaState.value))
+            }
+            TodaySection(
+                state: self.model.visibleActivity,
+                weeklyQuotaUsage: self.model.weeklyQuotaUsageToday(for: platform),
+                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                accentColor: self.accentColor)
+                .frame(height: DashboardOverviewView.todayHeight, alignment: .top)
+        }
+        .padding(.bottom, DashboardLayout.sectionGap)
+        .background(Color.clear)
+    }
+}
+
+/// Lightly filled rounded panel for instrument-style content.
+struct DashboardPanel<Content: View>: View {
+    var padding: CGFloat = DashboardLayout.panelPadding
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        self.content
+            .padding(self.padding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background {
+                RoundedRectangle(cornerRadius: DashboardLayout.panelRadius, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))
+            }
+    }
+}
+
+/// Small uppercase heading that opens each section.
+struct DashboardSectionLabel: View {
+    let title: String
+
+    var body: some View {
+        Text(self.title.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .tracking(0.6)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+    }
+}
+
+/// Menu item heading in the dashboard's section style.
+struct MenuSectionHeaderView: View {
+    static let height: CGFloat = 26
+
+    let title: String
+
+    var body: some View {
+        DashboardSectionLabel(title: self.title)
+            .padding(.horizontal, DashboardLayout.textInset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            .padding(.bottom, 6)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+// MARK: - Quota
+
+private enum QuotaStatus {
+    case healthy
+    case low
+    case critical
+
+    init(remainingPercent: Double) {
+        switch remainingPercent {
+        case ..<10: self = .critical
+        case ..<20: self = .low
+        default: self = .healthy
+        }
+    }
+
+    func fillColor(accentColor: Color) -> Color {
+        switch self {
+        case .healthy: accentColor
+        case .low: .orange
+        case .critical: .red
+        }
+    }
+
+    func textColor(normal: HierarchicalShapeStyle) -> AnyShapeStyle {
+        switch self {
+        case .healthy: AnyShapeStyle(normal)
+        case .low: AnyShapeStyle(Color.orange)
+        case .critical: AnyShapeStyle(Color.red)
+        }
+    }
+}
+
+private struct QuotaPanel: View {
+    let state: DashboardSourceState<QuotaSnapshot>
+    let usesWeekdayWeeklyPacing: Bool
+    let accentColor: Color
+
+    var body: some View {
+        let snapshot = self.state.value
+        DashboardPanel {
+            VStack(alignment: .leading, spacing: 0) {
+                if snapshot?.weekly != nil || snapshot?.session != nil {
+                    HStack(alignment: .center, spacing: 0) {
+                        if let snapshot, let weekly = snapshot.weekly {
+                            WeeklyGaugeBlock(
+                                window: weekly,
+                                measuredAt: snapshot.updatedAt,
+                                warning: self.warningText(snapshot),
+                                usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                                accentColor: self.accentColor)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if snapshot?.weekly != nil, snapshot?.session != nil {
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.08))
+                                .frame(width: 1, height: 48)
+                                .padding(.horizontal, 10)
+                        }
+                        if let fiveHour = snapshot?.session {
+                            FiveHourGaugeBlock(window: fiveHour, accentColor: self.accentColor)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .frame(height: DashboardOverviewView.gaugeRowHeight)
                 } else {
-                    QuotaTitleRow(
-                        title: "Weekly",
-                        detail: nil,
-                        remainingPercent: nil,
-                        placeholder: self.state.isRefreshing
-                            ? "Loading quota…"
-                            : "Quota unavailable",
-                        warning: self.state.errorMessage)
+                    HStack(spacing: 6) {
+                        Text(self.state.isRefreshing ? "Loading quota…" : "Quota unavailable")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                        if let errorMessage = self.state.errorMessage {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                                .help(errorMessage)
+                        }
+                    }
+                    .frame(height: DashboardOverviewView.quotaPlaceholderHeight)
                 }
 
-                if let fiveHour = self.state.value?.session {
-                    FiveHourQuotaBlock(window: fiveHour, accentColor: self.accentColor)
-                        .frame(height: DashboardOverviewView.fiveHourQuotaHeight, alignment: .top)
-                }
-
-                if let resetCredits = self.state.value?.resetCredits {
+                if let resetCredits = snapshot?.resetCredits {
                     ResetCreditsRow(snapshot: resetCredits)
-                        .frame(height: DashboardOverviewView.resetCreditsHeight)
+                        .frame(height: DashboardOverviewView.resetCreditsHeight, alignment: .bottom)
                 }
             }
         }
+        .padding(.horizontal, DashboardLayout.panelInset)
         .help(self.sourceText)
     }
 
@@ -429,75 +474,118 @@ private struct QuotaCard: View {
     }
 }
 
-private struct QuotaTitleRow: View {
-    let title: String
-    let detail: String?
-    let remainingPercent: Double?
-    var placeholder = "Usage unavailable"
-    var warning: String?
+/// Open ring that fills with the used share; weekly rings split into pacing segments
+/// and mark where linear usage would be.
+private struct QuotaGauge: View {
+    static let diameter: CGFloat = 62
+    private static let lineWidth: CGFloat = 7
+    private static let startAngle: Double = 150
+    private static let sweep: Double = 240
+
+    let usedPercent: Double?
+    let segmentCount: Int
+    let expectedPercent: Double?
+    let tint: Color
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Text(self.title)
-                .font(.system(size: 12, weight: .semibold))
-            if let detail {
-                Text(detail)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        let segments = max(1, self.segmentCount)
+        let gap: Double = segments > 1 ? 7 : 0
+        let segmentSweep = (Self.sweep - gap * Double(segments - 1)) / Double(segments)
+        ZStack {
+            ForEach(0 ..< segments, id: \.self) { index in
+                let start = Double(index) * (segmentSweep + gap)
+                self.arc(from: start, to: start + segmentSweep)
+                    .stroke(
+                        Color.primary.opacity(0.09),
+                        style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: segments > 1 ? .butt : .round))
+                let fill = self.fillFraction(index: index, segments: segments)
+                if fill > 0 {
+                    self.arc(from: start, to: start + segmentSweep * fill)
+                        .stroke(
+                            self.tint,
+                            style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: segments > 1 ? .butt : .round))
+                }
             }
-            if let warning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.orange)
-                    .help(warning)
-            }
-            Spacer(minLength: 6)
-            if let remainingPercent {
-                Text("\(Int(remainingPercent.rounded()))%")
-                    .font(.system(size: 17, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(QuotaTint.text(remainingPercent: remainingPercent))
-                Text("left")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-            } else {
-                InlinePlaceholder(text: self.placeholder)
+            if let expectedPercent {
+                let angle = Self.startAngle + self.angleOffset(
+                    percent: expectedPercent,
+                    segments: segments,
+                    segmentSweep: segmentSweep,
+                    gap: gap)
+                let radius = (Self.diameter - Self.lineWidth) / 2
+                Capsule()
+                    .fill(Color.primary.opacity(0.8))
+                    .frame(width: 2, height: Self.lineWidth + 6)
+                    .rotationEffect(.degrees(angle + 90))
+                    .offset(
+                        x: radius * cos(angle * .pi / 180),
+                        y: radius * sin(angle * .pi / 180))
             }
         }
-        .frame(height: 20)
+        .frame(width: Self.diameter, height: Self.diameter)
+    }
+
+    private func arc(from start: Double, to end: Double) -> some Shape {
+        GaugeArc(
+            startAngle: Self.startAngle + start,
+            endAngle: Self.startAngle + end,
+            inset: Self.lineWidth / 2)
+    }
+
+    private func fillFraction(index: Int, segments: Int) -> Double {
+        guard let usedPercent else { return 0 }
+        let used = usedPercent.clamped(to: 0 ... 100) / 100
+        return ((used - Double(index) / Double(segments)) * Double(segments)).clamped(to: 0 ... 1)
+    }
+
+    private func angleOffset(percent: Double, segments: Int, segmentSweep: Double, gap: Double) -> Double {
+        let position = (percent.clamped(to: 0 ... 100) / 100) * Double(segments)
+        let index = min(segments - 1, Int(position))
+        return Double(index) * (segmentSweep + gap) + (position - Double(index)) * segmentSweep
     }
 }
 
-private enum QuotaTint {
-    static func bar(remainingPercent: Double, accentColor: Color) -> Color {
-        switch remainingPercent {
-        case ..<10: .red
-        case ..<20: .orange
-        default: accentColor
-        }
-    }
+private struct GaugeArc: Shape {
+    let startAngle: Double
+    let endAngle: Double
+    let inset: CGFloat
 
-    static func text(remainingPercent: Double) -> Color {
-        switch remainingPercent {
-        case ..<10: .red
-        case ..<20: .orange
-        default: .primary
-        }
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.addArc(
+            center: CGPoint(x: rect.midX, y: rect.midY),
+            radius: min(rect.width, rect.height) / 2 - self.inset,
+            startAngle: .degrees(self.startAngle),
+            endAngle: .degrees(self.endAngle),
+            clockwise: false)
+        return path
     }
 }
 
-private struct WeeklyQuotaBlock: View {
+private struct GaugeCenterLabel: View {
+    let remainingPercent: Double?
+    let status: QuotaStatus
+
+    var body: some View {
+        VStack(spacing: -1) {
+            Text(self.remainingPercent.map { "\(Int($0.rounded()))%" } ?? "—")
+                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(self.status.textColor(normal: .primary))
+            Text("left")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
+        }
+        .offset(y: 2)
+    }
+}
+
+private struct WeeklyGaugeBlock: View {
     let window: QuotaWindowSnapshot
     let measuredAt: Date
-    let activity: DashboardSourceState<ActivitySnapshot>
     let warning: String?
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
-
-    private var remainingPercent: Double {
-        self.window.remainingPercent.clamped(to: 0 ... 100)
-    }
 
     private var pacing: WeeklyQuotaPacing? {
         guard let reset = self.window.resetsAt, reset > Date() else { return nil }
@@ -506,117 +594,57 @@ private struct WeeklyQuotaBlock: View {
             weekdaysOnly: self.usesWeekdayWeeklyPacing)
     }
 
-    private var cycleTotals: ActivityTotals? {
-        guard let pacing = self.pacing,
-              let summary = self.activity.value?.weeklySinceReset,
-              abs(summary.startedAt.timeIntervalSince(pacing.windowStart)) < 1
-        else {
-            return nil
-        }
-        return summary.totals
-    }
-
     var body: some View {
+        let remaining = self.window.usageKnown ? self.window.remainingPercent.clamped(to: 0 ... 100) : nil
+        let status = QuotaStatus(remainingPercent: remaining ?? 100)
         let pacing = self.pacing
-        let tint = QuotaTint.bar(remainingPercent: self.remainingPercent, accentColor: self.accentColor)
-        VStack(alignment: .leading, spacing: 0) {
-            QuotaTitleRow(
-                title: "Weekly",
-                detail: self.resetText,
-                remainingPercent: self.window.usageKnown ? self.remainingPercent : nil,
-                warning: self.warning)
-
-            Group {
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                QuotaGauge(
+                    usedPercent: remaining.map { 100 - $0 },
+                    segmentCount: pacing?.segmentCount ?? 1,
+                    expectedPercent: pacing?.expectedUsedPercent,
+                    tint: status.fillColor(accentColor: self.accentColor))
+                GaugeCenterLabel(remainingPercent: remaining, status: status)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text("Weekly")
+                        .font(.system(size: 12, weight: .semibold))
+                    if let warning {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.orange)
+                            .help(warning)
+                    }
+                }
+                Text(self.window.resetsAt.map { "Resets \($0.compactFutureText)" } ?? "Reset unknown")
+                    .foregroundStyle(.secondary)
                 if let pacing {
-                    WeeklyQuotaSegmentedBar(pacing: pacing, tint: tint)
-                } else {
-                    QuotaBar(
-                        usedPercent: self.window.usageKnown ? 100 - self.remainingPercent : 0,
-                        tint: tint)
-                        .frame(height: 8)
+                    Text(
+                        "\(pacing.weekdaysOnly ? "Workday" : "Day") "
+                            + "\(pacing.currentSegment) of \(pacing.segmentCount)")
+                        .foregroundStyle(.secondary)
+                    Text(self.paceText(pacing))
+                        .fontWeight(.medium)
+                        .foregroundStyle(self.paceColor(pacing))
                 }
             }
-            .frame(height: 12)
-            .padding(.top, 6)
-
-            self.paceRow(pacing)
-                .frame(height: 14)
-                .padding(.top, 6)
-
-            self.cycleRow
-                .frame(height: 14)
-                .padding(.top, 4)
+            .font(.system(size: 10.5))
+            .lineLimit(1)
+            .padding(.top, 2)
         }
         .help(pacing.map(self.helpText) ?? "")
+        .accessibilityElement(children: .combine)
     }
 
-    private func paceRow(_ pacing: WeeklyQuotaPacing?) -> some View {
-        HStack(spacing: 4) {
-            if let pacing {
-                Text(
-                    "\(pacing.weekdaysOnly ? "Workday" : "Day") "
-                        + "\(pacing.currentSegment)/\(pacing.segmentCount)"
-                        + " · \(Int(pacing.expectedUsedPercent.rounded()))% expected")
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 6)
-                Text(self.deltaText(pacing))
-                    .fontWeight(.medium)
-                    .foregroundStyle(self.deltaColor(pacing))
-            } else {
-                Text(self.window.usageKnown
-                    ? "\(Int((100 - self.remainingPercent).rounded()))% used"
-                    : "Usage unavailable")
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 6)
-            }
-        }
-        .font(.system(size: 10.5))
-        .lineLimit(1)
-    }
-
-    private var cycleRow: some View {
-        HStack(spacing: 4) {
-            Text("Since reset")
-                .foregroundStyle(.secondary)
-            if let totals = self.cycleTotals {
-                Text("· \(totals.sessionCount) sessions · \(totals.requestCount) turns")
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 6)
-                Text("\(totals.tokens.total.compactCount) tokens")
-                    .monospacedDigit()
-                Text(totals.costUsd.costText(tokenTotal: totals.tokens.total))
-                    .fontWeight(.semibold)
-                    .monospacedDigit()
-            } else {
-                Spacer(minLength: 6)
-                Text(self.cyclePlaceholder)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .font(.system(size: 10.5))
-        .lineLimit(1)
-        .minimumScaleFactor(0.85)
-    }
-
-    private var cyclePlaceholder: String {
-        if self.pacing == nil {
-            return "Waiting for a reset window"
-        }
-        return self.activity.isRefreshing ? "Calculating…" : "Unavailable"
-    }
-
-    private var resetText: String {
-        guard let reset = self.window.resetsAt, reset > Date() else { return "reset unavailable" }
-        return "resets \(reset.compactFutureText)"
-    }
-
-    private func deltaText(_ pacing: WeeklyQuotaPacing) -> String {
+    private func paceText(_ pacing: WeeklyQuotaPacing) -> String {
         let delta = pacing.deltaPercentagePoints
         guard abs(delta) >= 1 else { return "On pace" }
         return "\(Int(abs(delta).rounded()))pp \(delta > 0 ? "over" : "under") pace"
     }
 
-    private func deltaColor(_ pacing: WeeklyQuotaPacing) -> Color {
+    private func paceColor(_ pacing: WeeklyQuotaPacing) -> Color {
         let delta = pacing.deltaPercentagePoints
         if delta >= 1 {
             return .orange
@@ -635,109 +663,51 @@ private struct WeeklyQuotaBlock: View {
             : "Each segment is one seventh of the quota window. "
         return "Weekly cycle \(start) – \(end). \(paceDescription)"
             + "Used \(Int(pacing.actualUsedPercent.rounded()))%; "
-            + "linear pace \(Int(pacing.expectedUsedPercent.rounded()))%."
+            + "the marker shows linear pace at \(Int(pacing.expectedUsedPercent.rounded()))%."
     }
 }
 
-private struct WeeklyQuotaSegmentedBar: View {
-    let pacing: WeeklyQuotaPacing
-    let tint: Color
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack(alignment: .leading) {
-                HStack(spacing: 3) {
-                    ForEach(0 ..< self.pacing.segmentCount, id: \.self) { index in
-                        GeometryReader { segment in
-                            ZStack(alignment: .leading) {
-                                Rectangle()
-                                    .fill(TokenBarPalette.track)
-                                Rectangle()
-                                    .fill(self.tint)
-                                    .frame(width: segment.size.width * self.fillFraction(for: index))
-                            }
-                            .clipShape(RoundedRectangle(cornerRadius: 2.5, style: .continuous))
-                        }
-                    }
-                }
-                .frame(height: 8)
-
-                Capsule()
-                    .fill(Color.primary.opacity(0.75))
-                    .frame(width: 2, height: 12)
-                    .position(
-                        x: self.markerX(in: proxy.size.width),
-                        y: proxy.size.height / 2)
-            }
-        }
-        .frame(height: 12)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(self.accessibilityText)
-    }
-
-    private func fillFraction(for index: Int) -> Double {
-        let segmentPercent = 100 / Double(self.pacing.segmentCount)
-        let segmentStart = Double(index) * segmentPercent
-        return ((self.pacing.actualUsedPercent - segmentStart) / segmentPercent).clamped(to: 0 ... 1)
-    }
-
-    private func markerX(in width: CGFloat) -> CGFloat {
-        let raw = width * CGFloat(self.pacing.expectedUsedPercent / 100)
-        return raw.clamped(to: 1 ... max(1, width - 1))
-    }
-
-    private var accessibilityText: String {
-        let delta = self.pacing.deltaPercentagePoints
-        let comparison = abs(delta) < 1
-            ? "on pace"
-            : "\(Int(abs(delta).rounded())) percentage points \(delta > 0 ? "over" : "under") pace"
-        return "Weekly quota, \(Int(self.pacing.actualUsedPercent.rounded())) percent used, "
-            + "\(Int(self.pacing.expectedUsedPercent.rounded())) percent expected, \(comparison)."
-    }
-}
-
-/// Fills with the used share, like the weekly bar, so both quota bars read the same way.
-private struct QuotaBar: View {
-    let usedPercent: Double
-    let tint: Color
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack(alignment: .leading) {
-                Capsule().fill(TokenBarPalette.track)
-                Capsule()
-                    .fill(self.tint)
-                    .frame(width: proxy.size.width * self.usedPercent.clamped(to: 0 ... 100) / 100)
-            }
-        }
-    }
-}
-
-private struct FiveHourQuotaBlock: View {
+private struct FiveHourGaugeBlock: View {
     let window: QuotaWindowSnapshot
     let accentColor: Color
 
     var body: some View {
-        let remaining = self.window.remainingPercent.clamped(to: 0 ... 100)
-        VStack(alignment: .leading, spacing: 0) {
-            QuotaTitleRow(
-                title: "5-hour",
-                detail: self.resetText,
-                remainingPercent: self.window.usageKnown ? remaining : nil)
-            QuotaBar(
-                usedPercent: self.window.usageKnown ? 100 - remaining : 0,
-                tint: QuotaTint.bar(remainingPercent: remaining, accentColor: self.accentColor))
-                .frame(height: 8)
-                .padding(.top, 6)
+        let remaining = self.window.usageKnown ? self.window.remainingPercent.clamped(to: 0 ... 100) : nil
+        let status = QuotaStatus(remainingPercent: remaining ?? 100)
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                QuotaGauge(
+                    usedPercent: remaining.map { 100 - $0 },
+                    segmentCount: 1,
+                    expectedPercent: nil,
+                    tint: status.fillColor(accentColor: self.accentColor))
+                GaugeCenterLabel(remainingPercent: remaining, status: status)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("5-hour")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(self.resetText)
+                    .foregroundStyle(.secondary)
+                if let remaining {
+                    Text("\(Int((100 - remaining).rounded()))% used")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Usage unavailable")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 10.5))
+            .lineLimit(1)
+            .padding(.top, 2)
         }
         .accessibilityElement(children: .combine)
     }
 
     private var resetText: String {
         guard let reset = self.window.resetsAt, reset > Date() else {
-            return "reset unavailable"
+            return "Reset unknown"
         }
-        return "resets \(reset.compactFutureText)"
+        return "Resets \(reset.compactFutureText)"
     }
 }
 
@@ -745,31 +715,32 @@ private struct ResetCreditsRow: View {
     let snapshot: QuotaResetCreditsSnapshot
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Image(systemName: "arrow.counterclockwise.circle")
-                .font(.system(size: 10.5, weight: .medium))
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.counterclockwise")
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-            Text("Extra resets")
-                .font(.system(size: 12, weight: .semibold))
+            Text("\(self.snapshot.availableCount) extra \(self.snapshot.availableCount == 1 ? "reset" : "resets")")
+                .fontWeight(.medium)
+            Spacer(minLength: 6)
             if let expiration = self.snapshot.nextExpiresAt {
                 Text("next expires \(expiration.compactFutureText)")
-                    .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
-            Spacer(minLength: 6)
-            Text(self.countText)
-                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                .monospacedDigit()
         }
-    }
-
-    private var countText: String {
-        "\(self.snapshot.availableCount) available"
+        .font(.system(size: 10.5))
+        .lineLimit(1)
+        .padding(.top, 6)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+        }
     }
 }
 
-private struct TodayCard: View {
+// MARK: - Today
+
+private struct TodaySection: View {
     let state: DashboardSourceState<ActivitySnapshot>
     let weeklyQuotaUsage: WeeklyQuotaDailyUsage?
     let usesWeekdayWeeklyPacing: Bool
@@ -777,42 +748,204 @@ private struct TodayCard: View {
 
     var body: some View {
         let snapshot = self.state.value
-        let totals = snapshot?.today
-        DashboardCard {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text("Today")
-                        .font(.system(size: 12, weight: .semibold))
-                    if let totals {
-                        Text("\(totals.sessionCount) sessions · \(totals.requestCount) turns")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 6)
-                    if let totals {
-                        Text(totals.tokens.total.compactCount)
-                            .font(.system(size: 22, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                        Text("tokens")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                    } else {
-                        InlinePlaceholder(
-                            text: self.state.isRefreshing ? "Scanning activity…" : "No activity today")
-                    }
-                }
-                .frame(height: 26)
-
-                ActivityTotalsBreakdown(
-                    totals: totals ?? .empty,
-                    firstTokenText: totals?.menuAverageTTFTText ?? snapshot?.menuAverageTTFTText,
-                    speedText: totals?.menuAverageTPSText ?? snapshot?.menuAverageTPSText,
-                    weeklyQuotaUsage: self.weeklyQuotaUsage,
-                    usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                    accentColor: self.accentColor)
-                    .padding(.top, 8)
+        let totals = snapshot?.today ?? .empty
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                DashboardSectionLabel(title: "Today")
+                Spacer(minLength: 6)
+                Text(self.summaryText(snapshot?.today))
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            .padding(.horizontal, DashboardLayout.textInset)
+            .frame(height: 14)
+
+            HStack(spacing: 6) {
+                MetricTile(
+                    label: "Spent",
+                    value: totals.costUsd.costText(tokenTotal: totals.tokens.total))
+                MetricTile(label: "Tokens", value: totals.tokens.total.compactCount)
+                if let usage = self.weeklyQuotaUsage {
+                    MetricTile(
+                        label: "Of weekly",
+                        value: usage.menuValueText,
+                        tint: usage.tint(
+                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
+                            accentColor: self.accentColor))
+                        .help(usage.helpText(usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing))
+                } else {
+                    MetricTile(label: "Turns", value: "\(totals.requestCount)")
+                }
+            }
+            .frame(height: 52)
+            .padding(.horizontal, DashboardLayout.panelInset)
+            .padding(.top, 8)
+
+            TokenMixView(totals: totals)
+                .padding(.horizontal, DashboardLayout.textInset)
+                .padding(.top, 12)
+
+            PerformanceRow(
+                cacheText: totals.tokens.total > 0 ? totals.tokens.cachePercentageText : nil,
+                firstTokenText: snapshot?.today.menuAverageTTFTText ?? snapshot?.menuAverageTTFTText,
+                speedText: snapshot?.today.menuAverageTPSText ?? snapshot?.menuAverageTPSText)
+                .padding(.horizontal, DashboardLayout.textInset)
+                .padding(.top, 10)
+        }
+    }
+
+    private func summaryText(_ totals: ActivityTotals?) -> String {
+        guard let totals else {
+            return self.state.isRefreshing ? "Scanning activity…" : "No activity yet"
+        }
+        return "\(totals.sessionCount) sessions · \(totals.requestCount) turns"
+    }
+}
+
+private struct MetricTile: View {
+    let label: String
+    let value: String
+    var tint: Color?
+
+    var body: some View {
+        DashboardPanel(padding: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(self.label.uppercased())
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundStyle(.secondary)
+                Text(self.value)
+                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(self.tint ?? .primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .padding(.horizontal, DashboardLayout.textInset - DashboardLayout.panelInset)
+            .padding(.vertical, 8)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Thin proportional bar with an inline legend; per-type costs live in the tooltip.
+private struct TokenMixView: View {
+    let totals: ActivityTotals
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            TokenStackedBar(tokens: self.totals.tokens)
+                .frame(height: 5)
+            HStack(spacing: 0) {
+                ForEach(TokenKind.allCases, id: \.self) { kind in
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(kind.color)
+                            .frame(width: 6, height: 6)
+                        Text(kind.shortLabel)
+                            .foregroundStyle(.secondary)
+                        Text(kind.value(in: self.totals.tokens).compactCount)
+                            .monospacedDigit()
+                    }
+                    .frame(maxWidth: .infinity, alignment: kind == .input ? .leading : (kind == .reasoning ? .trailing : .center))
+                }
+            }
+            .font(.system(size: 10.5))
+            .lineLimit(1)
+        }
+        .help(self.costHelp)
+    }
+
+    private var costHelp: String {
+        guard let costs = self.totals.tokenCosts else { return "" }
+        return TokenKind.allCases.map { kind in
+            "\(kind.label): \(kind.value(in: self.totals.tokens).compactCount) · "
+                + kind.cost(in: costs).tokenComponentCostText
+        }
+        .joined(separator: "\n")
+    }
+}
+
+private struct PerformanceRow: View {
+    let cacheText: String?
+    let firstTokenText: String?
+    let speedText: String?
+
+    var body: some View {
+        HStack(spacing: 14) {
+            self.metric(symbol: "arrow.triangle.2.circlepath", value: self.cacheText, label: "cache hit")
+            self.metric(symbol: "timer", value: self.firstTokenText, label: "first token")
+            self.metric(symbol: "bolt", value: self.speedText, label: nil)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 10.5))
+        .lineLimit(1)
+    }
+
+    private func metric(symbol: String, value: String?, label: String?) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(.tertiary)
+            Text(value ?? "—")
+                .monospacedDigit()
+            if let label {
+                Text(label)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private enum TokenKind: CaseIterable {
+    case input
+    case output
+    case cache
+    case reasoning
+
+    var label: String {
+        switch self {
+        case .input: "Input"
+        case .output: "Output"
+        case .cache: "Cache"
+        case .reasoning: "Reasoning"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .input: "In"
+        case .output: "Out"
+        case .cache: "Cache"
+        case .reasoning: "Reason"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .input: TokenBarPalette.input
+        case .output: TokenBarPalette.output
+        case .cache: TokenBarPalette.cache
+        case .reasoning: TokenBarPalette.reasoning
+        }
+    }
+
+    func value(in tokens: TokenBreakdown) -> Int64 {
+        switch self {
+        case .input: tokens.displayedInput
+        case .output: tokens.output
+        case .cache: tokens.displayedCache
+        case .reasoning: tokens.reasoning
+        }
+    }
+
+    func cost(in costs: TokenCostBreakdown) -> Double {
+        switch self {
+        case .input: costs.displayedInput
+        case .output: costs.output
+        case .cache: costs.displayedCache
+        case .reasoning: costs.reasoning
         }
     }
 }
@@ -841,14 +974,11 @@ struct WeeklyQuotaUsageLabel: View {
     }
 }
 
-/// Token mix legend plus a labelled row of headline numbers; shared by the Today card
-/// and the activity detail submenu.
+/// Token mix with per-type costs and headline numbers, for the activity detail submenu.
 struct ActivityTotalsBreakdown: View {
     let totals: ActivityTotals
     let firstTokenText: String?
     let speedText: String?
-    var weeklyQuotaUsage: WeeklyQuotaDailyUsage?
-    var usesWeekdayWeeklyPacing = false
     let accentColor: Color
 
     var body: some View {
@@ -857,113 +987,82 @@ struct ActivityTotalsBreakdown: View {
                 .frame(height: 6)
 
             HStack(spacing: 16) {
-                TokenLegend(
-                    label: "Input",
-                    value: self.totals.tokens.displayedInput,
-                    costUsd: self.totals.tokenCosts?.displayedInput,
-                    color: TokenBarPalette.input)
-                TokenLegend(
-                    label: "Output",
-                    value: self.totals.tokens.output,
-                    costUsd: self.totals.tokenCosts?.output,
-                    color: TokenBarPalette.output)
+                TokenLegend(kind: .input, totals: self.totals)
+                TokenLegend(kind: .output, totals: self.totals)
             }
             .frame(height: 14)
             .padding(.top, 10)
             HStack(spacing: 16) {
-                TokenLegend(
-                    label: "Cache",
-                    value: self.totals.tokens.displayedCache,
-                    costUsd: self.totals.tokenCosts?.displayedCache,
-                    color: TokenBarPalette.cache)
-                TokenLegend(
-                    label: "Reasoning",
-                    value: self.totals.tokens.reasoning,
-                    costUsd: self.totals.tokenCosts?.reasoning,
-                    color: TokenBarPalette.reasoning)
+                TokenLegend(kind: .cache, totals: self.totals)
+                TokenLegend(kind: .reasoning, totals: self.totals)
             }
             .frame(height: 14)
             .padding(.top, 5)
 
-            Rectangle()
-                .fill(Color.primary.opacity(0.08))
-                .frame(height: 1)
-                .padding(.top, 10)
-
-            HStack(alignment: .top, spacing: 8) {
-                StatCell(
-                    value: self.totals.costUsd.costText(tokenTotal: self.totals.tokens.total),
-                    label: "cost")
-                if let usage = self.weeklyQuotaUsage {
-                    StatCell(
-                        value: usage.menuValueText,
-                        label: "weekly quota",
-                        tint: usage.tint(
-                            usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
-                            accentColor: self.accentColor))
-                        .help(usage.helpText(usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing))
-                }
-                StatCell(value: self.totals.tokens.cachePercentageText, label: "cache hit")
-                StatCell(value: self.firstTokenText ?? "—", label: "first token")
-                StatCell(
-                    value: self.speedText.map { $0.replacingOccurrences(of: " tok/s", with: "") } ?? "—",
-                    label: "tok/s")
+            HStack(spacing: 6) {
+                MetricTile(
+                    label: "Spent",
+                    value: self.totals.costUsd.costText(tokenTotal: self.totals.tokens.total))
+                MetricTile(label: "Cache hit", value: self.totals.tokens.cachePercentageText)
+                MetricTile(label: "First token", value: self.firstTokenText ?? "—")
+                MetricTile(
+                    label: "Tok/s",
+                    value: self.speedText.map { $0.replacingOccurrences(of: " tok/s", with: "") } ?? "—")
             }
-            .frame(height: 30)
-            .padding(.top, 8)
+            .frame(height: 52)
+            .padding(.top, 12)
         }
     }
 }
 
-private struct StatCell: View {
-    let value: String
-    let label: String
-    var tint: Color?
+private struct TokenLegend: View {
+    let kind: TokenKind
+    let totals: ActivityTotals
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(self.value)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(self.tint ?? .primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-            Text(self.label)
-                .font(.system(size: 9.5))
+        HStack(spacing: 5) {
+            Circle()
+                .fill(self.kind.color)
+                .frame(width: 6, height: 6)
+            Text(self.kind.label)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.85)
+            Spacer(minLength: 4)
+            Text(self.kind.value(in: self.totals.tokens).compactCount)
+                .monospacedDigit()
+            Text(self.totals.tokenCosts.map { self.kind.cost(in: $0).tokenComponentCostText } ?? "—")
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .frame(minWidth: 44, alignment: .trailing)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
+        .font(.system(size: 10.5))
+        .frame(maxWidth: .infinity)
+        .lineLimit(1)
     }
 }
 
 private struct TokenStackedBar: View {
     let tokens: TokenBreakdown
 
-    private var components: [TokenComponent] {
-        [
-            TokenComponent(id: "input", value: self.tokens.displayedInput, color: TokenBarPalette.input),
-            TokenComponent(id: "output", value: self.tokens.output, color: TokenBarPalette.output),
-            TokenComponent(id: "cache", value: self.tokens.displayedCache, color: TokenBarPalette.cache),
-            TokenComponent(id: "reasoning", value: self.tokens.reasoning, color: TokenBarPalette.reasoning),
-        ].filter { $0.value > 0 }
+    private var components: [(kind: TokenKind, value: Int64)] {
+        TokenKind.allCases
+            .map { ($0, $0.value(in: self.tokens)) }
+            .filter { $0.1 > 0 }
     }
 
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
-                Capsule().fill(TokenBarPalette.track)
+                Capsule().fill(Color.primary.opacity(0.09))
                 if self.tokens.total > 0 {
+                    let components = self.components
                     HStack(spacing: 1) {
-                        ForEach(self.components) { component in
+                        ForEach(components, id: \.kind) { component in
                             Rectangle()
-                                .fill(component.color)
+                                .fill(component.kind.color)
                                 .frame(
                                     width: max(
                                         2,
-                                        (proxy.size.width - CGFloat(max(0, self.components.count - 1)))
+                                        (proxy.size.width - CGFloat(max(0, components.count - 1)))
                                             * CGFloat(component.value) / CGFloat(self.tokens.total)))
                         }
                     }
@@ -974,47 +1073,10 @@ private struct TokenStackedBar: View {
     }
 }
 
-private struct TokenComponent: Identifiable {
-    let id: String
-    let value: Int64
-    let color: Color
-}
-
-private struct TokenLegend: View {
-    let label: String
-    let value: Int64
-    let costUsd: Double?
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(self.color)
-                .frame(width: 6, height: 6)
-            Text(self.label)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 4)
-            Text(self.value.compactCount)
-                .monospacedDigit()
-            Text(self.costText ?? "—")
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-                .frame(minWidth: 44, alignment: .trailing)
-        }
-        .font(.system(size: 10.5))
-        .frame(maxWidth: .infinity)
-        .lineLimit(1)
-    }
-
-    private var costText: String? {
-        guard let costUsd = self.costUsd, costUsd.isFinite, costUsd >= 0 else { return nil }
-        return costUsd.tokenComponentCostText
-    }
-}
+// MARK: - Activity
 
 struct ActivitySummarySection: View {
-    static let preferredHeight: CGFloat = 133
-    private static let cardHeight: CGFloat = 127
+    static let preferredHeight: CGFloat = 126
 
     let state: DashboardSourceState<ActivitySnapshot>
     let accentColor: Color
@@ -1024,31 +1086,30 @@ struct ActivitySummarySection: View {
         Array((self.state.value?.days ?? []).sorted { $0.date < $1.date }.suffix(30))
     }
 
-    private var lastSevenDays: [DailySummary] {
-        Array(self.days.suffix(7))
+    private var cycle: ActivityRangeSummary? {
+        self.state.value?.weeklySinceReset
+    }
+
+    /// First day of the current weekly quota cycle, in the statistics time zone the days use.
+    private var cycleStartDay: String? {
+        guard let cycle = self.cycle else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = TokenBarSettings.shared.statisticsTimeZone == .utc
+            ? TimeZone(identifier: "UTC")
+            : .autoupdatingCurrent
+        return formatter.string(from: cycle.startedAt)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            DashboardCard {
-                self.content
-            }
-            .frame(height: Self.cardHeight)
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var content: some View {
+        let cycleStartDay = self.cycleStartDay
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("Activity")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("30 days")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+                DashboardSectionLabel(title: "Last 30 days")
                 Spacer(minLength: 6)
                 Text(self.totalTokens.compactCount)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Text("tokens")
                     .font(.system(size: 10.5))
@@ -1060,7 +1121,7 @@ struct ActivitySummarySection: View {
                         .padding(.leading, 2)
                 }
             }
-            .frame(height: 18)
+            .frame(height: 14)
 
             ZStack {
                 Chart {
@@ -1068,10 +1129,7 @@ struct ActivitySummarySection: View {
                         BarMark(
                             x: .value("Day", day.date),
                             y: .value("Tokens", day.tokens.total))
-                            .foregroundStyle(
-                                day.id == self.days.last?.id
-                                    ? self.accentColor
-                                    : self.accentColor.opacity(0.5))
+                            .foregroundStyle(self.barColor(day, cycleStartDay: cycleStartDay))
                             .cornerRadius(2)
                     }
                     RuleMark(y: .value("Zero", 0))
@@ -1088,8 +1146,8 @@ struct ActivitySummarySection: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 52)
-            .padding(.top, 6)
+            .frame(height: 54)
+            .padding(.top, 10)
             .transaction { $0.animation = nil }
 
             HStack {
@@ -1102,47 +1160,51 @@ struct ActivitySummarySection: View {
             .frame(height: 11)
             .padding(.top, 3)
 
-            HStack(spacing: 4) {
-                Text("Last 7 days \(self.sevenDayTokens.compactCount)")
+            HStack(spacing: 5) {
+                if let cycle = self.cycle {
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(self.accentColor)
+                        .frame(width: 8, height: 8)
+                    Text("This cycle")
+                        .foregroundStyle(.secondary)
+                    Text(
+                        "\(cycle.totals.tokens.total.compactCount) · "
+                            + cycle.totals.costUsd.costText(tokenTotal: cycle.totals.tokens.total))
+                        .fontWeight(.medium)
+                        .monospacedDigit()
+                    Text("· \(cycle.totals.sessionCount) sessions")
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 6)
-                Text(
-                    "\(self.requestCount) turns · \(self.averageTokens.compactCount)/day"
-                        + " · Cache \(self.totalCachePercentageText)")
+                Text("Avg \(self.averageTokens.compactCount)/day")
+                    .foregroundStyle(.secondary)
             }
             .font(.system(size: 10.5))
-            .foregroundStyle(.secondary)
             .lineLimit(1)
             .minimumScaleFactor(0.85)
-            .frame(height: 13)
-            .padding(.top, 4)
+            .frame(height: 14)
+            .padding(.top, 6)
         }
+        .padding(.horizontal, DashboardLayout.textInset)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func barColor(_ day: DailySummary, cycleStartDay: String?) -> Color {
+        if day.id == self.days.last?.id {
+            return self.accentColor
+        }
+        if let cycleStartDay, day.date >= cycleStartDay {
+            return self.accentColor.opacity(0.55)
+        }
+        return Color.primary.opacity(0.16)
     }
 
     private var totalTokens: Int64 {
         self.days.reduce(0) { $0 + $1.tokens.total }
     }
 
-    private var sevenDayTokens: Int64 {
-        self.lastSevenDays.reduce(0) { $0 + $1.tokens.total }
-    }
-
     private var maximumTokens: Int64 {
         self.days.map(\.tokens.total).max() ?? 0
-    }
-
-    private var requestCount: Int {
-        self.days.reduce(0) { $0 + $1.requestCount }
-    }
-
-    private var totalCachePercentageText: String {
-        self.days.reduce(TokenBreakdown.zero) { total, day in
-            TokenBreakdown(
-                input: total.input.saturatingAdd(day.tokens.input),
-                output: total.output.saturatingAdd(day.tokens.output),
-                cacheRead: total.cacheRead.saturatingAdd(day.tokens.cacheRead),
-                cacheWrite: total.cacheWrite.saturatingAdd(day.tokens.cacheWrite),
-                reasoning: total.reasoning.saturatingAdd(day.tokens.reasoning))
-        }.cachePercentageText
     }
 
     private var averageTokens: Int64 {
@@ -1151,25 +1213,13 @@ struct ActivitySummarySection: View {
     }
 }
 
-private struct InlinePlaceholder: View {
-    let text: String
-
-    var body: some View {
-        Text(self.text)
-            .font(.system(size: 10.5))
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-    }
-}
-
-/// Token mix colors stay fixed so the user's accent theme never collides with a category.
+/// Fixed palette for token types so a user's accent theme never collides with a category.
 enum TokenBarPalette {
     static let input = Color(red: 0.26, green: 0.52, blue: 0.96)
     static let output = Color(red: 0.62, green: 0.42, blue: 0.92)
     static let cache = Color(red: 0.20, green: 0.68, blue: 0.60)
     static let reasoning = Color(red: 0.95, green: 0.62, blue: 0.22)
     static let positive = Color(red: 0.20, green: 0.66, blue: 0.48)
-    static let track = Color.primary.opacity(0.09)
 }
 
 private extension ActivityTotals {
