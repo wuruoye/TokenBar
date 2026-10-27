@@ -688,6 +688,13 @@ private struct DemoMemoryCounter {
     }
 }
 
+private final class DemoMenuSeparatorView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: 14, y: floor(self.bounds.midY), width: self.bounds.width - 28, height: 1).fill()
+    }
+}
+
 @MainActor
 enum DemoPreviewRenderer {
     static func render(model: DashboardModel, path: String) throws {
@@ -803,6 +810,131 @@ enum DemoPreviewRenderer {
         canvas.cacheDisplay(in: canvas.bounds, to: representation)
         guard let data = representation.representation(using: .png, properties: [:]) else { return }
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    /// Approximates the whole dropdown: dashboard, recent session rows and footer actions.
+    static func renderMenu(model: DashboardModel, path: String) throws {
+        let environment = ProcessInfo.processInfo.environment
+        if let rawScope = environment["TOKENBAR_DEMO_SCOPE"],
+           let scope = DashboardScope(rawValue: rawScope)
+        {
+            model.scope = scope
+        }
+        let showsGrok = environment["TOKENBAR_DEMO_SHOWS_GROK"] == "1"
+        let showsAntigravity = environment["TOKENBAR_DEMO_SHOWS_ANTIGRAVITY"] == "1"
+        let isDark = environment["TOKENBAR_DEMO_APPEARANCE"] == "dark"
+        let width: CGFloat = 384
+        let accentColor = Color.blue
+        let headerHeight = DashboardOverviewView.headerHeight(
+            showsClaude: true,
+            showsGrok: showsGrok,
+            showsAntigravity: showsAntigravity)
+        let overviewHeight = DashboardOverviewView.contentHeight(
+            quota: model.quotaState(for: model.scope.platform).value,
+            providesQuota: model.providesQuota(for: model.scope.platform))
+        let activityHeight = ActivitySummarySection.preferredHeight
+        let dashboardHeight = headerHeight + overviewHeight + activityHeight
+        let dashboard = VStack(spacing: 0) {
+            DashboardHeaderView(
+                model: model,
+                showsClaude: true,
+                showsGrok: showsGrok,
+                showsAntigravity: showsAntigravity,
+                accentColor: accentColor,
+                onSelectScope: nil)
+                .frame(height: headerHeight)
+            DashboardOverviewContentView(
+                model: model,
+                usesWeekdayWeeklyPacing: true,
+                accentColor: accentColor)
+                .frame(height: overviewHeight)
+            ActivitySummarySection(
+                state: model.visibleActivity,
+                accentColor: accentColor,
+                showsChevron: true)
+                .frame(height: activityHeight)
+        }
+        .frame(width: width, height: dashboardHeight, alignment: .top)
+
+        let sessions = Array((model.activitySnapshot?
+            .scoped(to: model.scope.platform)
+            .sessionMenu(limit: nil).visibleSessions ?? []).prefix(6))
+        let separatorHeight: CGFloat = 11
+        let sectionHeaderHeight: CGFloat = 22
+        let footerRows = 3
+        let height = 12 + dashboardHeight + separatorHeight + sectionHeaderHeight
+            + TokenMenuRowView.rowHeight * CGFloat(sessions.count)
+            + separatorHeight
+            + PersistentMenuActionRowView.rowHeight * CGFloat(footerRows)
+            + 6
+        let canvas = DemoRowPreviewCanvas(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        canvas.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+        var y = height - 6
+
+        func place(_ view: NSView, height: CGFloat) {
+            y -= height
+            view.frame = NSRect(x: 0, y: y, width: width, height: height)
+            canvas.addSubview(view)
+        }
+
+        let dashboardRenderer = ImageRenderer(
+            content: dashboard.environment(\.colorScheme, isDark ? .dark : .light))
+        dashboardRenderer.scale = 2
+        let dashboardView = NSImageView()
+        dashboardView.imageScaling = .scaleAxesIndependently
+        dashboardView.image = dashboardRenderer.nsImage
+        place(dashboardView, height: dashboardHeight)
+        place(DemoMenuSeparatorView(), height: separatorHeight)
+        let sectionHeader = NSTextField(labelWithString: "Recent Sessions")
+        sectionHeader.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        sectionHeader.textColor = .secondaryLabelColor
+        let sectionHeaderContainer = NSView()
+        sectionHeaderContainer.addSubview(sectionHeader)
+        sectionHeader.frame = NSRect(x: 14, y: 3, width: width - 28, height: 16)
+        place(sectionHeaderContainer, height: sectionHeaderHeight)
+        for session in sessions {
+            let row = TokenMenuRowView(width: width)
+            row.configure(
+                title: session.menuDisplayTitle,
+                cost: session.menuCostText,
+                detail: session.menuDetail,
+                trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
+                showsChevron: true,
+                badge: session.menuServiceTierBadge)
+            place(row, height: TokenMenuRowView.rowHeight)
+        }
+        place(DemoMenuSeparatorView(), height: separatorHeight)
+        let footerItems: [(String, String?, String)] = [
+            ("Refresh Now", "arrow.clockwise", "⌘R"),
+            ("Settings…", "gearshape", "⌘,"),
+            ("Quit TokenBar", "power", "⌘Q"),
+        ]
+        for (title, symbol, shortcut) in footerItems {
+            guard let symbol else {
+                // Native item without an image: the title starts at the menu's text inset.
+                let row = PersistentMenuActionRowView(
+                    width: width,
+                    title: "",
+                    systemImageName: "",
+                    shortcut: shortcut,
+                    accessibilityHelp: title)
+                let label = NSTextField(labelWithString: title)
+                label.font = .menuFont(ofSize: 0)
+                label.frame = NSRect(x: 14, y: 4, width: 200, height: 18)
+                row.addSubview(label)
+                place(row, height: PersistentMenuActionRowView.rowHeight)
+                continue
+            }
+            place(
+                PersistentMenuActionRowView(
+                    width: width,
+                    title: title,
+                    systemImageName: symbol,
+                    shortcut: shortcut,
+                    accessibilityHelp: title),
+                height: PersistentMenuActionRowView.rowHeight)
+        }
+        try self.render(view: canvas, scale: 2, path: path)
     }
 
     static func renderActivityDetail(model: DashboardModel, path: String) throws {
@@ -997,7 +1129,7 @@ private final class DemoRowPreviewCanvas: NSView {
     }
 }
 
-private struct DemoActivitySyncCredentialStore: ActivitySyncCredentialStoring {
+struct DemoActivitySyncCredentialStore: ActivitySyncCredentialStoring {
     func loadToken() throws -> String? { "demo-token" }
     func saveToken(_: String?) throws {}
 }

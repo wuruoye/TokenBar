@@ -69,7 +69,8 @@ struct ActivityDetailView: View {
             if let totals = self.rangeTotals {
                 ActivityTotalsBreakdown(
                     totals: totals,
-                    performanceText: totals.menuPerformanceText,
+                    firstTokenText: totals.menuAverageTTFTText,
+                    speedText: totals.menuAverageTPSText,
                     accentColor: self.accentColor)
             }
             Divider()
@@ -218,8 +219,8 @@ struct ActivityDetailView: View {
                             .font(.system(size: 13, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                         Text(day.costUsd.costText(tokenTotal: day.tokens.total))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
                     }
                     if let weeklyQuotaUsage {
                         WeeklyQuotaUsageLabel(
@@ -304,8 +305,8 @@ private struct ActivityModelRow: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                 Text(self.usage.costUsd.costText(tokenTotal: self.usage.tokens.total))
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(TokenBarVisualStyle.costAccentColor)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .monospacedDigit()
             }
 
             GeometryReader { proxy in

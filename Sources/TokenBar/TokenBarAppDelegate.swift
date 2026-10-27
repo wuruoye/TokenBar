@@ -4,7 +4,9 @@ import TokenBarCore
 @MainActor
 final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     let memoryTelemetryController = MemoryTelemetryController()
-    let activitySyncController = ActivitySyncController(settings: .shared)
+    let activitySyncController = ActivitySyncController(
+        settings: .shared,
+        credentials: TokenBarAppDelegate.activitySyncCredentials())
     private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private let openRouterPricingCatalog = OpenRouterPricingCatalogUpdater()
@@ -58,6 +60,20 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var previewTask: Task<Void, Never>?
 
+    /// Debug previews and demo runs are unsigned builds, so reading the real
+    /// Keychain item would ask the user for their password.
+    private static func activitySyncCredentials() -> any ActivitySyncCredentialStoring {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if environment["TOKENBAR_DEMO_MODE"] == "1"
+            || environment.keys.contains(where: { $0.hasPrefix("TOKENBAR_RENDER_") })
+        {
+            return DemoActivitySyncCredentialStore()
+        }
+        #endif
+        return KeychainActivitySyncCredentialStore()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
         let environment = ProcessInfo.processInfo.environment
@@ -66,6 +82,15 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 await self.model.start()
                 try? DemoPreviewRenderer.render(model: self.model, path: previewPath)
+                NSApplication.shared.terminate(nil)
+            }
+            return
+        }
+        if let previewPath = environment["TOKENBAR_RENDER_MENU_PREVIEW"] {
+            self.previewTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.model.start()
+                try? DemoPreviewRenderer.renderMenu(model: self.model, path: previewPath)
                 NSApplication.shared.terminate(nil)
             }
             return

@@ -45,6 +45,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.configureLabel(
             self.costField,
             font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold))
+        self.costField.alignment = .right
         self.costField.lineBreakMode = .byClipping
         self.costField.cell?.truncatesLastVisibleLine = false
         self.configureLabel(
@@ -102,7 +103,8 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
     override func layout() {
         super.layout()
 
-        let leading: CGFloat = 16
+        // Label cells inset text by 2pt, so 14 lines text up with the dashboard's 16pt edge.
+        let leading: CGFloat = 14
         let trailing: CGFloat = 14
         let chevronWidth: CGFloat = self.showsChevron ? 8 : 0
         let chevronGap: CGFloat = self.showsChevron ? 10 : 0
@@ -168,17 +170,17 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
                 .font: self.costField.font ?? NSFont.systemFont(ofSize: 10.5),
             ]).width) + 8
             : 0
-        let costWidth = min(72, measuredCostWidth)
+        let costWidth = min(80, measuredCostWidth)
         self.costField.frame = NSRect(
-            x: leading,
+            x: availableRight - costWidth,
             y: 4,
             width: costWidth,
             height: 15)
-        let detailX = hasCost ? leading + costWidth - 6 : leading
+        let detailRight = hasCost ? availableRight - costWidth - 4 : availableRight
         self.detailField.frame = NSRect(
-            x: detailX,
+            x: leading,
             y: 4,
-            width: max(0, availableRight - detailX),
+            width: max(0, detailRight - leading),
             height: 15)
     }
 
@@ -235,7 +237,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.badgeField.isHidden = badge == nil
         self.costField.stringValue = cost ?? ""
         self.costField.isHidden = cost == nil
-        self.detailField.stringValue = cost == nil ? detail : "· \(detail)"
+        self.detailField.stringValue = detail
         self.trailingField.stringValue = trailing
         self.showsChevron = showsChevron
         self.chevronView.isHidden = !showsChevron
@@ -276,7 +278,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             self.badgeField.textColor = badgeAccent
             self.badgeField.backgroundColor = badgeAccent.withAlphaComponent(0.13)
             self.badgeField.layer?.borderColor = badgeAccent.withAlphaComponent(0.26).cgColor
-            self.costField.textColor = TokenBarVisualStyle.costAccentNSColor
+            self.costField.textColor = .labelColor
             self.detailField.textColor = .secondaryLabelColor
             self.trailingField.textColor = .secondaryLabelColor
             self.chevronView.contentTintColor = .tertiaryLabelColor

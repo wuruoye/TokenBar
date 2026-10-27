@@ -3,7 +3,8 @@ import SwiftUI
 import TokenBarCore
 
 struct MemorySummarySection: View {
-    static let preferredHeight: CGFloat = 114
+    static let preferredHeight: CGFloat = 122
+    private static let cardHeight: CGFloat = 116
 
     let usage: MemoryUsageSnapshot?
     let receiverState: MemoryReceiverState
@@ -15,6 +16,16 @@ struct MemorySummarySection: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            DashboardCard {
+                self.content
+            }
+            .frame(height: Self.cardHeight)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Codex Memory")
@@ -60,8 +71,6 @@ struct MemorySummarySection: View {
             .font(.system(size: 9.5))
             .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
     }
 
     private func phaseSummary(

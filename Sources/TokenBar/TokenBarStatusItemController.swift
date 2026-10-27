@@ -592,7 +592,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         overviewItem.isEnabled = true
         self.rootMenu.addItem(overviewItem)
 
-        let activityHeight = ActivitySummarySection.preferredHeight + 1
+        let activityHeight = ActivitySummarySection.preferredHeight
         let activity = MenuActivitySummaryView(
             model: self.model,
             accentColor: accentColor)
@@ -613,7 +613,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.rootMenu.addItem(activityItem)
 
         if self.settings.monitorsCodexMemory {
-            let memoryHeight = MemorySummarySection.preferredHeight + 1
+            let memoryHeight = MemorySummarySection.preferredHeight
             let memory = MenuMemorySummaryView(
                 model: self.model,
                 telemetry: self.memoryTelemetry,
@@ -669,6 +669,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let quit = NSMenuItem(title: "Quit TokenBar", action: #selector(self.quit), keyEquivalent: "q")
         quit.target = self
         quit.keyEquivalentModifierMask = [.command]
+        quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         self.rootMenu.addItem(quit)
     }
 
@@ -1669,13 +1670,10 @@ private struct MenuActivitySummaryView: View {
     let accentColor: Color
 
     var body: some View {
-        VStack(spacing: 0) {
-            Divider().padding(.horizontal, 12)
-            ActivitySummarySection(
-                state: self.model.visibleActivity,
-                accentColor: self.accentColor,
-                showsChevron: true)
-        }
+        ActivitySummarySection(
+            state: self.model.visibleActivity,
+            accentColor: self.accentColor,
+            showsChevron: true)
     }
 }
 
@@ -1685,14 +1683,11 @@ private struct MenuMemorySummaryView: View {
     let accentColor: Color
 
     var body: some View {
-        VStack(spacing: 0) {
-            Divider().padding(.horizontal, 12)
-            MemorySummarySection(
-                usage: self.model.visibleActivitySnapshot?.memoryUsage,
-                receiverState: self.telemetry.receiverState,
-                configurationState: self.telemetry.configurationState,
-                accentColor: self.accentColor)
-        }
+        MemorySummarySection(
+            usage: self.model.visibleActivitySnapshot?.memoryUsage,
+            receiverState: self.telemetry.receiverState,
+            configurationState: self.telemetry.configurationState,
+            accentColor: self.accentColor)
     }
 }
 

@@ -106,7 +106,7 @@ final class PersistentMenuActionRowView: NSView, TokenMenuHighlighting {
         self.shortcutField.isHidden = !hasShortcut
         self.shortcutField.frame = NSRect(x: self.bounds.width - 58, y: 5, width: 42, height: 16)
         self.titleField.frame = NSRect(
-            x: 36,
+            x: 34,
             y: 4,
             width: self.bounds.width - (hasShortcut ? 102 : 52),
             height: 18)
