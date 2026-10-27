@@ -104,8 +104,9 @@ final class DesktopUnreadTurnReader {
     }
 
     /// A finished Claude turn ends with an assistant message that stopped for a
-    /// reason other than a tool call. Tool results, prompts, and a reply still
-    /// streaming belong to a turn in progress.
+    /// reason other than a tool call, or with the result of a tool that ends
+    /// the turn. Other tool results, prompts, and a reply still streaming
+    /// belong to a turn in progress.
     func claudeTurnIsRunning(transcript: URL) -> Bool {
         var isRunning = false
         Self.scanBackward(in: transcript, markers: ["\"type\":\"user\"", "\"type\":\"assistant\""].map { Data($0.utf8) }) { line in
@@ -122,6 +123,12 @@ final class DesktopUnreadTurnReader {
                 isRunning = stopReason == nil || stopReason == "tool_use"
                 return true
             case "user":
+                // A tool can end the turn with its result, without another reply.
+                let meta = (object["mcpMeta"] as? [String: Any])?["_meta"] as? [String: Any]
+                if meta?["claude/endTurn"] as? Bool == true {
+                    isRunning = false
+                    return true
+                }
                 // Interruptions and local slash commands end or bypass a turn.
                 if let text = (message["content"] as? String) ?? Self.textBlocks(message["content"]) {
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
