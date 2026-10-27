@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 import TokenBarCore
 
+/// Settings closes as soon as it loses focus, like a menu bar panel.
 @MainActor
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let loginItem: LoginItemController
 
     init(
@@ -30,6 +31,7 @@ final class SettingsWindowController: NSWindowController {
         window.setContentSize(NSSize(width: 480, height: 820))
         window.center()
         super.init(window: window)
+        window.delegate = self
     }
 
     @available(*, unavailable)
@@ -45,5 +47,18 @@ final class SettingsWindowController: NSWindowController {
         self.showWindow(nil)
         self.window?.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        guard let window = self.window, window.isVisible else { return }
+        // A sheet or child window, such as a text field's completion list,
+        // takes focus without leaving Settings.
+        if window.attachedSheet != nil { return }
+        if let keyWindow = NSApplication.shared.keyWindow,
+           keyWindow.sheetParent === window || keyWindow.parent === window
+        {
+            return
+        }
+        window.close()
     }
 }

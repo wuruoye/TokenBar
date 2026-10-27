@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(name: "TokenBarCore", targets: ["TokenBarCore"]),
         .executable(name: "TokenBar", targets: ["TokenBar"]),
+        .executable(name: "TokenBarWidget", targets: ["TokenBarWidget"]),
     ],
     dependencies: [
         .package(
@@ -22,10 +23,17 @@ let package = Package(
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
             ]),
+        .target(
+            name: "TokenBarWidgetData",
+            dependencies: [],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]),
         .executableTarget(
             name: "TokenBar",
             dependencies: [
                 "TokenBarCore",
+                "TokenBarWidgetData",
                 .product(name: "Vortex", package: "Vortex"),
             ],
             resources: [
@@ -33,5 +41,21 @@ let package = Package(
             ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
+            ]),
+        // `package_app.sh` wraps this executable in the app's WidgetKit extension.
+        .executableTarget(
+            name: "TokenBarWidget",
+            dependencies: ["TokenBarWidgetData"],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+                .unsafeFlags(["-application-extension"]),
+            ],
+            // Like Xcode's extension targets, start in Foundation's extension
+            // entry point, which sets up the extension before calling `@main`.
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-application_extension",
+                    "-Xlinker", "-e", "-Xlinker", "_NSExtensionMain",
+                ]),
             ]),
     ])

@@ -42,6 +42,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private let requestDetailService: any RequestDetailProviding
     private let sessionLauncher: SessionLauncher
     private let unreadTasks: DesktopUnreadTaskMonitor
+    private let unreadWidget: UnreadWidgetPublisher
+    private var desktopCard: DesktopCardController?
     private let showSettingsAction: () -> Void
     private let statusItem: NSStatusItem
     private let rootMenu = TokenBarMenu()
@@ -101,6 +103,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.requestDetailService = requestDetailService
         self.sessionLauncher = sessionLauncher
         self.unreadTasks = unreadTasks
+        self.unreadWidget = UnreadWidgetPublisher(unreadTasks: unreadTasks, settings: settings)
         self.syncSettingsSignature = SyncSettingsSignature(
             settings,
             activitySync: activitySync)
@@ -130,6 +133,15 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     func start() {
         self.unreadTasks.start()
+        self.unreadWidget.start()
+        let desktopCard = DesktopCardController(
+            unreadTasks: self.unreadTasks,
+            settings: self.settings,
+            openTask: { [weak self] platform, id in
+                self?.openUnreadTask(platform: platform, id: id)
+            })
+        self.desktopCard = desktopCard
+        desktopCard.start()
         self.startupTask = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.model.start()
@@ -147,6 +159,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     }
 
     func tearDown() {
+        self.desktopCard?.stop()
+        self.desktopCard = nil
+        self.unreadWidget.stop()
         self.unreadTasks.stop()
         self.startupTask?.cancel()
         self.startupTask = nil
@@ -1593,14 +1608,28 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         do {
             try self.sessionLauncher.open(session)
         } catch {
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Couldn’t Open Session"
-            alert.informativeText = error.localizedDescription
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            self.showOpenSessionError(error)
         }
+    }
+
+    /// Opens a task clicked in the widget the way the Codex or Claude task
+    /// notification opens it.
+    func openUnreadTask(platform: TokenPlatform, id: String) {
+        do {
+            try self.sessionLauncher.openUnreadTask(platform: platform, id: id)
+        } catch {
+            self.showOpenSessionError(error)
+        }
+    }
+
+    private func showOpenSessionError(_ error: any Error) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t Open Session"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     @objc private func copyRequest(_ sender: NSMenuItem) {
