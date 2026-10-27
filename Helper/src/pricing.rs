@@ -43,8 +43,9 @@ struct AnthropicModelRate {
 
 /// TokenBar's bundled Codex pricing catalog.
 ///
-/// Rates are standard API text-token prices in USD per million tokens, last
-/// reviewed 2026-09-05 against OpenAI's official pricing table. TokenBar can
+/// Rates are standard API text-token prices in USD per million tokens, reviewed
+/// 2026-09-05 against OpenAI's official pricing table; GPT-6.1 Sol was reviewed
+/// 2026-10-14. TokenBar can
 /// overlay a strictly validated daily copy of that table. A model without an
 /// official, OpenRouter, or bundled rate returns `None`; callers must keep that request's
 /// cost source unknown instead of presenting a fabricated $0.
@@ -54,7 +55,7 @@ struct AnthropicModelRate {
 /// GPT-5.3-Codex's public rate. Recognized OpenAI model ids keep their estimate
 /// even when a local Codex gateway records a custom provider name.
 ///
-/// GPT-5.4, GPT-5.5, and GPT-5.6 apply their explicit long-context table row
+/// GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6.1 Sol apply their explicit long-context table row
 /// to each request whose raw input exceeds 272K tokens. GPT-6 Astra applies
 /// its long-context table row for API Priority sessions, while ChatGPT subscription
 /// sessions keep short-context rates across all prompt lengths.
@@ -832,9 +833,9 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
     normalized
 }
 
-/// Official Fast multipliers reviewed 2026-09-05:
-/// - ChatGPT subscription credits: GPT-5.4 is 2x; GPT-5.5/5.6 and GPT-6 Astra are 2.5x.
-/// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6 and GPT-6 Astra are 2x.
+/// Official Fast multipliers reviewed 2026-09-05; GPT-6.1 Sol reviewed 2026-10-14:
+/// - ChatGPT subscription credits: GPT-5.4 is 2x; GPT-5.5/5.6, GPT-6 Astra, and GPT-6.1 Sol are 2.5x.
+/// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6, GPT-6 Astra, and GPT-6.1 Sol are 2x.
 ///
 /// Sources:
 /// - https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode
@@ -845,6 +846,8 @@ fn fast_cost_multiplier(model_id: &str, basis: FastPricingBasis) -> Option<f64> 
     match (basis, normalized.as_str()) {
         (FastPricingBasis::ChatGptSubscription, "gpt-6-astra") => Some(2.5),
         (FastPricingBasis::ApiPriority, "gpt-6-astra") => Some(2.0),
+        (FastPricingBasis::ChatGptSubscription, "gpt-6.1-sol") => Some(2.5),
+        (FastPricingBasis::ApiPriority, "gpt-6.1-sol") => Some(2.0),
         (_, "gpt-5.4") => Some(2.0),
         (_, "gpt-5.5") => Some(2.5),
         (FastPricingBasis::ChatGptSubscription, "gpt-5.6" | "gpt-5.6-sol") => Some(2.5),
@@ -858,6 +861,19 @@ fn fast_cost_multiplier(model_id: &str, basis: FastPricingBasis) -> Option<f64> 
 fn bundled_rate_for_model(model_id: &str) -> Option<ModelRate> {
     let normalized = normalize_pricing_model_id(model_id);
     match normalized.as_str() {
+        "gpt-6.1-sol" => Some(ModelRate {
+            input_per_million: 2.0,
+            cached_input_per_million: 0.1,
+            output_per_million: 10.0,
+            cache_write_per_million: Some(2.5),
+            long_context: Some(LongContextRate {
+                input_per_million: 4.0,
+                cached_input_per_million: 0.2,
+                output_per_million: 15.0,
+                cache_write_per_million: Some(5.0),
+            }),
+            long_context_available: true,
+        }),
         "gpt-6-astra" => Some(ModelRate {
             input_per_million: 10.0,
             cached_input_per_million: 1.0,
@@ -1001,7 +1017,8 @@ pub(crate) fn normalize_pricing_model_id(model_id: &str) -> String {
         }
     }
 
-    const BASE_MODELS: [&str; 20] = [
+    const BASE_MODELS: [&str; 21] = [
+        "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-5.1-codex-mini",
         "gpt-5.1-codex-max",
