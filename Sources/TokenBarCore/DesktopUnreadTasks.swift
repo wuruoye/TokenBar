@@ -1263,6 +1263,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                       self.turns.claudeTranscriptURL(
                           cliSessionID: $0,
                           workspacePath: session.workspacePath,
+                          activeAt: session.lastActivityAt,
                           projectsDirectory: self.reader.claudeProjectsDirectory)
                   }),
                   // The transcript URL is cached, and a URL caches its resource
@@ -1322,6 +1323,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 self.turns.claudeTurn(
                     cliSessionID: $0,
                     workspacePath: session.workspacePath,
+                    activeAt: session.lastActivityAt,
                     projectsDirectory: self.reader.claudeProjectsDirectory)
             }
             return DesktopUnreadTask(

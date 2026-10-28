@@ -32,6 +32,12 @@ final class DesktopUnreadTurnReader {
         let turn: DesktopUnreadTurn
     }
 
+    private struct FoundTranscript {
+        let url: URL
+        /// When the projects were last searched for this transcript.
+        let foundAt: Date
+    }
+
     private struct CachedTurnState {
         let size: UInt64
         let modifiedAt: Date
@@ -50,7 +56,7 @@ final class DesktopUnreadTurnReader {
 
     private var cache: [String: CachedTurn] = [:]
     private var turnStates: [String: CachedTurnState] = [:]
-    private var claudeTranscripts: [String: URL] = [:]
+    private var claudeTranscripts: [String: FoundTranscript] = [:]
 
     func codexTurn(rolloutURL: URL) -> DesktopUnreadTurn {
         let markers = ["UserMessage", "user_message", "task_complete", "AgentMessage", "agent_message"]
@@ -91,11 +97,13 @@ final class DesktopUnreadTurnReader {
     func claudeTurn(
         cliSessionID: String,
         workspacePath: String?,
+        activeAt: Date?,
         projectsDirectory: URL) -> DesktopUnreadTurn
     {
         guard let transcript = self.claudeTranscriptURL(
             cliSessionID: cliSessionID,
             workspacePath: workspacePath,
+            activeAt: activeAt,
             projectsDirectory: projectsDirectory)
         else {
             return DesktopUnreadTurn()
@@ -313,17 +321,25 @@ final class DesktopUnreadTurnReader {
     /// Claude Code names each project directory after its working directory with
     /// every other character replaced by `-`, and shortens long names, so a
     /// missing guess falls back to searching every project.
+    ///
+    /// A session that enters a worktree copies its transcript into that
+    /// worktree's project and writes there from then on, leaving the old copy
+    /// behind. So the newest copy is the session's, and the projects are
+    /// searched again when the session was active after its copy last
+    /// changed and after the last search.
     func claudeTranscriptURL(
         cliSessionID: String,
         workspacePath: String?,
+        activeAt: Date?,
         projectsDirectory: URL) -> URL?
     {
         let fileName = cliSessionID + ".jsonl"
         guard !cliSessionID.isEmpty, !cliSessionID.contains("/") else { return nil }
         if let known = self.claudeTranscripts[cliSessionID],
-           FileManager.default.fileExists(atPath: known.path)
+           let modifiedAt = Self.modificationDate(known.url),
+           activeAt.map({ $0 <= modifiedAt || $0 <= known.foundAt }) ?? true
         {
-            return known
+            return known.url
         }
         var candidates: [URL] = []
         if let workspacePath {
@@ -339,13 +355,18 @@ final class DesktopUnreadTurnReader {
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles])) ?? []
         candidates += projects.map { $0.appendingPathComponent(fileName, isDirectory: false) }
-        guard let transcript = candidates.first(where: {
-            FileManager.default.fileExists(atPath: $0.path)
-        }) else {
+        guard let transcript = candidates
+            .compactMap({ url in Self.modificationDate(url).map { (url, $0) } })
+            .max(by: { $0.1 < $1.1 })?.0
+        else {
             return nil
         }
-        self.claudeTranscripts[cliSessionID] = transcript
+        self.claudeTranscripts[cliSessionID] = FoundTranscript(url: transcript, foundAt: Date())
         return transcript
+    }
+
+    private static func modificationDate(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
     }
 
     private func cachedTurn(
