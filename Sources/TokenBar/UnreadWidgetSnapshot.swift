@@ -8,12 +8,24 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
         let id: String
         let name: String
         let unreadCount: Int
+        let today: Usage?
 
-        init(id: String, name: String, unreadCount: Int) {
+        init(id: String, name: String, unreadCount: Int, today: Usage? = nil) {
             self.id = id
             self.name = name
             self.unreadCount = unreadCount
+            self.today = today
         }
+    }
+
+    /// What one agent used today.
+    struct Usage: Equatable, Sendable {
+        let tokens: Int64
+        let costUsd: Double
+        /// Percentage points of the weekly quota used today.
+        let weeklyQuotaUsedToday: Double?
+        /// The average speed of generated tokens.
+        let tokensPerSecond: Double?
     }
 
     /// Codable because the tasks read last are kept across launches.

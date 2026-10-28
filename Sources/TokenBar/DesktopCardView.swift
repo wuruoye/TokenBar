@@ -38,16 +38,9 @@ struct DesktopCardView: View {
             .padding(Self.padding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
-            .background {
-                // Opaque like a full-color desktop widget. `BreathingGlow` draws
-                // the drop shadow once in Core Animation; a SwiftUI shadow would
-                // be re-rendered with every redraw.
-                let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
-                ZStack {
-                    shape.fill(Color(nsColor: .windowBackgroundColor))
-                    shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-                }
-            }
+            // `BreathingGlow` draws the drop shadow once in Core Animation; a
+            // SwiftUI shadow would be re-rendered with every redraw.
+            .modifier(CardSurface(shape: RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)))
             .overlay {
                 BreathingGlow(
                     cornerRadius: Self.cornerRadius,
@@ -117,7 +110,7 @@ struct DesktopCardView: View {
             HStack(spacing: 8) {
                 BreathingBadge(count: snapshot.unreadCount, animates: self.state.isVisible)
                 Text("Unread")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(CardFont.sans(13, .semibold))
                     .foregroundStyle(snapshot.unreadCount > 0 ? .primary : .secondary)
             }
             if let task = snapshot.tasks.first {
@@ -128,7 +121,7 @@ struct DesktopCardView: View {
                             CardTimeText(date: task.updatedAt)
                         }
                         Text(task.title)
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(CardFont.sans(12, .semibold))
                             .lineLimit(snapshot.running.isEmpty && snapshot.background.isEmpty ? 3 : 2)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -137,7 +130,7 @@ struct DesktopCardView: View {
                 .buttonStyle(.plain)
             } else {
                 Label("All caught up", systemImage: "checkmark.circle")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(CardFont.sans(12, .medium))
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -396,7 +389,7 @@ private struct SectionLabel: View {
 
     var body: some View {
         Text(self.text)
-            .font(.system(size: 11, weight: .semibold))
+            .font(CardFont.sans(11, .semibold))
             .foregroundStyle(.secondary)
             .padding(.leading, CardGrid.textInset)
             .frame(height: CardMetrics.sectionLabelHeight, alignment: .leading)
@@ -413,7 +406,7 @@ private struct CaughtUpRow: View {
                 .frame(width: CardGrid.iconColumn)
             Text(self.isCaughtUp ? "All caught up" : "Nothing running")
         }
-        .font(.system(size: 12, weight: .medium))
+        .font(CardFont.sans(12, .medium))
         .foregroundStyle(.secondary)
         .frame(height: CardMetrics.caughtUpHeight)
     }
@@ -438,11 +431,11 @@ private struct RunningSummaryRow: View {
                         CardPlatformIcon(platform: first.platform, size: 12)
                     }
                     Text(first.title)
-                        .font(.system(size: 11))
+                        .font(CardFont.sans(11))
                         .lineLimit(1)
                     if self.running.count > 1 {
                         Text("+\(self.running.count - 1)")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(CardFont.sans(11, .medium))
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
@@ -474,7 +467,7 @@ private struct CompactTaskRow: View {
                 }
                 .frame(width: CardGrid.iconColumn)
                 Text(self.task.title)
-                    .font(.system(size: 12))
+                    .font(CardFont.sans(12))
                     .foregroundStyle(self.isUnread ? .primary : .secondary)
                     .lineLimit(1)
                 Spacer(minLength: 4)
@@ -558,29 +551,100 @@ private struct RowHighlight: ViewModifier {
     }
 }
 
+/// The unread count, then what each agent used today. The usage drops its
+/// last figures first when the card is too narrow.
 private struct CardHeader: View {
     let snapshot: UnreadWidgetSnapshot
     let animates: Bool
 
     var body: some View {
-        HStack(alignment: .center, spacing: CardGrid.spacing) {
+        HStack(alignment: .firstTextBaseline, spacing: CardGrid.spacing) {
             BreathingBadge(count: self.snapshot.unreadCount, animates: self.animates)
             Text("Unread")
-                .font(.system(size: 13, weight: .semibold))
+                .font(CardFont.sans(13, .semibold))
                 .foregroundStyle(self.snapshot.unreadCount > 0 ? .primary : .secondary)
+                .fixedSize()
             Spacer(minLength: 8)
-            HStack(spacing: 10) {
-                ForEach(self.snapshot.platforms) { platform in
-                    HStack(spacing: 3) {
+            ViewThatFits(in: .horizontal) {
+                self.usage(figures: 4)
+                self.usage(figures: 3)
+                self.usage(figures: 2)
+                self.usage(figures: 1)
+            }
+        }
+    }
+
+    /// Every piece of text shares one size and baseline; each icon sits on
+    /// the same line, centered on the digits.
+    private func usage(figures: Int) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            ForEach(self.snapshot.platforms) { platform in
+                if let today = platform.today {
+                    HStack(alignment: .firstTextBaseline, spacing: 3) {
                         CardPlatformIcon(platform: platform.id, size: 12)
-                        Text("\(platform.unreadCount)")
-                            .font(.system(size: 12, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(platform.unreadCount > 0 ? .primary : .secondary)
+                            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1.7 }
+                            .padding(.trailing, 2)
+                        ForEach(Array(today.figures.prefix(figures).enumerated()), id: \.offset) { index, figure in
+                            if index > 0 {
+                                Text("·").foregroundStyle(.tertiary)
+                            }
+                            Text(figure)
+                        }
                     }
+                    .help("\(platform.name) today: \(today.summary)")
                 }
             }
         }
+        .foregroundStyle(.secondary)
+        .font(CardFont.sans(12))
+        .monospacedDigit()
+        .lineLimit(1)
+        .fixedSize()
+    }
+}
+
+extension UnreadWidgetSnapshot.Usage {
+    /// Tokens, cost, the weekly quota used today, and generation speed, with
+    /// whole dollars from $10 on.
+    var figures: [String] {
+        var figures = [self.tokens.statusBarCompactCount]
+        if self.costUsd > 0 {
+            figures.append(self.costUsd < 10 ? self.costUsd.usdText : Self.wholeDollarText(self.costUsd))
+        }
+        if let quota = self.weeklyQuotaUsedToday {
+            figures.append("+\(Self.percentText(quota))")
+        }
+        if let speed = self.tokensPerSecond {
+            figures.append("\(Int(speed.rounded())) tps")
+        }
+        return figures
+    }
+
+    var summary: String {
+        var parts = ["\(self.tokens.formatted()) tokens"]
+        if self.costUsd > 0 {
+            parts.append(self.costUsd.usdText)
+        }
+        if let quota = self.weeklyQuotaUsedToday {
+            parts.append("\(Self.percentText(quota)) of the weekly quota")
+        }
+        if let speed = self.tokensPerSecond {
+            parts.append("\(Int(speed.rounded())) tokens/s")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func wholeDollarText(_ amount: Double) -> String {
+        amount >= 1_000
+            ? String(format: "$%.1fK", locale: Locale(identifier: "en_US_POSIX"), amount / 1_000)
+            : String(format: "$%.0f", locale: Locale(identifier: "en_US_POSIX"), amount)
+    }
+
+    private static func percentText(_ points: Double) -> String {
+        String(
+            format: points < 10 ? "%.1f%%" : "%.0f%%",
+            locale: Locale(identifier: "en_US_POSIX"),
+            max(0, points))
     }
 }
 
@@ -602,14 +666,14 @@ private struct UnreadCardRow: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(self.task.title)
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(CardFont.sans(13, .semibold))
                             .lineLimit(1)
                         Spacer(minLength: 6)
                         CardTimeText(date: self.task.updatedAt)
                     }
                     if let reply = self.task.reply {
                         Text(reply)
-                            .font(.system(size: 12))
+                            .font(CardFont.sans(12))
                             .foregroundStyle(.primary)
                             .lineLimit(self.replyLines)
                     }
@@ -649,7 +713,7 @@ private struct UnreadCardRow: View {
                         .fixedSize()
                 }
             }
-            .font(.system(size: 10.5))
+            .font(CardFont.sans(10.5))
             .monospacedDigit()
             .foregroundStyle(.secondary)
         }
@@ -677,7 +741,7 @@ private struct RunningCardRow: View {
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
                         Text(self.task.title)
-                            .font(.system(size: 12))
+                            .font(CardFont.sans(12))
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         if let startedAt = self.task.startedAt {
@@ -687,7 +751,7 @@ private struct RunningCardRow: View {
                     }
                     if let activity = self.task.activity {
                         Text(activity)
-                            .font(.system(size: 10.5))
+                            .font(CardFont.sans(10.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -712,7 +776,7 @@ private struct ElapsedMinutesText: View {
             // The schedule's date is the start of the minute, which can trail now.
             let minutes = max(0, Int(max(context.date, Date()).timeIntervalSince(self.since) / 60))
             Text(minutes == 0 ? "now" : UnreadTaskFormat.duration(TimeInterval(minutes * 60)))
-                .font(.system(size: 11))
+                .font(CardFont.sans(11))
                 .monospacedDigit()
                 .lineLimit(1)
         }
@@ -738,7 +802,7 @@ private struct CardTimeText: View {
                         Text(date, format: .dateTime.month(.abbreviated).day())
                     }
                 }
-                .font(.system(size: 11))
+                .font(CardFont.sans(11))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -759,7 +823,7 @@ private struct BreathingBadge: View {
     var body: some View {
         let isUnread = self.count > 0
         Text(self.count > 99 ? "99+" : "\(self.count)")
-            .font(.system(size: 14, weight: .bold, design: .rounded))
+            .font(CardFont.sans(14, .bold))
             .monospacedDigit()
             .contentTransition(.numericText(value: Double(self.count)))
             .minimumScaleFactor(0.6)
@@ -1046,6 +1110,66 @@ private final class SpinningRingView: NSView {
 
 // MARK: Pieces
 
+/// Liquid Glass over the desktop, tinted with the window color so the
+/// wallpaper shows through only faintly, or a thick material on systems
+/// without it. The glass stays behind the content: content inside it takes
+/// its colors from the wallpaper and can become hard to read.
+private struct CardSurface: ViewModifier {
+    /// How strongly the window color covers the glass.
+    private static let tintOpacity = 0.7
+
+    let shape: RoundedRectangle
+
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content.background {
+                Color.clear.glassEffect(
+                    .regular.tint(Color(nsColor: .windowBackgroundColor).opacity(Self.tintOpacity)),
+                    in: self.shape)
+            }
+        } else {
+            content.background {
+                ZStack {
+                    self.shape.fill(.thickMaterial)
+                    self.shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                }
+            }
+        }
+    }
+}
+
+/// Claude Desktop's Anthropic Sans, loaded from the installed app, or the
+/// system font where Claude Desktop is missing. The text cut of each weight
+/// suits the card's small sizes.
+enum CardFont {
+    private static let isAvailable: Bool = {
+        guard let app = NSWorkspace.shared.urlForApplication(
+            withBundleIdentifier: DesktopUnreadTaskMonitor.claudeBundleIdentifier),
+            let file = (try? FileManager.default.contentsOfDirectory(
+                at: app.appending(path: "Contents/Resources/fonts", directoryHint: .isDirectory),
+                includingPropertiesForKeys: nil))?
+                .first(where: { $0.lastPathComponent.hasPrefix("AnthropicSans-Romans") })
+        else {
+            return false
+        }
+        CTFontManagerRegisterFontsForURL(file as CFURL, .process, nil)
+        return NSFont(name: "AnthropicSansVariable-TextRegular", size: 12) != nil
+    }()
+
+    static func sans(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+        guard self.isAvailable else { return .system(size: size, weight: weight) }
+        let style = switch weight {
+        case .ultraLight, .thin, .light: "Light"
+        case .medium: "Medium"
+        case .semibold: "Semibold"
+        case .bold: "Bold"
+        case .heavy, .black: "Extrabold"
+        default: "Regular"
+        }
+        return .custom("AnthropicSansVariable-Text\(style)", fixedSize: size)
+    }
+}
+
 private struct CardPlatformIcon: View {
     let platform: String
     let size: CGFloat
@@ -1071,7 +1195,7 @@ private struct CompactLabelStyle: LabelStyle {
     func makeBody(configuration: Configuration) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 3) {
             configuration.icon
-                .font(.system(size: 8, weight: .semibold))
+                .font(CardFont.sans(8, .semibold))
             configuration.title
         }
     }

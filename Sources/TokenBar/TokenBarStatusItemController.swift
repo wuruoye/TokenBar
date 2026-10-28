@@ -104,7 +104,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.requestDetailService = requestDetailService
         self.sessionLauncher = sessionLauncher
         self.unreadTasks = unreadTasks
-        self.unreadWidget = UnreadWidgetPublisher(unreadTasks: unreadTasks, settings: settings)
+        self.unreadWidget = UnreadWidgetPublisher(unreadTasks: unreadTasks, model: model, settings: settings)
         self.syncSettingsSignature = SyncSettingsSignature(
             settings,
             activitySync: activitySync)

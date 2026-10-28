@@ -23,6 +23,7 @@ final class UnreadWidgetPublisher {
     private(set) var snapshot = UnreadWidgetSnapshot(platforms: [], tasks: [], running: [])
 
     @ObservationIgnored private let unreadTasks: DesktopUnreadTaskMonitor
+    @ObservationIgnored private let model: DashboardModel
     @ObservationIgnored private let settings: TokenBarSettings
     @ObservationIgnored private var pendingPublish: Task<Void, Never>?
     /// Tasks the user read, most recently read first, kept across launches.
@@ -32,8 +33,9 @@ final class UnreadWidgetPublisher {
     @ObservationIgnored private var pendingSettle: Task<Void, Never>?
     @ObservationIgnored private var isStarted = false
 
-    init(unreadTasks: DesktopUnreadTaskMonitor, settings: TokenBarSettings) {
+    init(unreadTasks: DesktopUnreadTaskMonitor, model: DashboardModel, settings: TokenBarSettings) {
         self.unreadTasks = unreadTasks
+        self.model = model
         self.settings = settings
     }
 
@@ -59,6 +61,8 @@ final class UnreadWidgetPublisher {
         withObservationTracking {
             _ = self.unreadTasks.tasks
             _ = self.unreadTasks.running
+            _ = self.model.activity
+            _ = self.model.weeklyQuotaUsageHistories
             _ = self.settings.showsClaude
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
@@ -75,7 +79,7 @@ final class UnreadWidgetPublisher {
             try? await Task.sleep(for: Self.coalescingDelay)
             guard let self, !Task.isCancelled, self.isStarted else { return }
             self.pendingPublish = nil
-            let next = Self.snapshot(of: self.unreadTasks, settings: self.settings)
+            let next = Self.snapshot(of: self.unreadTasks, model: self.model, settings: self.settings)
             self.snapshot = self.recordingReads(from: self.snapshot, in: next)
         }
     }
@@ -150,6 +154,7 @@ final class UnreadWidgetPublisher {
     /// those once it is read.
     static func snapshot(
         of unreadTasks: DesktopUnreadTaskMonitor,
+        model: DashboardModel,
         settings: TokenBarSettings) -> UnreadWidgetSnapshot
     {
         let platforms: [TokenPlatform] = settings.showsClaude ? [.codex, .claude] : [.codex]
@@ -171,7 +176,15 @@ final class UnreadWidgetPublisher {
                 UnreadWidgetSnapshot.Platform(
                     id: platform.rawValue,
                     name: platform.displayName,
-                    unreadCount: tasks.count { $0.platform == platform })
+                    unreadCount: tasks.count { $0.platform == platform },
+                    today: model.activitySnapshot.map { activity in
+                        let today = activity.scoped(to: platform).today
+                        return UnreadWidgetSnapshot.Usage(
+                            tokens: today.tokens.total,
+                            costUsd: today.costUsd,
+                            weeklyQuotaUsedToday: model.weeklyQuotaUsageToday(for: platform)?.usedPercentagePoints,
+                            tokensPerSecond: today.averageGenerationTokensPerSecond)
+                    })
             },
             tasks: tasks.map { task in
                 UnreadWidgetSnapshot.Item(

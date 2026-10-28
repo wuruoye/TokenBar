@@ -1060,8 +1060,16 @@ enum DemoPreviewRenderer {
         let now = Date()
         state.snapshot = UnreadWidgetSnapshot(
             platforms: [
-                .init(id: "codex", name: "Codex", unreadCount: 2),
-                .init(id: "claude", name: "Claude", unreadCount: 1),
+                .init(
+                    id: "codex",
+                    name: "Codex",
+                    unreadCount: 2,
+                    today: .init(tokens: 359_000_000, costUsd: 182.4, weeklyQuotaUsedToday: 6.2, tokensPerSecond: 52)),
+                .init(
+                    id: "claude",
+                    name: "Claude",
+                    unreadCount: 1,
+                    today: .init(tokens: 141_000_000, costUsd: 96.1, weeklyQuotaUsedToday: 11, tokensPerSecond: 71)),
             ],
             tasks: [
                 .init(
@@ -1143,7 +1151,9 @@ enum DemoPreviewRenderer {
         // `TOKENBAR_DEMO_CARD_CAUGHT_UP=1` previews the card with nothing unread.
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_CARD_CAUGHT_UP"] == "1" {
             state.snapshot = UnreadWidgetSnapshot(
-                platforms: state.snapshot.platforms.map { .init(id: $0.id, name: $0.name, unreadCount: 0) },
+                platforms: state.snapshot.platforms.map {
+                    .init(id: $0.id, name: $0.name, unreadCount: 0, today: $0.today)
+                },
                 tasks: [],
                 running: state.snapshot.running,
                 background: state.snapshot.background,
