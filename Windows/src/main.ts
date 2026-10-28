@@ -329,7 +329,8 @@ function sessionView(): HTMLElement {
     const heading = el("div", "turn-heading");
     const name = el("span");
     name.append(el("strong", "", "Turn " + (index + 1)));
-    if (request.serviceTier === "fast" || request.serviceTier === "mixed") name.append(el("span", "badge", request.serviceTier.toUpperCase()));
+    const tierBadge = ({fast: "FAST", ultrafast: "ULTRA", mixed: "MIXED"} as Record<string, string>)[request.serviceTier];
+    if (tierBadge) name.append(el("span", "badge", tierBadge));
     heading.append(name, el("strong", "cost", requestCost(request)));
     const tps = throughput(request);
     const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + (formatTPS(tps) ?? tps.toFixed(1) + " tok/s") : ""));

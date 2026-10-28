@@ -8,6 +8,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
         settings: .shared,
         credentials: TokenBarAppDelegate.activitySyncCredentials())
     private let openAIPricingCatalog = OpenAIPricingCatalogUpdater()
+    private let codexSpeedCatalog = CodexSpeedCatalogUpdater()
     private let anthropicPricingCatalog = AnthropicPricingCatalogUpdater()
     private let openRouterPricingCatalog = OpenRouterPricingCatalogUpdater()
     private lazy var model: DashboardModel = {
@@ -32,6 +33,7 @@ final class TokenBarAppDelegate: NSObject, NSApplicationDelegate {
                 }
             },
             openAIPricingCatalog: self.openAIPricingCatalog,
+            codexSpeedCatalog: self.codexSpeedCatalog,
             anthropicPricingCatalog: self.anthropicPricingCatalog,
             openRouterPricingCatalog: self.openRouterPricingCatalog)
         let synchronizedActivity = SynchronizedActivityService(

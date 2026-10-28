@@ -110,53 +110,54 @@ public actor OpenAIPricingCatalogUpdater: OpenAIPricingCatalogUpdating {
         }
         let lines = markdown.lines
         guard lines.contains(where: { $0 == "# Pricing" }) else { return false }
+        // Only the table shape is checked, never particular model names, so
+        // the copy keeps updating after OpenAI retires a model from the page.
         return Self.hasValidPricingSection(lines, heading: "### Standard pricing data")
-            && Self.hasValidPricingSection(lines, heading: "### Fast pricing data")
     }
 
+    /// Checks every table under the heading by column name, so a table that
+    /// reorders columns, adds cache-write durations, or lists older models in a
+    /// shorter table still passes.
     private nonisolated static func hasValidPricingSection(
         _ lines: [String],
         heading: String) -> Bool
     {
-        let expectedHeader = [
-            "Model",
-            "Short context input",
-            "Short context cached input",
-            "Short context cache writes",
-            "Short context output",
-            "Long context input",
-            "Long context cached input",
-            "Long context cache writes",
-            "Long context output",
-        ]
         guard let headingIndex = lines.firstIndex(of: heading) else { return false }
-        let section = lines[lines.index(after: headingIndex)...]
-        guard let headerIndex = section.firstIndex(where: { $0.hasPrefix("| Model |") }),
-              Self.tableCells(section[headerIndex]) == expectedHeader
-        else {
-            return false
+        let requiredColumns = [
+            ["short context input", "input"],
+            ["short context cached input", "cached input"],
+            ["short context output", "output"],
+        ]
+        var rowCount = 0
+        var index = lines.index(after: headingIndex)
+        while index < lines.endIndex {
+            let line = lines[index]
+            if ["# ", "## ", "### "].contains(where: { line.hasPrefix($0) }) {
+                break
+            }
+            guard line.hasPrefix("| Model |") else {
+                index += 1
+                continue
+            }
+            let header = Self.tableCells(line).map { $0.lowercased() }
+            guard requiredColumns.allSatisfy({ names in header.contains(where: names.contains) })
+            else {
+                return false
+            }
+            index += 2
+            while index < lines.endIndex, lines[index].hasPrefix("|") {
+                let cells = Self.tableCells(lines[index])
+                guard cells.count == header.count,
+                      !cells[0].isEmpty,
+                      cells.dropFirst().allSatisfy(Self.isPriceCell)
+                else {
+                    return false
+                }
+                rowCount += 1
+                index += 1
+            }
         }
-
-        let rows = section[section.index(after: headerIndex)...]
-            .dropFirst()
-            .prefix(while: { $0.hasPrefix("|") })
-            .map(Self.tableCells)
-        guard rows.count >= 8,
-              rows.allSatisfy({ cells in
-                  cells.count == expectedHeader.count
-                      && !cells[0].isEmpty
-                      && cells.dropFirst().allSatisfy(Self.isPriceCell)
-              })
-        else {
-            return false
-        }
-
-        let requiredModels = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        return requiredModels.allSatisfy { model in
-            rows.contains(where: { cells in
-                cells[0] == model
-            })
-        }
+        return rowCount >= 8
     }
 
     private nonisolated static func tableCells(_ line: String) -> [String] {

@@ -24,9 +24,8 @@ use tokenbar_helper::grok::{
 };
 use serde::Deserialize;
 use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
-use tokenbar_helper::pricing::{
-    AnthropicPricing, CodexPricing, FastPricingBasis, GooglePricing,
-};
+use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, GooglePricing};
+use tokenbar_helper::usage::BillingBasis;
 use tokenbar_helper::{
     build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
@@ -34,7 +33,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -47,6 +46,7 @@ struct SnapshotConfig {
     grok_weekly_reset_ms: Option<i64>,
     antigravity_weekly_reset_ms: Option<i64>,
     openai_pricing_markdown: Option<PathBuf>,
+    codex_speed_markdown: Option<PathBuf>,
     anthropic_pricing_markdown: Option<PathBuf>,
     openrouter_pricing_json: Option<PathBuf>,
     memory_database: Option<PathBuf>,
@@ -65,6 +65,7 @@ impl Default for SnapshotConfig {
             grok_weekly_reset_ms: None,
             antigravity_weekly_reset_ms: None,
             openai_pricing_markdown: None,
+            codex_speed_markdown: None,
             anthropic_pricing_markdown: None,
             openrouter_pricing_json: None,
             memory_database: None,
@@ -175,15 +176,16 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
 
     let catalog_load = load_openrouter_pricing(&config);
     let catalog = catalog_load.catalog.map(Arc::new);
-    let fast_pricing_basis = codex_fast_pricing_basis(&config);
-    let pricing = config
+    let default_billing = codex_default_billing(&config);
+    let mut pricing = config
         .openai_pricing_markdown
         .as_deref()
-        .and_then(|path| {
-            CodexPricing::from_official_markdown_file(path, fast_pricing_basis).ok()
-        })
-        .unwrap_or_else(|| CodexPricing::with_fast_pricing(fast_pricing_basis))
+        .and_then(|path| CodexPricing::from_official_markdown_file(path, default_billing).ok())
+        .unwrap_or_else(|| CodexPricing::with_default_billing(default_billing))
         .with_openrouter_catalog(catalog.clone());
+    if let Some(path) = config.codex_speed_markdown.as_deref() {
+        pricing = pricing.with_speed_markdown_file(path);
+    }
     let mut codex_messages = parse_local_codex_messages(
         LocalParseOptions {
             home_dir: home_dir.clone(),
@@ -197,9 +199,9 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     normalize_codex_reasoning_usage(&mut codex_messages, |message| {
         pricing.calculate_token_costs_with_service_tier(
             &message.model_id,
-            Some(&message.provider_id),
             &message.tokens,
             message.service_tier,
+            message.billing,
         )
     });
     let mut session_titles = session_index_path
@@ -344,19 +346,21 @@ fn codex_home_path(config: &SnapshotConfig) -> Option<PathBuf> {
         .map(|home| home.join(".codex"))
 }
 
-fn codex_fast_pricing_basis(config: &SnapshotConfig) -> FastPricingBasis {
+/// The current Codex sign-in method, used for requests whose session log does
+/// not record how they were paid for.
+fn codex_default_billing(config: &SnapshotConfig) -> BillingBasis {
     codex_home_path(config)
         .and_then(|path| File::open(path.join("auth.json")).ok())
         .and_then(|file| serde_json::from_reader::<_, CodexAuthConfig>(file).ok())
         .and_then(|auth| auth.auth_mode)
-        .and_then(|mode| fast_pricing_basis_for_auth_mode(&mode))
+        .and_then(|mode| billing_for_auth_mode(&mode))
         .unwrap_or_default()
 }
 
-fn fast_pricing_basis_for_auth_mode(auth_mode: &str) -> Option<FastPricingBasis> {
+fn billing_for_auth_mode(auth_mode: &str) -> Option<BillingBasis> {
     match auth_mode.trim().to_ascii_lowercase().as_str() {
-        "chatgpt" => Some(FastPricingBasis::ChatGptSubscription),
-        "api" | "api-key" | "api_key" | "apikey" => Some(FastPricingBasis::ApiPriority),
+        "chatgpt" => Some(BillingBasis::ChatGptIncluded),
+        "api" | "api-key" | "api_key" | "apikey" => Some(BillingBasis::Api),
         _ => None,
     }
 }
@@ -490,6 +494,12 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
                     .next()
                     .ok_or("--openai-pricing-markdown requires a path")?;
                 config.openai_pricing_markdown = Some(PathBuf::from(value));
+            }
+            Some("--codex-speed-markdown") => {
+                let value = args
+                    .next()
+                    .ok_or("--codex-speed-markdown requires a path")?;
+                config.codex_speed_markdown = Some(PathBuf::from(value));
             }
             Some("--anthropic-pricing-markdown") => {
                 let value = args

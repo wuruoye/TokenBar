@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +8,8 @@ use crate::openrouter::Catalog;
 use chrono::{Local, NaiveDate};
 
 use crate::usage::{
-    CacheWriteBreakdown, ServiceTier, TokenBreakdown, TokenCostBreakdown,
+    normalize_model_for_grouping, BillingBasis, CacheWriteBreakdown, ServiceTier, TokenBreakdown,
+    TokenCostBreakdown,
 };
 
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
@@ -60,10 +61,16 @@ struct AnthropicModelRate {
 /// its long-context table row for API Priority sessions, while ChatGPT subscription
 /// sessions keep short-context rates across all prompt lengths.
 ///
+/// Fast and Ultrafast depend on how each request was paid for. API keys use
+/// the official Fast or Ultrafast table row. ChatGPT sign-in uses the Standard
+/// estimate times the usage multiplier from the official Codex speed page,
+/// which differs between included usage and purchased credits.
+///
 /// Sources:
 /// - https://developers.openai.com/api/docs/models/gpt-6-astra
 /// - https://openrouter.ai/docs/guides/overview/models
 /// - https://developers.openai.com/api/docs/pricing.md
+/// - https://learn.chatgpt.com/docs/agent-configuration/speed.md
 /// - https://openai.com/index/introducing-gpt-5-3-codex-spark/
 /// - https://developers.openai.com/api/docs/models/codex-mini-latest
 /// - https://developers.openai.com/api/docs/models/gpt-5
@@ -81,51 +88,47 @@ struct AnthropicModelRate {
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-sol
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-terra
 /// - https://developers.openai.com/api/docs/models/gpt-5.6-luna
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FastPricingBasis {
-    ChatGptSubscription,
-    #[default]
-    ApiPriority,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct CodexPricing {
-    fast_pricing_basis: FastPricingBasis,
+    default_billing: BillingBasis,
     standard_overrides: HashMap<String, ModelRate>,
     fast_overrides: HashMap<String, ModelRate>,
+    ultrafast_overrides: HashMap<String, ModelRate>,
+    speed_rules: SpeedRules,
     openrouter: Option<Arc<Catalog>>,
 }
 
 impl CodexPricing {
     pub fn bundled() -> Self {
-        Self::with_fast_pricing(FastPricingBasis::ApiPriority)
+        Self::with_default_billing(BillingBasis::Api)
     }
 
-    pub fn with_fast_pricing(fast_pricing_basis: FastPricingBasis) -> Self {
+    /// `default_billing` applies to requests whose session log does not say
+    /// how they were paid for.
+    pub fn with_default_billing(default_billing: BillingBasis) -> Self {
         Self {
-            fast_pricing_basis,
-            standard_overrides: HashMap::new(),
-            fast_overrides: HashMap::new(),
-            openrouter: None,
+            default_billing,
+            ..Self::default()
         }
     }
 
     pub fn from_official_markdown(
         markdown: &str,
-        fast_pricing_basis: FastPricingBasis,
+        default_billing: BillingBasis,
     ) -> Result<Self, String> {
-        let (standard_overrides, fast_overrides) = parse_official_openai_rates(markdown)?;
+        let tables = parse_official_openai_rates(markdown)?;
         Ok(Self {
-            fast_pricing_basis,
-            standard_overrides,
-            fast_overrides,
-            openrouter: None,
+            default_billing,
+            standard_overrides: tables.standard,
+            fast_overrides: tables.fast,
+            ultrafast_overrides: tables.ultrafast,
+            ..Self::default()
         })
     }
 
     pub fn from_official_markdown_file(
         path: &Path,
-        fast_pricing_basis: FastPricingBasis,
+        default_billing: BillingBasis,
     ) -> Result<Self, String> {
         let metadata = fs::metadata(path)
             .map_err(|error| format!("could not inspect OpenAI pricing catalog: {error}"))?;
@@ -134,7 +137,22 @@ impl CodexPricing {
         }
         let markdown = fs::read_to_string(path)
             .map_err(|error| format!("could not read OpenAI pricing catalog: {error}"))?;
-        Self::from_official_markdown(&markdown, fast_pricing_basis)
+        Self::from_official_markdown(&markdown, default_billing)
+    }
+
+    /// Overlays ChatGPT's Fast and Ultrafast usage multipliers from a copy of
+    /// the official Codex speed page. A page that no longer reads cleanly keeps
+    /// the bundled multipliers.
+    pub fn with_speed_markdown_file(mut self, path: &Path) -> Self {
+        let rules = fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.len() <= 2_000_000)
+            .and_then(|_| fs::read_to_string(path).ok())
+            .and_then(|markdown| SpeedRules::from_official_markdown(&markdown));
+        if let Some(rules) = rules {
+            self.speed_rules = rules;
+        }
+        self
     }
 
     pub fn with_openrouter_catalog(mut self, catalog: Option<Arc<Catalog>>) -> Self {
@@ -142,98 +160,112 @@ impl CodexPricing {
         self
     }
 
-    pub fn calculate_cost_with_provider(
+    /// Prices one request. `billing` comes from the session log when it
+    /// recorded one; otherwise the current sign-in method applies. Fast and
+    /// Ultrafast change cost only; token and cache counts stay raw. A speed tier
+    /// without a verified multiplier keeps the Standard estimate instead of
+    /// receiving a guessed one.
+    pub fn calculate_token_costs_with_service_tier(
         &self,
         model_id: &str,
-        provider_id: Option<&str>,
         usage: &TokenBreakdown,
-    ) -> Option<f64> {
-        self.calculate_token_costs_with_provider(model_id, provider_id, usage)
-            .map(|costs| costs.total())
+        service_tier: ServiceTier,
+        billing: Option<BillingBasis>,
+    ) -> Option<TokenCostBreakdown> {
+        let billing = billing.unwrap_or(self.default_billing);
+        let Some(speed) = Speed::from_service_tier(service_tier) else {
+            return self.standard_costs(model_id, usage, billing);
+        };
+        if billing == BillingBasis::Api {
+            let table = match speed {
+                Speed::Fast => &self.fast_overrides,
+                Speed::Ultrafast => &self.ultrafast_overrides,
+            };
+            if let Some(rate) = lookup_rate(table, model_id) {
+                return calculate_token_costs(rate, usage);
+            }
+        }
+        let multiplier = self.speed_multiplier(model_id, speed, billing).unwrap_or(1.0);
+        self.standard_costs(model_id, usage, billing)?.scaled(multiplier)
     }
 
-    pub fn calculate_token_costs_with_provider(
+    fn standard_costs(
         &self,
         model_id: &str,
-        _provider_id: Option<&str>,
         usage: &TokenBreakdown,
+        billing: BillingBasis,
     ) -> Option<TokenCostBreakdown> {
         // Explicit official tables retain priority; automatic quotes cover other models.
-        if !self.standard_overrides.contains_key(&normalize_pricing_model_id(model_id)) {
-            let known_long_context = bundled_rate_for_model(model_id)
+        if lookup_rate(&self.standard_overrides, model_id).is_none() {
+            let normalized = normalize_pricing_model_id(model_id);
+            let known_long_context = bundled_rate_for_model(&normalized)
                 .is_some_and(|rate| rate.long_context.is_some())
-                && !(self.fast_pricing_basis == FastPricingBasis::ChatGptSubscription
-                    && normalize_pricing_model_id(model_id) == "gpt-6-astra");
+                && !(billing.is_chatgpt() && normalized == "gpt-6-astra");
             if let Some(costs) = self.openrouter.as_ref().and_then(|catalog|
                 catalog.costs("openai", model_id, usage, None, known_long_context)) {
                 return Some(costs);
             }
         }
-        let rate = self.rate_for_model(model_id)?;
+        let rate = self.rate_for_model(model_id, billing)?;
         calculate_token_costs(rate, usage)
     }
 
-    fn rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
+    fn rate_for_model(&self, model_id: &str, billing: BillingBasis) -> Option<ModelRate> {
         let normalized = normalize_pricing_model_id(model_id);
-        let mut rate = self.standard_overrides
-            .get(&normalized)
-            .copied()
+        let mut rate = lookup_rate(&self.standard_overrides, model_id)
             .or_else(|| bundled_rate_for_model(&normalized))?;
-        if self.fast_pricing_basis == FastPricingBasis::ChatGptSubscription
-            && normalized == "gpt-6-astra"
-        {
+        if billing.is_chatgpt() && normalized == "gpt-6-astra" {
             rate.long_context = None;
         }
         Some(rate)
     }
 
-    fn fast_rate_for_model(&self, model_id: &str) -> Option<ModelRate> {
-        let normalized = normalize_pricing_model_id(model_id);
-        self.fast_overrides.get(&normalized).copied()
-    }
-
-    /// Applies the Fast multiplier for the active Codex login type to the
-    /// standard API-equivalent estimate. The tier changes cost only; token and
-    /// cache counts stay raw. Models without an explicitly verified multiplier
-    /// keep their standard estimate instead of receiving a guessed multiplier.
-    pub fn calculate_cost_with_service_tier(
+    fn speed_multiplier(
         &self,
         model_id: &str,
-        provider_id: Option<&str>,
-        usage: &TokenBreakdown,
-        service_tier: ServiceTier,
+        speed: Speed,
+        billing: BillingBasis,
     ) -> Option<f64> {
-        self.calculate_token_costs_with_service_tier(
-            model_id,
-            provider_id,
-            usage,
-            service_tier,
-        )
-        .map(|costs| costs.total())
-    }
-
-    pub fn calculate_token_costs_with_service_tier(
-        &self,
-        model_id: &str,
-        provider_id: Option<&str>,
-        usage: &TokenBreakdown,
-        service_tier: ServiceTier,
-    ) -> Option<TokenCostBreakdown> {
-        if service_tier == ServiceTier::Fast
-            && self.fast_pricing_basis == FastPricingBasis::ApiPriority
-        {
-            if let Some(rate) = self.fast_rate_for_model(model_id) {
-                return calculate_token_costs(rate, usage);
+        let normalized = normalize_pricing_model_id(model_id);
+        if billing.is_chatgpt() {
+            if let Some(rule) = self
+                .speed_rules
+                .rule(speed)
+                .filter(|rule| rule.models.contains(&normalized))
+            {
+                return Some(if billing == BillingBasis::ChatGptIncluded {
+                    rule.included
+                } else {
+                    rule.credits
+                });
             }
         }
+        bundled_speed_multiplier(&normalized, speed, billing)
+    }
+}
 
-        let base = self.calculate_token_costs_with_provider(model_id, provider_id, usage)?;
-        let multiplier = if service_tier == ServiceTier::Fast {
-            fast_cost_multiplier(model_id, self.fast_pricing_basis).unwrap_or(1.0)
-        } else {
-            1.0
-        };
-        base.scaled(multiplier)
+/// Looks up the exact model id first, so a row for a dated snapshot wins, then
+/// the base model.
+fn lookup_rate(table: &HashMap<String, ModelRate>, model_id: &str) -> Option<ModelRate> {
+    table
+        .get(&clean_pricing_model_id(model_id))
+        .or_else(|| table.get(&normalize_pricing_model_id(model_id)))
+        .copied()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speed {
+    Fast,
+    Ultrafast,
+}
+
+impl Speed {
+    fn from_service_tier(tier: ServiceTier) -> Option<Self> {
+        match tier {
+            ServiceTier::Fast => Some(Self::Fast),
+            ServiceTier::Ultrafast => Some(Self::Ultrafast),
+            ServiceTier::Unknown | ServiceTier::Standard => None,
+        }
     }
 }
 
@@ -285,8 +317,16 @@ fn short_context_rate(rate: ModelRate) -> LongContextRate {
     }
 }
 
-type OpenAiRateTables = (HashMap<String, ModelRate>, HashMap<String, ModelRate>);
+struct OpenAiRateTables {
+    standard: HashMap<String, ModelRate>,
+    fast: HashMap<String, ModelRate>,
+    ultrafast: HashMap<String, ModelRate>,
+}
 
+/// Reads OpenAI's official pricing Markdown. Only the Standard table is
+/// required; Fast and Ultrafast tables are used when present and readable.
+/// Validation checks the table shape and price ranges rather than particular
+/// model names, so a retired model leaving the table does not reject the file.
 fn parse_official_openai_rates(
     markdown: &str,
 ) -> Result<OpenAiRateTables, String> {
@@ -294,77 +334,139 @@ fn parse_official_openai_rates(
         return Err("official OpenAI pricing title was not found".to_string());
     }
 
-    let mut standard = parse_openai_rate_table(markdown, "### Standard pricing data")?;
-    let mut fast = parse_openai_rate_table(markdown, "### Fast pricing data")?;
-    for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-        if !standard.contains_key(model) || !fast.contains_key(model) {
-            return Err(format!("official OpenAI pricing is missing {model}"));
-        }
-    }
-    if standard.len() < 8 || fast.len() < 8 {
+    let standard = parse_openai_rate_table(markdown, "### Standard pricing data")?;
+    if standard.len() < 8 {
         return Err("official OpenAI pricing contained too few valid models".to_string());
     }
-
-    if let Some(rate) = standard.get("gpt-5.6-sol").copied() {
-        standard.insert("gpt-5.6".to_string(), rate);
+    let optional_table =
+        |heading: &str| parse_openai_rate_table(markdown, heading).unwrap_or_default();
+    let mut tables = OpenAiRateTables {
+        standard,
+        fast: optional_table("### Fast pricing data"),
+        ultrafast: optional_table("### Ultrafast pricing data"),
+    };
+    for table in [&mut tables.standard, &mut tables.fast, &mut tables.ultrafast] {
+        if let Some(rate) = table.get("gpt-5.6-sol").copied() {
+            table.insert("gpt-5.6".to_string(), rate);
+        }
+        add_base_model_aliases(table);
     }
-    if let Some(rate) = fast.get("gpt-5.6-sol").copied() {
-        fast.insert("gpt-5.6".to_string(), rate);
-    }
-    Ok((standard, fast))
+    Ok(tables)
 }
 
+/// Lets a table that lists only dated snapshots price the base model id Codex
+/// logs. An explicit base row wins; otherwise the newest snapshot does.
+fn add_base_model_aliases(table: &mut HashMap<String, ModelRate>) {
+    let mut snapshots = table
+        .iter()
+        .map(|(model, rate)| (normalize_pricing_model_id(model), model.clone(), *rate))
+        .filter(|(base, model, _)| base != model && !table.contains_key(base))
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| left.1.cmp(&right.1));
+    for (base, _, rate) in snapshots {
+        table.insert(base, rate);
+    }
+}
+
+/// Reads every pricing table under one `###` heading. Columns are found by
+/// header name, so a table that reorders columns, adds cache-write durations,
+/// or lists older models in a shorter table still reads.
 fn parse_openai_rate_table(
     markdown: &str,
     heading: &str,
 ) -> Result<HashMap<String, ModelRate>, String> {
-    const EXPECTED_HEADER: [&str; 9] = [
-        "Model",
-        "Short context input",
-        "Short context cached input",
-        "Short context cache writes",
-        "Short context output",
-        "Long context input",
-        "Long context cached input",
-        "Long context cache writes",
-        "Long context output",
-    ];
-
     let mut lines = markdown.lines();
     if !lines.any(|line| line.trim() == heading) {
         return Err(format!("official OpenAI pricing section was not found: {heading}"));
     }
-    let header = lines
-        .find(|line| line.trim_start().starts_with("| Model |"))
-        .ok_or_else(|| format!("official OpenAI pricing header was not found: {heading}"))?;
-    let header_cells = markdown_table_cells(header);
-    if header_cells.as_slice() != EXPECTED_HEADER {
-        return Err(format!("official OpenAI pricing has an unexpected schema: {heading}"));
-    }
-    let separator = lines
-        .next()
-        .ok_or_else(|| format!("official OpenAI pricing separator was not found: {heading}"))?;
-    if markdown_table_cells(separator).len() != EXPECTED_HEADER.len() {
-        return Err(format!("official OpenAI pricing separator is invalid: {heading}"));
-    }
 
+    let mut lines = lines.peekable();
     let mut rates = HashMap::new();
-    for line in lines {
-        if !line.trim_start().starts_with('|') {
+    let mut table_count = 0;
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if ["# ", "## ", "### "].iter().any(|prefix| trimmed.starts_with(prefix)) {
             break;
         }
-        let cells = markdown_table_cells(line);
-        if cells.len() != EXPECTED_HEADER.len() {
-            return Err(format!("official OpenAI pricing row is invalid: {heading}"));
+        if !trimmed.starts_with("| Model |") {
+            continue;
         }
-        if let Some((model, rate)) = openai_rate_from_cells(&cells)? {
-            rates.insert(model, rate);
+        let header_cells = markdown_table_cells(trimmed);
+        let columns = OpenAiRateColumns::from_header(&header_cells)
+            .ok_or_else(|| format!("official OpenAI pricing has an unexpected schema: {heading}"))?;
+        let separator = lines
+            .next()
+            .ok_or_else(|| format!("official OpenAI pricing separator was not found: {heading}"))?;
+        if markdown_table_cells(separator).len() != header_cells.len() {
+            return Err(format!("official OpenAI pricing separator is invalid: {heading}"));
         }
+        table_count += 1;
+        while let Some(row) = lines.next_if(|line| line.trim_start().starts_with('|')) {
+            let cells = markdown_table_cells(row);
+            if cells.len() != header_cells.len() {
+                return Err(format!("official OpenAI pricing row is invalid: {heading}"));
+            }
+            if let Some((model, rate)) = openai_rate_from_cells(&cells, &columns)? {
+                rates.insert(model, rate);
+            }
+        }
+    }
+    if table_count == 0 {
+        return Err(format!("official OpenAI pricing header was not found: {heading}"));
     }
     Ok(rates)
 }
 
-fn openai_rate_from_cells(cells: &[&str]) -> Result<Option<(String, ModelRate)>, String> {
+/// Column positions in one pricing table. Where the table lists several
+/// cache-write durations, the 30-minute write is used; it matches the single
+/// cache-write price the table listed before durations were split.
+struct OpenAiRateColumns {
+    input: usize,
+    cached_input: usize,
+    output: usize,
+    cache_write: Option<usize>,
+    long_input: Option<usize>,
+    long_cached_input: Option<usize>,
+    long_output: Option<usize>,
+    long_cache_write: Option<usize>,
+}
+
+impl OpenAiRateColumns {
+    fn from_header(cells: &[&str]) -> Option<Self> {
+        if !cells.first()?.eq_ignore_ascii_case("model") {
+            return None;
+        }
+        let names = cells
+            .iter()
+            .map(|cell| cell.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let find = |candidates: &[&str]| {
+            names
+                .iter()
+                .position(|name| candidates.contains(&name.as_str()))
+        };
+        Some(Self {
+            input: find(&["short context input", "input"])?,
+            cached_input: find(&["short context cached input", "cached input"])?,
+            output: find(&["short context output", "output"])?,
+            cache_write: find(&[
+                "short context 30m write",
+                "short context cache writes",
+                "30m write",
+                "cache writes",
+            ]),
+            long_input: find(&["long context input"]),
+            long_cached_input: find(&["long context cached input"]),
+            long_output: find(&["long context output"]),
+            long_cache_write: find(&["long context 30m write", "long context cache writes"]),
+        })
+    }
+}
+
+fn openai_rate_from_cells(
+    cells: &[&str],
+    columns: &OpenAiRateColumns,
+) -> Result<Option<(String, ModelRate)>, String> {
     let Some(raw_model) = cells.first().copied() else {
         return Err("official OpenAI pricing row has no model".to_string());
     };
@@ -384,21 +486,23 @@ fn openai_rate_from_cells(cells: &[&str]) -> Result<Option<(String, ModelRate)>,
         return Err(format!("official OpenAI pricing model is invalid: {raw_model}"));
     }
 
-    let Some(input_per_million) = parse_openai_price_cell(cells[1])? else {
+    let price = |index: usize| parse_openai_price_cell(cells[index]);
+    let optional_price = |index: Option<usize>| index.map_or(Ok(None), price);
+    let Some(input_per_million) = price(columns.input)? else {
         return Ok(None);
     };
-    let Some(cached_input_per_million) = parse_openai_price_cell(cells[2])? else {
+    let Some(cached_input_per_million) = price(columns.cached_input)? else {
         return Ok(None);
     };
-    let cache_write_per_million = parse_openai_price_cell(cells[3])?;
-    let Some(output_per_million) = parse_openai_price_cell(cells[4])? else {
+    let cache_write_per_million = optional_price(columns.cache_write)?;
+    let Some(output_per_million) = price(columns.output)? else {
         return Ok(None);
     };
 
-    let long_input = parse_openai_price_cell(cells[5])?;
-    let long_cached = parse_openai_price_cell(cells[6])?;
-    let long_cache_write = parse_openai_price_cell(cells[7])?;
-    let long_output = parse_openai_price_cell(cells[8])?;
+    let long_input = optional_price(columns.long_input)?;
+    let long_cached = optional_price(columns.long_cached_input)?;
+    let long_cache_write = optional_price(columns.long_cache_write)?;
+    let long_output = optional_price(columns.long_output)?;
     let long_context = match (long_input, long_cached, long_output) {
         (Some(input), Some(cached), Some(output)) => Some(LongContextRate {
             input_per_million: input,
@@ -480,15 +584,29 @@ fn valid_openai_context_rate(rate: LongContextRate) -> bool {
 /// TokenBar ships a reviewed fallback catalog and can overlay a strictly
 /// validated copy of Anthropic's official pricing Markdown. Unknown or future
 /// model versions remain unpriced instead of silently inheriting a nearby
-/// model's rate.
+/// model's rate. A model priced by prompt length, such as "for prompts over
+/// 100,000 tokens", switches to its higher row once a request's prompt passes
+/// that size.
 ///
 /// Source: https://platform.claude.com/docs/en/about-claude/pricing.md
 #[derive(Debug, Clone)]
 pub struct AnthropicPricing {
     effective_date: NaiveDate,
     official_rates: HashMap<String, AnthropicModelRate>,
+    long_prompt_rates: HashMap<String, AnthropicLongPromptRate>,
     openrouter: Option<Arc<Catalog>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AnthropicLongPromptRate {
+    prompt_tokens_over: i64,
+    rate: AnthropicModelRate,
+}
+
+type AnthropicRateTables = (
+    HashMap<String, AnthropicModelRate>,
+    HashMap<String, AnthropicLongPromptRate>,
+);
 
 impl Default for AnthropicPricing {
     fn default() -> Self {
@@ -501,6 +619,7 @@ impl AnthropicPricing {
         Self {
             effective_date,
             official_rates: HashMap::new(),
+            long_prompt_rates: HashMap::new(),
             openrouter: None,
         }
     }
@@ -509,9 +628,12 @@ impl AnthropicPricing {
         markdown: &str,
         effective_date: NaiveDate,
     ) -> Result<Self, String> {
+        let (official_rates, long_prompt_rates) =
+            parse_official_anthropic_rates(markdown, effective_date)?;
         Ok(Self {
             effective_date,
-            official_rates: parse_official_anthropic_rates(markdown, effective_date)?,
+            official_rates,
+            long_prompt_rates,
             openrouter: None,
         })
     }
@@ -550,7 +672,7 @@ impl AnthropicPricing {
                 return Some(costs);
             }
         }
-        let rate = self.rate_for_model(model_id)?;
+        let rate = self.rate_for_model(model_id, usage)?;
         let cache_write = anthropic_cache_write_cost(usage.cache_write, cache_writes, rate);
         let costs = TokenCostBreakdown {
             input: usage.input.max(0) as f64 * rate.input_per_million / TOKENS_PER_MILLION,
@@ -564,8 +686,22 @@ impl AnthropicPricing {
         costs.total().is_finite().then_some(costs)
     }
 
-    fn rate_for_model(&self, model_id: &str) -> Option<AnthropicModelRate> {
+    fn rate_for_model(
+        &self,
+        model_id: &str,
+        usage: &TokenBreakdown,
+    ) -> Option<AnthropicModelRate> {
         let normalized = normalize_anthropic_model_id(model_id);
+        let prompt_tokens = usage
+            .input
+            .max(0)
+            .saturating_add(usage.cache_read.max(0))
+            .saturating_add(usage.cache_write.max(0));
+        if let Some(long_prompt) = self.long_prompt_rates.get(&normalized) {
+            if prompt_tokens > long_prompt.prompt_tokens_over {
+                return Some(long_prompt.rate);
+            }
+        }
         self.official_rates
             .get(&normalized)
             .copied()
@@ -631,7 +767,7 @@ fn anthropic_cache_write_cost(
 fn parse_official_anthropic_rates(
     markdown: &str,
     effective_date: NaiveDate,
-) -> Result<HashMap<String, AnthropicModelRate>, String> {
+) -> Result<AnthropicRateTables, String> {
     let mut lines = markdown.lines();
     let Some(header) = lines.find(|line| {
         let header = line.trim_start().to_ascii_lowercase();
@@ -650,6 +786,7 @@ fn parse_official_anthropic_rates(
     }
 
     let mut rates = HashMap::new();
+    let mut long_prompt_rates = HashMap::new();
     for line in lines {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') {
@@ -675,13 +812,40 @@ fn parse_official_anthropic_rates(
         let Some(rate) = official_rate_from_cells(&cells) else {
             return Err(format!("official Anthropic pricing row is invalid: {label}"));
         };
-        rates.insert(model_id, rate);
+        match long_prompt_threshold(label) {
+            Some(prompt_tokens_over) => {
+                long_prompt_rates.insert(
+                    model_id,
+                    AnthropicLongPromptRate {
+                        prompt_tokens_over,
+                        rate,
+                    },
+                );
+            }
+            None => {
+                rates.insert(model_id, rate);
+            }
+        }
     }
 
     if rates.len() < 5 {
         return Err("official Anthropic pricing table contained too few valid models".to_string());
     }
-    Ok(rates)
+    long_prompt_rates.retain(|model_id, _| rates.contains_key(model_id));
+    Ok((rates, long_prompt_rates))
+}
+
+/// Reads the size from a row label such as "Claude Haiku 5.5 (for prompts over
+/// 100,000 tokens)". The matching "up to" row is the model's base price.
+fn long_prompt_threshold(label: &str) -> Option<i64> {
+    let lower = label.to_ascii_lowercase();
+    let (_, remainder) = lower.split_once("for prompts over ")?;
+    let digits = remainder
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == ',')
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse::<i64>().ok().filter(|tokens| *tokens > 0)
 }
 
 fn markdown_table_cells(line: &str) -> Vec<&str> {
@@ -698,7 +862,7 @@ fn official_model_id(label: &str) -> Option<String> {
         return None;
     }
     let family = words.next()?.to_ascii_lowercase();
-    if !matches!(family.as_str(), "fable" | "mythos" | "opus" | "sonnet" | "haiku") {
+    if family.is_empty() || !family.bytes().all(|byte| byte.is_ascii_lowercase()) {
         return None;
     }
     let version = words.next()?.trim_matches(|character: char| {
@@ -833,29 +997,196 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
     normalized
 }
 
-/// Official Fast multipliers reviewed 2026-09-05; GPT-6.1 Sol reviewed 2026-10-14:
-/// - ChatGPT subscription credits: GPT-5.4 is 2x; GPT-5.5/5.6, GPT-6 Astra, and GPT-6.1 Sol are 2.5x.
-/// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6, GPT-6 Astra, and GPT-6.1 Sol are 2x.
+/// Bundled Fast and Ultrafast multipliers, used when the official speed page or
+/// pricing table does not cover a model. Fast reviewed 2026-09-05; GPT-6.1 Sol
+/// reviewed 2026-10-14; GPT-6.1 Terra, GPT-6 Sol, GPT-6 Luna, Ultrafast, and
+/// purchased credits reviewed 2026-10-28:
+/// - ChatGPT included usage: Fast is 2x for GPT-5.4 and 2.5x for GPT-5.5 and
+///   later; Ultrafast is 8x.
+/// - ChatGPT purchased credits: Fast is 2x and Ultrafast is 6x for the models
+///   the speed page lists.
+/// - API Priority pricing: GPT-5.4 is 2x; GPT-5.5 is 2.5x; GPT-5.6 and later
+///   are 2x; Ultrafast is 6x.
 ///
 /// Sources:
 /// - https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode
 /// - https://developers.openai.com/api/docs/pricing
 /// - https://developers.openai.com/api/docs/guides/priority-processing
-fn fast_cost_multiplier(model_id: &str, basis: FastPricingBasis) -> Option<f64> {
+fn bundled_speed_multiplier(model_id: &str, speed: Speed, billing: BillingBasis) -> Option<f64> {
+    const FAST_MODELS: [&str; 9] = [
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ];
+    const ULTRAFAST_MODELS: [&str; 2] = ["gpt-6-astra", "gpt-6.1-sol"];
+
     let normalized = normalize_pricing_model_id(model_id);
-    match (basis, normalized.as_str()) {
-        (FastPricingBasis::ChatGptSubscription, "gpt-6-astra") => Some(2.5),
-        (FastPricingBasis::ApiPriority, "gpt-6-astra") => Some(2.0),
-        (FastPricingBasis::ChatGptSubscription, "gpt-6.1-sol") => Some(2.5),
-        (FastPricingBasis::ApiPriority, "gpt-6.1-sol") => Some(2.0),
-        (_, "gpt-5.4") => Some(2.0),
-        (_, "gpt-5.5") => Some(2.5),
-        (FastPricingBasis::ChatGptSubscription, "gpt-5.6" | "gpt-5.6-sol") => Some(2.5),
-        (FastPricingBasis::ChatGptSubscription, "gpt-5.6-terra" | "gpt-5.6-luna") => Some(2.5),
-        (FastPricingBasis::ApiPriority, "gpt-5.6" | "gpt-5.6-sol") => Some(2.0),
-        (FastPricingBasis::ApiPriority, "gpt-5.6-terra" | "gpt-5.6-luna") => Some(2.0),
-        _ => None,
+    let model = normalized.as_str();
+    match (speed, billing) {
+        (Speed::Ultrafast, _) if !ULTRAFAST_MODELS.contains(&model) => None,
+        (Speed::Ultrafast, BillingBasis::ChatGptIncluded) => Some(8.0),
+        (Speed::Ultrafast, BillingBasis::ChatGptCredits | BillingBasis::Api) => Some(6.0),
+        (Speed::Fast, BillingBasis::ChatGptIncluded) => match model {
+            "gpt-5.4" => Some(2.0),
+            "gpt-5.5" => Some(2.5),
+            _ => FAST_MODELS.contains(&model).then_some(2.5),
+        },
+        (Speed::Fast, BillingBasis::ChatGptCredits) => FAST_MODELS.contains(&model).then_some(2.0),
+        (Speed::Fast, BillingBasis::Api) => match model {
+            "gpt-5.4" => Some(2.0),
+            "gpt-5.5" => Some(2.5),
+            _ => FAST_MODELS.contains(&model).then_some(2.0),
+        },
     }
+}
+
+/// ChatGPT usage multipliers for Fast and Ultrafast, read from a daily copy of
+/// the official Codex speed page.
+///
+/// Source: https://learn.chatgpt.com/docs/agent-configuration/speed.md
+#[derive(Debug, Clone, Default)]
+struct SpeedRules {
+    fast: Option<SpeedRule>,
+    ultrafast: Option<SpeedRule>,
+}
+
+#[derive(Debug, Clone)]
+struct SpeedRule {
+    models: HashSet<String>,
+    included: f64,
+    credits: f64,
+}
+
+impl SpeedRules {
+    fn from_official_markdown(markdown: &str) -> Option<Self> {
+        if !markdown.lines().any(|line| line.trim() == "# Speed") {
+            return None;
+        }
+        let rules = Self {
+            fast: speed_rule(markdown, "Fast mode"),
+            ultrafast: speed_rule(markdown, "Ultrafast mode"),
+        };
+        (rules.fast.is_some() || rules.ultrafast.is_some()).then_some(rules)
+    }
+
+    fn rule(&self, speed: Speed) -> Option<&SpeedRule> {
+        match speed {
+            Speed::Fast => self.fast.as_ref(),
+            Speed::Ultrafast => self.ultrafast.as_ref(),
+        }
+    }
+}
+
+/// Reads one `## <heading>` section of the speed page: the models named in
+/// its "supports" sentences, and the "at Nx" multipliers in its included-usage
+/// and purchased-credits sentences. A section missing any of the three is
+/// ignored so the bundled multipliers stay in use.
+fn speed_rule(markdown: &str, heading: &str) -> Option<SpeedRule> {
+    let section = markdown_section(markdown, heading)?;
+    let text = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut models = HashSet::new();
+    let mut included = None;
+    let mut credits = None;
+    for sentence in text.split(". ") {
+        let lower = sentence.to_ascii_lowercase();
+        if lower.contains("support") {
+            models.extend(gpt_model_ids(sentence));
+        }
+        let Some(multiplier) = multiplier_after_at(&lower) else {
+            continue;
+        };
+        if lower.contains("included") {
+            included.get_or_insert(multiplier);
+        } else if lower.contains("credits") {
+            credits.get_or_insert(multiplier);
+        }
+    }
+    if models.is_empty() {
+        return None;
+    }
+    Some(SpeedRule {
+        models,
+        included: included?,
+        credits: credits?,
+    })
+}
+
+fn markdown_section(markdown: &str, heading: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    lines.find(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .is_some_and(|title| title.trim().eq_ignore_ascii_case(heading))
+    })?;
+    let section = lines
+        .take_while(|line| {
+            let line = line.trim_start();
+            !line.starts_with("# ") && !line.starts_with("## ")
+        })
+        .collect::<Vec<_>>();
+    Some(section.join("\n"))
+}
+
+/// Turns names such as "GPT-6.1 Sol" or "GPT-5.6" into the ids Codex logs
+/// ("gpt-6.1-sol", "gpt-5.6").
+fn gpt_model_ids(sentence: &str) -> Vec<String> {
+    let words = sentence.split_whitespace().collect::<Vec<_>>();
+    let mut ids = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let (word, mut ended) = trim_sentence_word(words[index]);
+        index += 1;
+        let Some(version) = word.strip_prefix("GPT-").filter(|version| {
+            version.starts_with(|character: char| character.is_ascii_digit())
+                && version.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        }) else {
+            continue;
+        };
+        let mut id = format!("gpt-{version}");
+        while !ended && index < words.len() {
+            let (name, name_ended) = trim_sentence_word(words[index]);
+            if !name.starts_with(|character: char| character.is_ascii_uppercase())
+                || !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                || matches!(name, "Fast" | "Ultrafast" | "Standard" | "Priority")
+            {
+                break;
+            }
+            id.push('-');
+            id.push_str(&name.to_ascii_lowercase());
+            ended = name_ended;
+            index += 1;
+        }
+        ids.push(id);
+    }
+    ids
+}
+
+fn trim_sentence_word(word: &str) -> (&str, bool) {
+    let trimmed = word.trim_end_matches(|character: char| {
+        matches!(character, ',' | '.' | ';' | ':' | ')')
+    });
+    (trimmed, trimmed.len() != word.len())
+}
+
+fn multiplier_after_at(sentence: &str) -> Option<f64> {
+    let words = sentence.split_whitespace().collect::<Vec<_>>();
+    words.windows(2).find_map(|pair| {
+        if pair[0] != "at" {
+            return None;
+        }
+        trim_sentence_word(pair[1])
+            .0
+            .strip_suffix('x')?
+            .parse::<f64>()
+            .ok()
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 1.0 && *multiplier <= 50.0)
+    })
 }
 
 fn bundled_rate_for_model(model_id: &str) -> Option<ModelRate> {
@@ -998,7 +1329,10 @@ fn bundled_rate_for_model(model_id: &str) -> Option<ModelRate> {
     }
 }
 
-pub(crate) fn normalize_pricing_model_id(model_id: &str) -> String {
+/// Lowercases a Codex model id and removes provider prefixes and a trailing
+/// `(effort)` label. Snapshot dates and effort suffixes stay, so a pricing row
+/// for an exact snapshot still wins over its base model.
+fn clean_pricing_model_id(model_id: &str) -> String {
     let mut normalized = model_id.trim().to_ascii_lowercase();
     for prefix in ["openai/", "openai_codex/"] {
         if let Some(model) = normalized.strip_prefix(prefix) {
@@ -1016,60 +1350,15 @@ pub(crate) fn normalize_pricing_model_id(model_id: &str) -> String {
             }
         }
     }
-
-    const BASE_MODELS: [&str; 21] = [
-        "gpt-6.1-sol",
-        "gpt-6-astra",
-        "gpt-5.1-codex-mini",
-        "gpt-5.1-codex-max",
-        "gpt-5.3-codex-spark",
-        "codex-mini-latest",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.2-codex",
-        "gpt-5.1-codex",
-        "gpt-5-codex",
-        "gpt-5-mini",
-        "gpt-5.4",
-        "gpt-5.2",
-        "gpt-5.1",
-        "gpt-5.5",
-        "gpt-5.6",
-        "gpt-5",
-    ];
-
-    for base in BASE_MODELS {
-        if normalized == base || is_snapshot_of(&normalized, base) {
-            return base.to_string();
-        }
-    }
-
-    for suffix in [
-        "-minimal", "-medium", "-xhigh", "-high", "-auto", "-none", "-low", "-fast",
-    ] {
-        if let Some(candidate) = normalized.strip_suffix(suffix) {
-            for base in BASE_MODELS {
-                if candidate == base || is_snapshot_of(candidate, base) {
-                    return base.to_string();
-                }
-            }
-        }
-    }
     normalized
 }
 
-fn is_snapshot_of(model_id: &str, base: &str) -> bool {
-    let Some(suffix) = model_id
-        .strip_prefix(base)
-        .and_then(|value| value.strip_prefix('-'))
-    else {
-        return false;
-    };
-    let compact = suffix.replace('-', "");
-    compact.len() == 8 && compact.bytes().all(|byte| byte.is_ascii_digit())
+/// Reduces a Codex model id to the base model that price tables list, with no
+/// provider prefix, effort label or suffix, or snapshot date. The rule needs no
+/// list of known models, so a new row in the official table also prices the
+/// dated and effort-suffixed ids Codex logs for that model.
+pub(crate) fn normalize_pricing_model_id(model_id: &str) -> String {
+    normalize_model_for_grouping(model_id)
 }
 
 /// Google Gemini pricing used for Antigravity estimates.

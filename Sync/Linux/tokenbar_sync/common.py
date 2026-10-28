@@ -565,7 +565,7 @@ def _validate_request(value: Any, label: str, *, depth: int = 0) -> None:
     if request.get("costSource") not in {"unknown", "providerReported", "estimated"}:
         raise ValidationError(f"{label}.costSource is invalid")
     service_tier = request.get("serviceTier")
-    if service_tier is not None and service_tier not in {"unknown", "standard", "fast", "mixed"}:
+    if service_tier is not None and service_tier not in {"unknown", "standard", "fast", "ultrafast", "mixed"}:
         raise ValidationError(f"{label}.serviceTier is invalid")
     platform = request.get("platform")
     if platform is not None:

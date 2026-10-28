@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::{human_message_text, message_content_text};
 use crate::usage::{
     content_preview_from_str, content_preview_from_value, normalize_reasoning_effort, normalize_workspace_key,
-    workspace_label_from_key, ServiceTier, TokenBreakdown, UnifiedMessage,
+    workspace_label_from_key, BillingBasis, ServiceTier, TokenBreakdown, UnifiedMessage,
 };
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +40,7 @@ struct CodexPayload {
     reasoning_effort: Option<Value>,
     model_info: Option<CodexModelInfo>,
     info: Option<CodexInfo>,
+    rate_limits: Option<Value>,
     turn_id: Option<String>,
     time_to_first_token_ms: Option<i64>,
     started_at_ms: Option<i64>,
@@ -193,6 +194,7 @@ struct CodexParseState {
     current_service_tier: ServiceTier,
     service_tier_consensus: Option<ServiceTier>,
     service_tier_conflicted: bool,
+    current_billing: Option<BillingBasis>,
     current_turn_start_ms: Option<i64>,
     current_model_request_start_ms: Option<i64>,
     current_model_generation_start_ms: Option<i64>,
@@ -541,6 +543,9 @@ fn parse_codex_reader<R: BufRead>(
                     state.current_model_generation_start_ms = None;
                     state.current_model_response_end_ms = None;
                     state.pending_next_model_request_start_ms = None;
+                    if let Some(billing) = billing_from_rate_limits(payload.rate_limits.as_ref()) {
+                        state.current_billing = Some(billing);
+                    }
 
                     let Some(info) = payload.info else {
                         continue;
@@ -632,6 +637,7 @@ fn parse_codex_reader<R: BufRead>(
                         agent,
                     );
                     message.service_tier = state.current_service_tier;
+                    message.billing = state.current_billing;
                     message.reasoning_effort.clone_from(&state.current_reasoning_effort);
                     message.duration_ms = duration_ms;
                     message.model_duration_ms = model_duration_ms;
@@ -698,6 +704,7 @@ fn parse_codex_reader<R: BufRead>(
         }
         if let Some(mut message) = headless_message {
             message.service_tier = state.current_service_tier;
+            message.billing = state.current_billing;
             message.reasoning_effort.clone_from(&state.current_reasoning_effort);
             message.set_workspace(
                 state.session_workspace_key.clone(),
@@ -709,6 +716,7 @@ fn parse_codex_reader<R: BufRead>(
 
     flush_pending_model_messages(&mut pending_model_messages, &mut messages, "unknown");
     backfill_homogeneous_service_tier(&mut messages, &state);
+    backfill_leading_billing(&mut messages);
     Ok(ParsedCodexFile {
         messages,
         service_tier_snapshots,
@@ -777,6 +785,7 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
 
 fn service_tier_from_raw(raw: Option<&str>) -> ServiceTier {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("ultrafast" | "ultra_fast" | "ultra-fast") => ServiceTier::Ultrafast,
         Some("priority" | "fast") => ServiceTier::Fast,
         Some("default" | "standard") => ServiceTier::Standard,
         _ => ServiceTier::Unknown,
@@ -822,6 +831,45 @@ fn backfill_homogeneous_service_tier(messages: &mut [UnifiedMessage], state: &Co
         if message.service_tier == ServiceTier::Unknown {
             message.service_tier = tier;
         }
+    }
+}
+
+/// Reads how a request was paid for from the rate-limit snapshot Codex logs
+/// with each token count. Only ChatGPT sign-in reports a plan; once a usage
+/// window is spent, further requests draw on purchased credits. Returns `None`
+/// when the snapshot is missing, so the session's last known basis applies.
+fn billing_from_rate_limits(rate_limits: Option<&Value>) -> Option<BillingBasis> {
+    let rate_limits = rate_limits?.as_object()?;
+    rate_limits
+        .get("plan_type")?
+        .as_str()
+        .filter(|plan| !plan.trim().is_empty())?;
+    let limit_reached = rate_limits
+        .get("rate_limit_reached_type")
+        .and_then(Value::as_str)
+        .is_some_and(|reached| !reached.trim().is_empty());
+    let window_spent = ["primary", "secondary"].iter().any(|window| {
+        rate_limits
+            .get(*window)
+            .and_then(|window| window.get("used_percent"))
+            .and_then(Value::as_f64)
+            .is_some_and(|used| used >= 100.0)
+    });
+    Some(if limit_reached || window_spent {
+        BillingBasis::ChatGptCredits
+    } else {
+        BillingBasis::ChatGptIncluded
+    })
+}
+
+/// A session's first token counts can arrive before Codex has a rate-limit
+/// snapshot. They were paid for the same way as the first request that has one.
+fn backfill_leading_billing(messages: &mut [UnifiedMessage]) {
+    let Some(first_known) = messages.iter().find_map(|message| message.billing) else {
+        return;
+    };
+    for message in messages.iter_mut().take_while(|message| message.billing.is_none()) {
+        message.billing = Some(first_known);
     }
 }
 

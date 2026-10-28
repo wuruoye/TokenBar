@@ -282,6 +282,7 @@ private extension ActivityServiceTier {
     var menuBadge: String? {
         switch self {
         case .fast: "FAST"
+        case .ultrafast: "ULTRA"
         case .mixed: "MIXED"
         case .unknown, .standard: nil
         }

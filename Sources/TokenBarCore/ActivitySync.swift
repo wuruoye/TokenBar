@@ -1247,7 +1247,7 @@ public extension SessionSummary {
             tokens: redacted.tokens,
             costUsd: redacted.costUsd,
             models: redacted.models,
-            requests: redacted.requests,
+            requests: redacted.requests.map { $0.withSyncCompatibleServiceTier() },
             title: sanitizedActivitySyncSessionTitle(self.title),
             workspacePath: nil,
             platform: redacted.platform)
@@ -1269,6 +1269,34 @@ public extension SessionSummary {
 public extension RequestSummary {
     var synchronizedDeviceID: String? {
         synchronizedDeviceIDForActivitySync(from: self.id)
+    }
+
+    /// Sync servers and other devices that predate Ultrafast reject the tier,
+    /// so it is uploaded as Fast. Its cost is already priced at Ultrafast.
+    func withSyncCompatibleServiceTier() -> RequestSummary {
+        RequestSummary(
+            id: self.id,
+            sessionId: self.sessionId,
+            physicalSessionId: self.physicalSessionId,
+            isSubagent: self.isSubagent,
+            agent: self.agent,
+            model: self.model,
+            provider: self.provider,
+            startedAtMs: self.startedAtMs,
+            endedAtMs: self.endedAtMs,
+            durationMs: self.durationMs,
+            modelDurationMs: self.modelDurationMs,
+            timeToFirstTokenMs: self.timeToFirstTokenMs,
+            tokens: self.tokens,
+            costUsd: self.costUsd,
+            costSource: self.costSource,
+            promptPreview: self.promptPreview,
+            outputPreview: self.outputPreview,
+            sessionPath: self.sessionPath,
+            contributions: self.contributions?.map { $0.withSyncCompatibleServiceTier() },
+            serviceTier: self.serviceTier == .ultrafast ? .fast : self.serviceTier,
+            reasoningEffort: self.reasoningEffort,
+            platform: self.platform)
     }
 
     var isSynchronizedRemote: Bool {

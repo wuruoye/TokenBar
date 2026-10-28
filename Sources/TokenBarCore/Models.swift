@@ -258,6 +258,7 @@ public enum ActivityServiceTier: String, Codable, Equatable, Sendable {
     case unknown
     case standard
     case fast
+    case ultrafast
     case mixed
 
     public static func combining(_ tiers: some Sequence<ActivityServiceTier>) -> ActivityServiceTier {

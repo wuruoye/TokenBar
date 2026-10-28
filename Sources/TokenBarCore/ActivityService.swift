@@ -100,6 +100,7 @@ public struct ActivityService: ActivityProviding, Sendable {
     private let timeout: TimeInterval
     private let memoryDatabaseURLProvider: @Sendable () async -> URL?
     private let openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)?
+    private let codexSpeedCatalog: (any CodexSpeedCatalogUpdating)?
     private let anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)?
     private let openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)?
     private let resolveHelper: @Sendable () throws -> URL
@@ -111,6 +112,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURL: URL? = nil,
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
+        codexSpeedCatalog: (any CodexSpeedCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -120,6 +122,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         self.arguments = arguments
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.openAIPricingCatalog = openAIPricingCatalog
+        self.codexSpeedCatalog = codexSpeedCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
@@ -135,6 +138,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         memoryDatabaseURL: URL? = nil,
         memoryDatabaseURLProvider: (@Sendable () async -> URL?)? = nil,
         openAIPricingCatalog: (any OpenAIPricingCatalogUpdating)? = nil,
+        codexSpeedCatalog: (any CodexSpeedCatalogUpdating)? = nil,
         anthropicPricingCatalog: (any AnthropicPricingCatalogUpdating)? = nil,
         openRouterPricingCatalog: (any OpenRouterPricingCatalogUpdating)? = nil,
         environment: [String: String] = [:],
@@ -145,6 +149,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         self.arguments = arguments
         self.memoryDatabaseURLProvider = memoryDatabaseURLProvider ?? { memoryDatabaseURL }
         self.openAIPricingCatalog = openAIPricingCatalog
+        self.codexSpeedCatalog = codexSpeedCatalog
         self.anthropicPricingCatalog = anthropicPricingCatalog
         self.openRouterPricingCatalog = openRouterPricingCatalog
         self.environment = environment
@@ -200,14 +205,17 @@ public struct ActivityService: ActivityProviding, Sendable {
         statisticsTimeZone: TokenBarStatisticsTimeZone) async throws -> ActivitySnapshot
     {
         async let openAIPricingURL = self.openAIPricingCatalog?.refreshIfNeeded()
+        async let codexSpeedURL = self.codexSpeedCatalog?.refreshIfNeeded()
         async let anthropicPricingURL = self.anthropicPricingCatalog?.refreshIfNeeded()
         async let openRouterPricingURL = self.openRouterPricingCatalog?.refreshIfNeeded()
         let pricingURLs = await (openAIPricingURL, anthropicPricingURL, openRouterPricingURL)
+        let speedURL = await codexSpeedURL
         let initial = try await self.runSnapshot(
             helperURL: helperURL,
             sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
             memoryDatabaseURL: memoryDatabaseURL,
             openAIPricingURL: pricingURLs.0,
+            codexSpeedURL: speedURL,
             anthropicPricingURL: pricingURLs.1,
             openRouterPricingURL: pricingURLs.2,
             snapshotArguments: snapshotArguments,
@@ -238,6 +246,7 @@ public struct ActivityService: ActivityProviding, Sendable {
             sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
             memoryDatabaseURL: memoryDatabaseURL,
             openAIPricingURL: refreshedURLs.0 ?? pricingURLs.0,
+            codexSpeedURL: speedURL,
             anthropicPricingURL: refreshedURLs.1 ?? pricingURLs.1,
             openRouterPricingURL: refreshedURLs.2 ?? pricingURLs.2,
             snapshotArguments: snapshotArguments,
@@ -249,6 +258,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         memoryDatabaseURL: URL?,
         openAIPricingURL: URL?,
+        codexSpeedURL: URL?,
         anthropicPricingURL: URL?,
         openRouterPricingURL: URL?,
         snapshotArguments: [String],
@@ -260,6 +270,7 @@ public struct ActivityService: ActivityProviding, Sendable {
                 sinceWeeklyResetAtByPlatform: sinceWeeklyResetAtByPlatform,
                 memoryDatabaseURL: memoryDatabaseURL,
                 openAIPricingURL: openAIPricingURL,
+                codexSpeedURL: codexSpeedURL,
                 anthropicPricingURL: anthropicPricingURL,
                 openRouterPricingURL: openRouterPricingURL,
                 snapshotArguments: snapshotArguments,
@@ -295,6 +306,7 @@ public struct ActivityService: ActivityProviding, Sendable {
         sinceWeeklyResetAtByPlatform: [TokenPlatform: Date],
         memoryDatabaseURL: URL?,
         openAIPricingURL: URL?,
+        codexSpeedURL: URL?,
         anthropicPricingURL: URL?,
         openRouterPricingURL: URL?,
         snapshotArguments: [String],
@@ -320,6 +332,9 @@ public struct ActivityService: ActivityProviding, Sendable {
         }
         if let openAIPricingURL {
             arguments += ["--openai-pricing-markdown", openAIPricingURL.path]
+        }
+        if let codexSpeedURL {
+            arguments += ["--codex-speed-markdown", codexSpeedURL.path]
         }
         if let anthropicPricingURL {
             arguments += ["--anthropic-pricing-markdown", anthropicPricingURL.path]

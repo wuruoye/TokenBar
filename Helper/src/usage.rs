@@ -161,6 +161,28 @@ pub enum ServiceTier {
     Unknown,
     Standard,
     Fast,
+    Ultrafast,
+}
+
+/// How a request was charged. Fast and Ultrafast cost a different multiple of
+/// the Standard rate for ChatGPT included usage, purchased ChatGPT credits, and
+/// API keys, so pricing needs to know which one paid for each request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BillingBasis {
+    /// Signed in with ChatGPT, drawing on the plan's included usage.
+    ChatGptIncluded,
+    /// Signed in with ChatGPT after included usage ran out, drawing on
+    /// purchased credits or Enterprise pay-as-you-go usage.
+    ChatGptCredits,
+    /// Signed in with an API key, charged at API token prices.
+    #[default]
+    Api,
+}
+
+impl BillingBasis {
+    pub const fn is_chatgpt(self) -> bool {
+        matches!(self, Self::ChatGptIncluded | Self::ChatGptCredits)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +213,10 @@ pub struct UnifiedMessage {
     pub cost_source: CostSource,
     #[serde(default)]
     pub service_tier: ServiceTier,
+    /// Read from the session log when it says; otherwise pricing falls back
+    /// to the current sign-in method.
+    #[serde(skip)]
+    pub billing: Option<BillingBasis>,
     #[serde(default)]
     pub duration_ms: Option<i64>,
     #[serde(default)]
@@ -246,6 +272,7 @@ impl UnifiedMessage {
             token_costs: None,
             cost_source: CostSource::Unknown,
             service_tier: ServiceTier::Unknown,
+            billing: None,
             duration_ms: None,
             model_duration_ms: None,
             time_to_first_token_ms: None,

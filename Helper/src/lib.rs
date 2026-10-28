@@ -97,6 +97,7 @@ pub enum ActivityServiceTier {
     Unknown,
     Standard,
     Fast,
+    Ultrafast,
     Mixed,
 }
 
@@ -106,6 +107,7 @@ impl From<ServiceTier> for ActivityServiceTier {
             ServiceTier::Unknown => Self::Unknown,
             ServiceTier::Standard => Self::Standard,
             ServiceTier::Fast => Self::Fast,
+            ServiceTier::Ultrafast => Self::Ultrafast,
         }
     }
 }

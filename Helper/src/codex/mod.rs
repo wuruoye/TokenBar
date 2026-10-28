@@ -86,9 +86,9 @@ fn apply_pricing(message: &mut UnifiedMessage, pricing: &CodexPricing) {
     message.cost_source = CostSource::Unknown;
     if let Some(token_costs) = pricing.calculate_token_costs_with_service_tier(
         &message.model_id,
-        Some(&message.provider_id),
         &message.tokens,
         message.service_tier,
+        message.billing,
     ) {
         message.cost = token_costs.total();
         message.token_costs = Some(token_costs);
