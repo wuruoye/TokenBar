@@ -17,6 +17,13 @@ struct DesktopCardView: View {
     static let glowRoom: CGFloat = 22
     /// The corner radius of macOS desktop widgets.
     static let cornerRadius: CGFloat = 27.88
+    /// Claude's cream (`#FAF9F5`) in the light appearance, the window color
+    /// in the dark one.
+    private static let background = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? .windowBackgroundColor
+            : NSColor(srgbRed: 0xFA / 255, green: 0xF9 / 255, blue: 0xF5 / 255, alpha: 1)
+    })
     private static let padding: CGFloat = 14
 
     let state: DesktopCardState
@@ -44,7 +51,7 @@ struct DesktopCardView: View {
                 // be re-rendered with every redraw.
                 let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
                 ZStack {
-                    shape.fill(Color(nsColor: .windowBackgroundColor))
+                    shape.fill(Self.background)
                     shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                 }
             }
