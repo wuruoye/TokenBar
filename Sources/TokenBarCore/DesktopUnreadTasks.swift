@@ -43,6 +43,12 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
 
 /// Tracks finished Codex and Claude desktop tasks that each app's sidebar still
 /// marks as unread.
+///
+/// The apps mark the task they show as read as soon as their window comes to
+/// the front, even when the user only passes through on the way to another
+/// app or Space. A task marked read during a visit shorter than `readDwell`
+/// stays unread here until its app stays in front that long again, showing
+/// the task where the app tells which one it shows.
 @MainActor
 @Observable
 public final class DesktopUnreadTaskMonitor {
@@ -51,11 +57,36 @@ public final class DesktopUnreadTaskMonitor {
     /// Tasks still running a turn per platform, most recently started first.
     public private(set) var running: [TokenPlatform: [DesktopRunningTask]] = [:]
 
+    /// A time an app was in front.
+    private struct Visit {
+        let start: Date
+        var end: Date?
+    }
+
+    private struct HeldTask {
+        let task: DesktopUnreadTask
+        let since: Date
+    }
+
+    /// How long an app has to stay in front for the task it shows to count as read.
+    static let readDwell: TimeInterval = 3
+    /// Claude can write a read state a while after the visit that caused it.
+    static let readLag: TimeInterval = 60
+    /// Bounds a hold on a task that is archived before the user sees it.
+    static let holdLimit: TimeInterval = 24 * 60 * 60
+
     @ObservationIgnored private let reader: DesktopUnreadTaskReader
     @ObservationIgnored private var watcher: DesktopUnreadTaskWatcher?
 
     @ObservationIgnored private let claudeTrackerStateURL: URL?
     @ObservationIgnored private var isClaudeActive = true
+    /// The unread tasks each app reports, before held tasks are added.
+    @ObservationIgnored private var reported: [TokenPlatform: [DesktopUnreadTask]] = [:]
+    @ObservationIgnored private var held: [TokenPlatform: [String: HeldTask]] = [:]
+    @ObservationIgnored private var visits: [TokenPlatform: Visit] = [:]
+    /// Tasks opened from TokenBar, which count as read as soon as their app shows them.
+    @ObservationIgnored private var openedAt: [TokenPlatform: [String: Date]] = [:]
+    @ObservationIgnored private var releaseChecks: [TokenPlatform: Task<Void, Never>] = [:]
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -82,13 +113,41 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     public nonisolated static let claudeBundleIdentifier = "com.anthropic.claudefordesktop"
+    public nonisolated static let codexBundleIdentifier = "com.openai.codex"
 
-    /// Claude counts a turn that ends in the session its window shows as read,
-    /// even while another app is in front, so TokenBar keeps such a turn unread
-    /// until Claude comes to the front on it.
-    public func setClaudeIsActive(_ isActive: Bool) {
-        self.isClaudeActive = isActive
-        self.watcher?.setClaudeActive(isActive)
+    /// Hears which app is in front. Claude counts a turn that ends in the
+    /// session its window shows as read, even while another app is in front,
+    /// so TokenBar keeps such a turn unread until Claude comes to the front on
+    /// it.
+    public func setFrontmostApplication(_ bundleIdentifier: String?) {
+        let platform: TokenPlatform? = switch bundleIdentifier {
+        case Self.claudeBundleIdentifier: .claude
+        case Self.codexBundleIdentifier: .codex
+        default: nil
+        }
+        let now = Date()
+        for (other, visit) in self.visits where other != platform && visit.end == nil {
+            self.visits[other]?.end = now
+            self.releaseChecks.removeValue(forKey: other)?.cancel()
+        }
+        if let platform, self.visits[platform].map({ $0.end != nil }) ?? true {
+            self.visits[platform] = Visit(start: now)
+            self.scheduleReleaseCheck(for: platform)
+        }
+        let isClaudeActive = platform == .claude
+        if isClaudeActive != self.isClaudeActive {
+            self.isClaudeActive = isClaudeActive
+            self.watcher?.setClaudeActive(isClaudeActive)
+        }
+    }
+
+    /// A task opened from TokenBar is read once its app shows it, however
+    /// briefly.
+    public func markOpened(platform: TokenPlatform, id: String) {
+        self.openedAt[platform, default: [:]][id] = Date()
+        if self.held[platform]?.removeValue(forKey: id) != nil {
+            self.publishTasks(for: platform)
+        }
     }
 
     public func start() {
@@ -116,6 +175,13 @@ public final class DesktopUnreadTaskMonitor {
         self.watcher = nil
         self.tasks = [:]
         self.running = [:]
+        self.reported = [:]
+        self.held = [:]
+        self.openedAt = [:]
+        for check in self.releaseChecks.values {
+            check.cancel()
+        }
+        self.releaseChecks = [:]
     }
 
     public func refresh() {
@@ -123,13 +189,98 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     private func accept(_ tasks: [DesktopUnreadTask], for platform: TokenPlatform) {
-        guard self.watcher != nil, self.tasks[platform] != tasks else { return }
-        self.tasks[platform] = tasks
+        guard self.watcher != nil else { return }
+        let now = Date()
+        let ids = Set(tasks.map(\.id))
+        let opened = (self.openedAt[platform] ?? [:]).filter { now.timeIntervalSince($0.value) < Self.readLag }
+        self.openedAt[platform] = opened
+        if self.isPassingVisit(of: platform, now: now) {
+            for task in self.reported[platform] ?? [] where !ids.contains(task.id) && opened[task.id] == nil {
+                self.held[platform, default: [:]][task.id] = HeldTask(task: task, since: now)
+            }
+        }
+        self.reported[platform] = tasks
+        self.releaseHeld(for: platform, now: now)
+        self.publishTasks(for: platform)
     }
 
     private func acceptRunning(_ tasks: [DesktopRunningTask], for platform: TokenPlatform) {
         guard self.watcher != nil, self.running[platform] != tasks else { return }
         self.running[platform] = tasks
+        // A new turn means the user saw the last one.
+        if !(self.held[platform] ?? [:]).isEmpty {
+            self.publishTasks(for: platform)
+        }
+    }
+
+    /// Whether the app is in front, or left it recently, after a visit too
+    /// short for the user to have read what it showed.
+    private func isPassingVisit(of platform: TokenPlatform, now: Date) -> Bool {
+        guard let visit = self.visits[platform] else { return false }
+        guard (visit.end ?? now).timeIntervalSince(visit.start) < Self.readDwell else { return false }
+        return visit.end.map { now.timeIntervalSince($0) < Self.readLag } ?? true
+    }
+
+    /// Releases held tasks once the app has stayed in front long enough. Claude
+    /// logs the session its window shows, so only that one is released there.
+    private func releaseHeld(for platform: TokenPlatform, now: Date) {
+        guard var held = self.held[platform], !held.isEmpty else { return }
+        held = held.filter { now.timeIntervalSince($0.value.since) < Self.holdLimit }
+        if let visit = self.visits[platform],
+           visit.end == nil,
+           now.timeIntervalSince(visit.start) >= Self.readDwell
+        {
+            if platform == .claude {
+                switch self.reader.claudeShownSession() {
+                case let .session(id): held[id] = nil
+                case .none: break
+                case .unknown: held = [:]
+                }
+            } else {
+                held = [:]
+            }
+        }
+        self.held[platform] = held
+    }
+
+    /// Checks once when the visit reaches `readDwell`. Later, switching to a
+    /// held Claude session rewrites its record, and the recount that follows
+    /// releases it.
+    private func scheduleReleaseCheck(for platform: TokenPlatform) {
+        guard !(self.held[platform] ?? [:]).isEmpty,
+              let visit = self.visits[platform],
+              visit.end == nil
+        else {
+            return
+        }
+        let remaining = Self.readDwell - Date().timeIntervalSince(visit.start)
+        guard remaining > 0 else { return }
+        let delay = remaining + 0.1
+        self.releaseChecks[platform]?.cancel()
+        self.releaseChecks[platform] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.releaseChecks[platform] = nil
+            self.releaseHeld(for: platform, now: Date())
+            self.publishTasks(for: platform)
+        }
+    }
+
+    /// Publishes the reported tasks and the held ones that are neither
+    /// reported again nor running a new turn.
+    private func publishTasks(for platform: TokenPlatform) {
+        let reported = self.reported[platform] ?? []
+        let excluded = Set(reported.map(\.id) + (self.running[platform] ?? []).map(\.id))
+        let held = (self.held[platform] ?? [:]).filter { !excluded.contains($0.key) }
+        self.held[platform] = held
+        let tasks = held.isEmpty ? reported : (reported + held.values.map(\.task)).sorted {
+            ($0.updatedAt ?? .distantPast, $0.id) > ($1.updatedAt ?? .distantPast, $1.id)
+        }
+        if !held.isEmpty {
+            self.scheduleReleaseCheck(for: platform)
+        }
+        guard self.tasks[platform] != tasks else { return }
+        self.tasks[platform] = tasks
     }
 }
 
