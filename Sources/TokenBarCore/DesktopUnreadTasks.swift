@@ -69,7 +69,7 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// How long an app has to stay in front for the task it shows to count as read.
-    static let readDwell: TimeInterval = 3
+    static let readDwell: TimeInterval = 5
     /// Claude can write a read state a while after the visit that caused it.
     static let readLag: TimeInterval = 60
     /// Bounds a hold on a task that is archived before the user sees it.
