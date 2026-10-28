@@ -38,9 +38,16 @@ struct DesktopCardView: View {
             .padding(Self.padding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
-            // `BreathingGlow` draws the drop shadow once in Core Animation; a
-            // SwiftUI shadow would be re-rendered with every redraw.
-            .modifier(CardSurface(shape: RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)))
+            .background {
+                // Opaque like a full-color desktop widget. `BreathingGlow` draws
+                // the drop shadow once in Core Animation; a SwiftUI shadow would
+                // be re-rendered with every redraw.
+                let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                ZStack {
+                    shape.fill(Color(nsColor: .windowBackgroundColor))
+                    shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                }
+            }
             .overlay {
                 BreathingGlow(
                     cornerRadius: Self.cornerRadius,
@@ -1109,34 +1116,6 @@ private final class SpinningRingView: NSView {
 }
 
 // MARK: Pieces
-
-/// Liquid Glass over the desktop, tinted with the window color so the
-/// wallpaper shows through only faintly, or a thick material on systems
-/// without it. The glass stays behind the content: content inside it takes
-/// its colors from the wallpaper and can become hard to read.
-private struct CardSurface: ViewModifier {
-    /// How strongly the window color covers the glass.
-    private static let tintOpacity = 0.7
-
-    let shape: RoundedRectangle
-
-    func body(content: Content) -> some View {
-        if #available(macOS 26, *) {
-            content.background {
-                Color.clear.glassEffect(
-                    .regular.tint(Color(nsColor: .windowBackgroundColor).opacity(Self.tintOpacity)),
-                    in: self.shape)
-            }
-        } else {
-            content.background {
-                ZStack {
-                    self.shape.fill(.thickMaterial)
-                    self.shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-                }
-            }
-        }
-    }
-}
 
 /// Anthropic Sans from the app's resources, or the system font in a build
 /// without it. The font is not open source, so the repository leaves it out
