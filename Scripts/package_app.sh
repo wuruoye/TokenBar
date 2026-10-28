@@ -10,8 +10,6 @@ LOCAL_SIGNING_IDENTITY_FILE="$ROOT/.tokenbar-codesign-identity"
 SIGNING_IDENTITY="${CODESIGN_IDENTITY:-}"
 BUNDLE_IDENTIFIER="${TOKENBAR_BUNDLE_IDENTIFIER:-}"
 BUNDLE_DISPLAY_NAME="${TOKENBAR_BUNDLE_DISPLAY_NAME:-}"
-APP_GROUP="${TOKENBAR_APP_GROUP:-}"
-WIDGET_NAME="TokenBarWidget"
 
 if [[ -z "$SIGNING_IDENTITY" && (-e "$LOCAL_SIGNING_IDENTITY_FILE" || -L "$LOCAL_SIGNING_IDENTITY_FILE") ]]; then
   if [[ ! -f "$LOCAL_SIGNING_IDENTITY_FILE" || -L "$LOCAL_SIGNING_IDENTITY_FILE" ]]; then
@@ -78,7 +76,6 @@ validate_existing_app_target() {
 validate_existing_app_target "$APP_PATH"
 
 swift build --package-path "$ROOT" -c "$CONFIGURATION" --product TokenBar
-swift build --package-path "$ROOT" -c "$CONFIGURATION" --product "$WIDGET_NAME"
 SWIFT_BIN_DIR="$(swift build --package-path "$ROOT" -c "$CONFIGURATION" --show-bin-path)"
 
 CARGO_ENCODED_RUSTFLAGS="$RUST_BUILD_FLAGS" cargo build \
@@ -137,60 +134,12 @@ if [[ "$SIGNING_IDENTITY" != "-" ]]; then
 fi
 
 codesign "${SIGN_ARGS[@]}" "$STAGING_PATH/Contents/Helpers/tokenbar-helper"
-
-# A WidgetKit extension must be sandboxed and share data with the app through
-# an App Group. Without a provisioning profile, macOS only grants groups named
-# after the signing team, so ad-hoc builds ship without the widget.
-if [[ -z "$APP_GROUP" ]]; then
-  TEAM_ID="$(codesign -dv "$STAGING_PATH/Contents/Helpers/tokenbar-helper" 2>&1 \
-    | sed -n 's/^TeamIdentifier=//p')"
-  if [[ -n "$TEAM_ID" && "$TEAM_ID" != "not set" ]]; then
-    APP_GROUP="$TEAM_ID.$(plutil -extract CFBundleIdentifier raw -o - "$STAGING_PATH/Contents/Info.plist")"
-  fi
-fi
-APP_SIGN_ARGS=("${SIGN_ARGS[@]}")
-if [[ -n "$APP_GROUP" ]]; then
-  APP_ENTITLEMENTS="$STAGING_ROOT/TokenBar.entitlements"
-  WIDGET_ENTITLEMENTS="$STAGING_ROOT/$WIDGET_NAME.entitlements"
-  plutil -create xml1 "$APP_ENTITLEMENTS"
-  plutil -insert 'com\.apple\.security\.application-groups' -json "[\"$APP_GROUP\"]" "$APP_ENTITLEMENTS"
-  cp "$APP_ENTITLEMENTS" "$WIDGET_ENTITLEMENTS"
-  plutil -insert 'com\.apple\.security\.app-sandbox' -bool true "$WIDGET_ENTITLEMENTS"
-
-  WIDGET_PATH="$STAGING_PATH/Contents/PlugIns/$WIDGET_NAME.appex"
-  WIDGET_PLIST="$WIDGET_PATH/Contents/Info.plist"
-  mkdir -p "$WIDGET_PATH/Contents/MacOS" "$WIDGET_PATH/Contents/Resources"
-  cp "$ROOT/Resources/Widget-Info.plist" "$WIDGET_PLIST"
-  for key in CFBundleShortVersionString CFBundleVersion; do
-    plutil -replace "$key" -string \
-      "$(plutil -extract "$key" raw -o - "$STAGING_PATH/Contents/Info.plist")" "$WIDGET_PLIST"
-  done
-  plutil -replace CFBundleIdentifier -string \
-    "$(plutil -extract CFBundleIdentifier raw -o - "$STAGING_PATH/Contents/Info.plist").Widget" "$WIDGET_PLIST"
-  for plist in "$STAGING_PATH/Contents/Info.plist" "$WIDGET_PLIST"; do
-    plutil -replace TokenBarAppGroupIdentifier -string "$APP_GROUP" "$plist"
-  done
-  cp "$ROOT/Sources/TokenBar/Resources/ProviderIcon-codex.svg" \
-    "$ROOT/Sources/TokenBar/Resources/ProviderIcon-claude.svg" \
-    "$WIDGET_PATH/Contents/Resources/"
-  cp "$SWIFT_BIN_DIR/$WIDGET_NAME" "$WIDGET_PATH/Contents/MacOS/$WIDGET_NAME"
-  chmod 755 "$WIDGET_PATH/Contents/MacOS/$WIDGET_NAME"
-  codesign "${SIGN_ARGS[@]}" --entitlements "$WIDGET_ENTITLEMENTS" "$WIDGET_PATH"
-  APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
-else
-  echo "Skipping the desktop widget: it needs a signing identity with a team (see .tokenbar-codesign-identity)." >&2
-fi
-
-codesign "${APP_SIGN_ARGS[@]}" "$STAGING_PATH/Contents/MacOS/TokenBar"
-codesign "${APP_SIGN_ARGS[@]}" "$STAGING_PATH"
+codesign "${SIGN_ARGS[@]}" "$STAGING_PATH/Contents/MacOS/TokenBar"
+codesign "${SIGN_ARGS[@]}" "$STAGING_PATH"
 codesign --verify --deep --strict "$STAGING_PATH"
 
 validate_existing_app_target "$APP_PATH"
 rm -rf -- "$APP_PATH"
 mv "$STAGING_PATH" "$APP_PATH"
-# A widget extension that is already running keeps the replaced binary until
-# it exits; the system starts the new one for the next render.
-pkill -f "$APP_PATH/Contents/PlugIns/$WIDGET_NAME.appex/Contents/MacOS/$WIDGET_NAME" 2>/dev/null || true
-rm -f -- "$STAGING_ROOT"/*.entitlements
 rmdir "$STAGING_ROOT"
 echo "Created $APP_PATH"

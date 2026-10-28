@@ -2,7 +2,6 @@ import AppKit
 import Observation
 import SwiftUI
 import TokenBarCore
-import TokenBarWidgetData
 
 /// The four macOS desktop widget sizes the card can take, or the one that
 /// fits what it shows.
@@ -48,7 +47,7 @@ enum DesktopCardSize: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class DesktopCardState {
-    var snapshot = UnreadWidgetSnapshot(isTracking: true, platforms: [], tasks: [], running: [])
+    var snapshot = UnreadWidgetSnapshot(platforms: [], tasks: [], running: [])
     /// False while other windows cover the card or its Space is not shown, so
     /// the animations stop drawing.
     var isVisible = true
@@ -94,7 +93,7 @@ final class DesktopCardController {
     private var pendingShrink: Task<Void, Never>?
     private var isStarted = false
 
-    /// The card shows the widget's snapshot, which also remembers the tasks
+    /// The card shows the publisher's snapshot, which also remembers the tasks
     /// read last.
     init(
         publisher: UnreadWidgetPublisher,

@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import TokenBarCore
-import TokenBarWidgetData
 
 /// The desktop card's content: unread tasks with their replies, then running
 /// tasks, tasks whose work runs on in the background, and the tasks read last,

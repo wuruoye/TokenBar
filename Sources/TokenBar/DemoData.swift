@@ -3,7 +3,6 @@ import AppKit
 import Foundation
 import SwiftUI
 import TokenBarCore
-import TokenBarWidgetData
 
 struct DemoQuotaProvider: QuotaProviding {
     let platform = TokenPlatform.codex
@@ -1060,7 +1059,6 @@ enum DemoPreviewRenderer {
         let state = DesktopCardState()
         let now = Date()
         state.snapshot = UnreadWidgetSnapshot(
-            isTracking: true,
             platforms: [
                 .init(id: "codex", name: "Codex", unreadCount: 2),
                 .init(id: "claude", name: "Claude", unreadCount: 1),
@@ -1145,7 +1143,6 @@ enum DemoPreviewRenderer {
         // `TOKENBAR_DEMO_CARD_CAUGHT_UP=1` previews the card with nothing unread.
         if ProcessInfo.processInfo.environment["TOKENBAR_DEMO_CARD_CAUGHT_UP"] == "1" {
             state.snapshot = UnreadWidgetSnapshot(
-                isTracking: true,
                 platforms: state.snapshot.platforms.map { .init(id: $0.id, name: $0.name, unreadCount: 0) },
                 tasks: [],
                 running: state.snapshot.running,

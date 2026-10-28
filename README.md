@@ -46,8 +46,7 @@ The native Windows taskbar and tray client supports Codex, Claude Code, and Grok
 - Hover a physical request to load its full prompt and output, or click it to copy a stable Tokscale-compatible locator.
 - Optionally combine privacy-redacted activity snapshots from Windows, Linux, and other Macs through a self-hosted HTTPS sync service; remote sessions are labeled by device and stay read-only.
 - Optionally launch TokenBar automatically when you sign in to macOS, with approval handled through the system Login Items settings.
-- Add the **Unread Tasks** desktop widget to see finished Codex and Claude desktop tasks you have not opened yet, each with its title, your last prompt, the opening of the reply, and how long the turn ran, plus the tasks still running. Clicking a task opens it in Codex or Claude, the same place its task notification opens, even after the notification is gone.
-- Optionally show the same tasks on a desktop card that TokenBar draws itself: it glows softly while anything is unread, turns a ring around each running task, snaps to screen edges, and can be resized.
+- Optionally show a desktop card with finished Codex and Claude desktop tasks you have not opened yet, each with its title, your last prompt, the opening of the reply, and how long the turn ran, plus the tasks still running or working in the background and what each is doing. Clicking a task opens it in Codex or Claude, the same place its task notification opens, even after the notification is gone. TokenBar draws the card itself: it glows softly while anything is unread, turns a ring around each running task, snaps to screen edges, and can be resized.
 - Choose a theme color, recent-session limit, background refresh interval, and whether full request content appears on hover.
 
 ## Screenshots
@@ -92,8 +91,6 @@ After upgrading from an ad-hoc build, TokenBar reads the legacy activity-sync cr
 printf '%s\n' 'Apple Development: Your Name (TEAMID)' > .tokenbar-codesign-identity
 ./Scripts/package_app.sh
 ```
-
-The Unread Tasks widget is a sandboxed WidgetKit extension that reads TokenBar's data through the App Group `<TEAM_ID>.<bundle identifier>`. `package_app.sh` embeds it only when the signing identity has a team, so ad-hoc builds ship without the widget. Set `TOKENBAR_APP_GROUP` to use a different group.
 
 For a Developer ID build, provide a signing identity:
 

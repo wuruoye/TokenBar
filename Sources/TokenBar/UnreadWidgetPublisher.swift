@@ -1,18 +1,14 @@
 import Foundation
 import Observation
 import TokenBarCore
-import TokenBarWidgetData
-import WidgetKit
 
-/// Builds the snapshot the TokenBar widget and the desktop card show, keeps the
-/// last tasks the user read, and shares the snapshot with the widget, reloading
-/// it when it changes. Builds signed without an App Group have no widget, so
-/// there the snapshot only feeds the card.
+/// Builds the snapshot the desktop card shows and keeps the last tasks the
+/// user read.
 @MainActor
 @Observable
 final class UnreadWidgetPublisher {
     /// Codex and Claude publish separately when a task finishes or is read, so a
-    /// short delay lets one widget reload cover both.
+    /// short delay lets one update cover both.
     private static let coalescingDelay: Duration = .milliseconds(400)
     static let recentLimit = 2
     /// Read tasks kept beyond the ones shown, so one that runs again comes back
@@ -24,12 +20,10 @@ final class UnreadWidgetPublisher {
     /// end of the turn by a moment.
     private static let finishGrace: Duration = .seconds(3)
 
-    private(set) var snapshot = UnreadWidgetSnapshot(isTracking: true, platforms: [], tasks: [], running: [])
+    private(set) var snapshot = UnreadWidgetSnapshot(platforms: [], tasks: [], running: [])
 
     @ObservationIgnored private let unreadTasks: DesktopUnreadTaskMonitor
     @ObservationIgnored private let settings: TokenBarSettings
-    @ObservationIgnored private let sharesWithWidget = UnreadWidgetStore.appGroupIdentifier != nil
-    @ObservationIgnored private var published: UnreadWidgetSnapshot?
     @ObservationIgnored private var pendingPublish: Task<Void, Never>?
     /// Tasks the user read, most recently read first, kept across launches.
     @ObservationIgnored private var readHistory: [UnreadWidgetSnapshot.Item] = []
@@ -59,12 +53,6 @@ final class UnreadWidgetPublisher {
         self.pendingPublish = nil
         self.pendingSettle?.cancel()
         self.pendingSettle = nil
-        self.publish(UnreadWidgetSnapshot(
-            isTracking: false,
-            platforms: [],
-            tasks: [],
-            running: [],
-            recent: self.snapshot.recent))
     }
 
     private func observe() {
@@ -89,7 +77,6 @@ final class UnreadWidgetPublisher {
             self.pendingPublish = nil
             let next = Self.snapshot(of: self.unreadTasks, settings: self.settings)
             self.snapshot = self.recordingReads(from: self.snapshot, in: next)
-            self.publish(self.snapshot)
         }
     }
 
@@ -140,7 +127,6 @@ final class UnreadWidgetPublisher {
             .filter { !current.contains($0.id) && platforms.contains($0.platform) }
             .prefix(Self.recentLimit)
         return UnreadWidgetSnapshot(
-            isTracking: next.isTracking,
             platforms: next.platforms,
             tasks: next.tasks,
             running: next.running,
@@ -181,7 +167,6 @@ final class UnreadWidgetPublisher {
             .filter { !runningIDs.contains("\($0.platform.rawValue)/\($0.id)") }
             .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
         return UnreadWidgetSnapshot(
-            isTracking: true,
             platforms: platforms.map { platform in
                 UnreadWidgetSnapshot.Platform(
                     id: platform.rawValue,
@@ -212,35 +197,5 @@ final class UnreadWidgetPublisher {
             title: task.title ?? "\(task.platform.displayName) task",
             startedAt: task.startedAt,
             activity: task.activity)
-    }
-
-    /// What a task is doing changes with every step it takes, more often than
-    /// the widget may reload, so only the card shows it.
-    private func publish(_ snapshot: UnreadWidgetSnapshot) {
-        let shared = snapshot.withoutActivity
-        guard self.sharesWithWidget, shared != self.published else { return }
-        do {
-            try UnreadWidgetStore.save(shared)
-        } catch {
-            NSLog("TokenBar could not share unread tasks with its widget: %@", String(describing: error))
-            return
-        }
-        self.published = shared
-        WidgetCenter.shared.reloadTimelines(ofKind: UnreadWidgetStore.widgetKind)
-    }
-}
-
-private extension UnreadWidgetSnapshot {
-    var withoutActivity: UnreadWidgetSnapshot {
-        let strip = { (task: RunningItem) in
-            RunningItem(platform: task.platform, taskID: task.taskID, title: task.title, startedAt: task.startedAt)
-        }
-        return UnreadWidgetSnapshot(
-            isTracking: self.isTracking,
-            platforms: self.platforms,
-            tasks: self.tasks,
-            running: self.running.map(strip),
-            background: self.background.map(strip),
-            recent: self.recent)
     }
 }
