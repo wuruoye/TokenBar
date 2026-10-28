@@ -39,11 +39,13 @@ struct DesktopCardView: View {
         let size = self.state.points
         let inner = CGSize(width: size.width - Self.padding * 2, height: size.height - Self.padding * 2)
         // The rows are laid out for the size the card is heading to, while the
-        // card itself follows its window as that resizes.
+        // card itself follows its window as that resizes. Without the minimum,
+        // rows wider than a growing window would widen the card past it, and
+        // the window would center the card, moving its left edge.
         self.content(snapshot, in: inner)
             .frame(width: inner.width, height: inner.height, alignment: .topLeading)
             .padding(Self.padding)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
             .background {
                 // Opaque like a full-color desktop widget. `BreathingGlow` draws
