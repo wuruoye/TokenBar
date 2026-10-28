@@ -9,3 +9,4 @@ dist/
 *.log
 .DS_Store
 .tokenbar-codesign-identity
+Sources/TokenBar/Resources/Fonts/

@@ -1138,18 +1138,14 @@ private struct CardSurface: ViewModifier {
     }
 }
 
-/// Claude Desktop's Anthropic Sans, loaded from the installed app, or the
-/// system font where Claude Desktop is missing. The text cut of each weight
+/// Anthropic Sans from the app's resources, or the system font in a build
+/// without it. The font is not open source, so the repository leaves it out
+/// and a local copy is bundled at build time. The text cut of each weight
 /// suits the card's small sizes.
+@MainActor
 enum CardFont {
     private static let isAvailable: Bool = {
-        guard let app = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: DesktopUnreadTaskMonitor.claudeBundleIdentifier),
-            let file = (try? FileManager.default.contentsOfDirectory(
-                at: app.appending(path: "Contents/Resources/fonts", directoryHint: .isDirectory),
-                includingPropertiesForKeys: nil))?
-                .first(where: { $0.lastPathComponent.hasPrefix("AnthropicSans-Romans") })
-        else {
+        guard let file = PlatformStatusIcon.resourceBundle.url(forResource: "AnthropicSans", withExtension: "ttf") else {
             return false
         }
         CTFontManagerRegisterFontsForURL(file as CFURL, .process, nil)

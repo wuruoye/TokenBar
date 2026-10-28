@@ -1964,7 +1964,9 @@ enum PlatformStatusIcon {
     private static let size = NSSize(width: 16, height: 16)
     private static var cache: [TokenPlatform: NSImage] = [:]
 
-    private static let resourceBundle: Bundle = {
+    /// The package's resources, copied into the app or, in a debug build,
+    /// next to the executable.
+    static let resourceBundle: Bundle = {
         if let bundleURL = Bundle.main.url(
             forResource: "TokenBar_TokenBar",
             withExtension: "bundle"),
