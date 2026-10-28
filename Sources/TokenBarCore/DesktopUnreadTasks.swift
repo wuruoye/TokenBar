@@ -478,9 +478,19 @@ struct DesktopUnreadTaskReader: Sendable {
         return id == "null" ? .none : .session(id)
     }
 
-    /// When the running Claude Desktop launched. The tasks its sessions run in
-    /// the background end when it quits.
-    func claudeLaunchedAt() -> Date? {
+    /// The running Claude Desktop's process and when it launched.
+    struct ClaudeLaunch: Equatable, Sendable {
+        let pid: pid_t
+        let startedAt: Date
+    }
+
+    /// The running Claude Desktop. The tasks its sessions run in the background
+    /// end when it quits. Checking the known process is one lookup, while
+    /// finding a new one goes through every process.
+    func claudeLaunch(reusing known: ClaudeLaunch?) -> ClaudeLaunch? {
+        if let known, Self.processStartedAt(known.pid) == known.startedAt {
+            return known
+        }
         var mib = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(getuid())]
         var size = 0
         guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return nil }
@@ -498,10 +508,22 @@ struct DesktopUnreadTaskReader: Sendable {
             else {
                 continue
             }
-            let started = process.kp_proc.p_starttime
-            return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
+            return ClaudeLaunch(pid: process.kp_proc.p_pid, startedAt: Self.startedAt(process))
         }
         return nil
+    }
+
+    private static func processStartedAt(_ pid: pid_t) -> Date? {
+        var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var process = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, u_int(mib.count), &process, &size, nil, 0) == 0, size > 0 else { return nil }
+        return self.startedAt(process)
+    }
+
+    private static func startedAt(_ process: kinfo_proc) -> Date {
+        let started = process.kp_proc.p_starttime
+        return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
     }
 
     /// Chromium prefixes localStorage values with 0 for UTF-16LE or 1 for Latin-1.
@@ -791,6 +813,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var claudeWaitingIDs: Set<String> = []
     private var claudeBackgroundIDs: Set<String> = []
     private var isClaudeActive = true
+    private var claudeLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
     }
@@ -1077,7 +1100,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     {
         var waiting = Set<String>()
         var transcripts: [String: URL] = [:]
-        lazy var claudeLaunchedAt = self.reader.claudeLaunchedAt()
+        lazy var claudeLaunchedAt: Date? = {
+            self.claudeLaunch = self.reader.claudeLaunch(reusing: self.claudeLaunch)
+            return self.claudeLaunch?.startedAt
+        }()
         let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
             guard !session.isArchived,
                   let edge = session.lastTurnEdgeAt ?? session.lastActivityAt,
@@ -1101,7 +1127,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 return nil
             }
             transcripts[id] = transcript
-            switch self.turns.claudeTurnState(transcript: transcript) {
+            switch self.turns.claudeTurnState(transcript: transcript, size: size, modifiedAt: activeAt) {
             case .running:
                 return DesktopRunningTask(
                     platform: .claude,

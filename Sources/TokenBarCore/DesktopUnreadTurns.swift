@@ -32,14 +32,24 @@ final class DesktopUnreadTurnReader {
         let turn: DesktopUnreadTurn
     }
 
+    private struct CachedTurnState {
+        let size: UInt64
+        let modifiedAt: Date
+        let state: ClaudeTurnState
+    }
+
     /// Long turns can write megabytes of tool output after their prompt.
     private static let maximumScannedBytes: UInt64 = 32 << 20
+    /// The line sought is usually near the end, so the first chunk is small
+    /// and each next one doubles up to the largest.
+    private static let firstChunkSize: UInt64 = 16 << 10
     private static let chunkSize: UInt64 = 256 << 10
     private static let maximumTextLength = 280
     /// Claude tools that pause the turn until the user answers.
     private static let claudeUserInputTools: Set<String> = ["AskUserQuestion", "ExitPlanMode"]
 
     private var cache: [String: CachedTurn] = [:]
+    private var turnStates: [String: CachedTurnState] = [:]
     private var claudeTranscripts: [String: URL] = [:]
 
     func codexTurn(rolloutURL: URL) -> DesktopUnreadTurn {
@@ -117,8 +127,18 @@ final class DesktopUnreadTurnReader {
     /// reason other than a tool call, or with the result of a tool that ends
     /// the turn. A call to a tool that asks the user waits for the answer.
     /// Other tool results, prompts, and a reply still streaming belong to a
-    /// turn in progress.
-    func claudeTurnState(transcript: URL) -> ClaudeTurnState {
+    /// turn in progress. Read again only when the transcript's size or
+    /// modification date changes.
+    func claudeTurnState(transcript: URL, size: UInt64, modifiedAt: Date) -> ClaudeTurnState {
+        if let cached = self.turnStates[transcript.path], cached.size == size, cached.modifiedAt == modifiedAt {
+            return cached.state
+        }
+        let state = Self.claudeTurnState(transcript: transcript)
+        self.turnStates[transcript.path] = CachedTurnState(size: size, modifiedAt: modifiedAt, state: state)
+        return state
+    }
+
+    private static func claudeTurnState(transcript: URL) -> ClaudeTurnState {
         var state = ClaudeTurnState.ended
         Self.scanBackward(in: transcript, markers: ["\"type\":\"user\"", "\"type\":\"assistant\""].map { Data($0.utf8) }) { line in
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
@@ -391,8 +411,9 @@ final class DesktopUnreadTurnReader {
         guard var end = try? handle.seekToEnd() else { return }
         var carry = Data()
         var scanned: UInt64 = 0
+        var chunkSize = self.firstChunkSize
         while end > 0, scanned < self.maximumScannedBytes {
-            let start = end > self.chunkSize ? end - self.chunkSize : 0
+            let start = end > chunkSize ? end - chunkSize : 0
             guard (try? handle.seek(toOffset: start)) != nil,
                   let chunk = try? handle.read(upToCount: Int(end - start))
             else {
@@ -410,6 +431,7 @@ final class DesktopUnreadTurnReader {
             }
             scanned += end - start
             end = start
+            chunkSize = min(chunkSize * 2, self.chunkSize)
         }
     }
 }
