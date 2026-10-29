@@ -654,6 +654,10 @@ struct DesktopUnreadTaskReader: Sendable {
     // MARK: Claude
 
     private struct ClaudeSessionRecord: Decodable {
+        struct PendingStart: Decodable {
+            let since: Int64?
+        }
+
         let completedTurns: Int?
         let lastFocusedAt: Int64?
         let lastActivityAt: Int64?
@@ -662,6 +666,7 @@ struct DesktopUnreadTaskReader: Sendable {
         let title: String?
         let cwd: String?
         let cliSessionId: String?
+        let pendingFirstStart: PendingStart?
     }
 
     private var claudeLocalStorageDirectory: URL {
@@ -871,6 +876,9 @@ struct DesktopUnreadTaskReader: Sendable {
                         },
                         lastTurnEdgeAt: record.lastTurnEdgeAt.map {
                             Date(timeIntervalSince1970: TimeInterval($0) / 1000)
+                        },
+                        startingSince: record.pendingFirstStart.map {
+                            $0.since.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) } ?? modifiedAt
                         })
                 }
             }
@@ -913,6 +921,9 @@ struct ClaudeSessionSnapshot: Equatable, Sendable {
     let lastActivityAt: Date?
     /// When the session last started or finished a turn.
     let lastTurnEdgeAt: Date?
+    /// Claude is still setting up a new session, such as creating its
+    /// worktree, and has not started its first turn or written a transcript.
+    var startingSince: Date? = nil
 }
 
 /// Combines Claude's lagging unread store with the session records the app writes
@@ -1422,6 +1433,17 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             return self.claudeLaunch?.startedAt
         }()
         let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
+            // A new session runs while Claude sets it up, which can take
+            // minutes for the worktree of a large repository.
+            if let startingSince = session.startingSince {
+                guard !session.isArchived, claudeLaunchedAt != nil else { return nil }
+                return DesktopRunningTask(
+                    platform: .claude,
+                    id: id,
+                    title: session.title,
+                    startedAt: startingSince,
+                    activity: "Starting")
+            }
             guard !session.isArchived,
                   let edge = session.lastTurnEdgeAt ?? session.lastActivityAt,
                   now.timeIntervalSince(edge) < 6 * 60 * 60,
