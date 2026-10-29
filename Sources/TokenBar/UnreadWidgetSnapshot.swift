@@ -41,6 +41,8 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
         let turnDuration: TimeInterval?
         let workspaceName: String?
         let updatedAt: Date?
+        /// Background work is also shown on the unread card for this session.
+        var backgroundActivity: String? = nil
 
         var id: String {
             "\(self.platform)/\(self.taskID)"
@@ -75,17 +77,22 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
         let startedAt: Date?
         /// What the turn, or else its background tasks, is doing now.
         let activity: String?
+        let isInterrupted: Bool
 
         var id: String {
             "\(self.platform)/\(self.taskID)"
         }
 
-        init(platform: String, taskID: String, title: String, startedAt: Date?, activity: String? = nil) {
+        init(
+            platform: String, taskID: String, title: String, startedAt: Date?, activity: String? = nil,
+            isInterrupted: Bool = false)
+        {
             self.platform = platform
             self.taskID = taskID
             self.title = title
             self.startedAt = startedAt
             self.activity = activity
+            self.isInterrupted = isInterrupted
         }
     }
 

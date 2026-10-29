@@ -442,11 +442,11 @@ private struct RunningSummaryRow: View {
                     ZStack {
                         SpinningRing(
                             tint: CardAccent.ringTint(for: first.platform, isInBackground: self.isInBackground),
-                            animates: self.animates)
+                            animates: self.animates && !first.isInterrupted)
                             .frame(width: 18, height: 18)
                         CardPlatformIcon(platform: first.platform, size: 12)
                     }
-                    Text(first.title)
+                    Text(self.isInBackground ? "Background · \(first.title)" : first.title)
                         .font(CardFont.sans(11))
                         .lineLimit(1)
                     if self.running.count > 1 {
@@ -687,7 +687,7 @@ private struct UnreadCardRow: View {
                         Spacer(minLength: 6)
                         CardTimeText(date: self.task.updatedAt)
                     }
-                    if let reply = self.task.reply {
+                    if let reply = self.task.backgroundActivity.map({ "Background · \($0)" }) ?? self.task.reply {
                         Text(reply)
                             .font(CardFont.sans(12))
                             .foregroundStyle(.primary)
@@ -747,10 +747,16 @@ private struct RunningCardRow: View {
         Button(action: self.action) {
             HStack(spacing: CardGrid.spacing) {
                 ZStack {
-                    SpinningRing(
-                        tint: CardAccent.ringTint(for: self.task.platform, isInBackground: self.isInBackground),
-                        animates: self.animates)
-                        .frame(width: 20, height: 20)
+                    if self.task.isInterrupted {
+                        Image(systemName: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 20, height: 20)
+                    } else {
+                        SpinningRing(
+                            tint: CardAccent.ringTint(for: self.task.platform, isInBackground: self.isInBackground),
+                            animates: self.animates)
+                            .frame(width: 20, height: 20)
+                    }
                     CardPlatformIcon(platform: self.task.platform, size: 14)
                 }
                 .frame(width: CardGrid.iconColumn)

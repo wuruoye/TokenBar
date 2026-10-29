@@ -46,10 +46,12 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
 ///
 /// The apps mark the task they show as read as soon as their window comes to
 /// the front, even when the user only passes through on the way to another
-/// app or Space. A task marked read during a visit shorter than `readDwell`
-/// stays unread here until its app stays in front that long again. Claude
-/// logs each switch between its sessions, which is deliberate: a visit with a
-/// switch reads the sessions it showed however short it was.
+/// app or Space. So a task an app marks read stays unread here until the user
+/// has seen it: opened it from TokenBar, or after it finished, kept its app in
+/// front showing it for `readDwell`. Claude logs the session its window shows,
+/// and a switch the user makes there reads the sessions on both sides of it
+/// however short the visit. Codex logs nothing like that, so a Codex visit
+/// that lasts `readDwell` reads every task.
 @MainActor
 @Observable
 public final class DesktopUnreadTaskMonitor {
@@ -71,11 +73,13 @@ public final class DesktopUnreadTaskMonitor {
 
     /// How long an app has to stay in front for the task it shows to count as read.
     static let readDwell: TimeInterval = 3
-    /// Claude can write a read state a while after the visit that caused it.
+    /// An app can write the read state of a task opened from TokenBar a while later.
     static let readLag: TimeInterval = 60
     /// Claude's log reaches back a few hours, so older visits are not kept.
-    static let claudeVisitHistoryLimit: TimeInterval = 4 * 60 * 60
-    /// Bounds a hold on a task that is archived before the user sees it.
+    static let visitHistoryLimit: TimeInterval = 4 * 60 * 60
+    /// How long Claude can take to switch to a session opened from TokenBar.
+    static let claudeOpenSwitchLag: TimeInterval = 10
+    /// Bounds a hold on a task read where TokenBar cannot see, such as on another device.
     static let holdLimit: TimeInterval = 24 * 60 * 60
 
     @ObservationIgnored private let reader: DesktopUnreadTaskReader
@@ -85,14 +89,19 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private var isClaudeActive = true
     /// The unread tasks each app reports, before held tasks are added.
     @ObservationIgnored private var reported: [TokenPlatform: [DesktopUnreadTask]] = [:]
+    /// Tasks an app marked read before the user saw them.
     @ObservationIgnored private var held: [TokenPlatform: [String: HeldTask]] = [:]
-    @ObservationIgnored private var visits: [TokenPlatform: Visit] = [:]
-    /// Claude's recent visits, oldest first, the last one possibly still going.
-    @ObservationIgnored private var claudeVisits: [Visit] = []
+    /// The sessions that still exist unarchived, for an app that tells.
+    @ObservationIgnored private var existing: [TokenPlatform: Set<String>] = [:]
+    /// Each app's recent visits, oldest first, the last one possibly still going.
+    @ObservationIgnored private var visits: [TokenPlatform: [Visit]] = [:]
     /// Claude's focus changes, read again only when its log grows.
     @ObservationIgnored private var claudeFocusCache: (logSize: UInt64, changes: [ClaudeFocusChange])?
     /// Tasks opened from TokenBar, which count as read as soon as their app shows them.
     @ObservationIgnored private var openedAt: [TokenPlatform: [String: Date]] = [:]
+    /// Claude sessions opened from TokenBar, oldest first. Claude logs the
+    /// switch to one like a switch the user makes.
+    @ObservationIgnored private var claudeOpens: [(id: String, at: Date)] = []
     @ObservationIgnored private var releaseChecks: [TokenPlatform: Task<Void, Never>] = [:]
 
     public init(
@@ -133,20 +142,15 @@ public final class DesktopUnreadTaskMonitor {
         default: nil
         }
         let now = Date()
-        for (other, visit) in self.visits where other != platform && visit.end == nil {
-            self.visits[other]?.end = now
+        for (other, history) in self.visits where other != platform {
+            guard let last = history.indices.last, history[last].end == nil else { continue }
+            self.visits[other]?[last].end = now
             self.releaseChecks.removeValue(forKey: other)?.cancel()
-            if other == .claude, !self.claudeVisits.isEmpty {
-                self.claudeVisits[self.claudeVisits.count - 1].end = now
-            }
         }
-        if let platform, self.visits[platform].map({ $0.end != nil }) ?? true {
-            self.visits[platform] = Visit(start: now)
-            if platform == .claude {
-                self.claudeVisits = self.claudeVisits.filter {
-                    now.timeIntervalSince($0.end ?? now) < Self.claudeVisitHistoryLimit
-                } + [Visit(start: now)]
-            }
+        if let platform, self.visits[platform]?.last.map({ $0.end != nil }) ?? true {
+            self.visits[platform] = (self.visits[platform] ?? []).filter {
+                now.timeIntervalSince($0.end ?? now) < Self.visitHistoryLimit
+            } + [Visit(start: now)]
             self.scheduleReleaseCheck(for: platform)
         }
         let isClaudeActive = platform == .claude
@@ -159,7 +163,13 @@ public final class DesktopUnreadTaskMonitor {
     /// A task opened from TokenBar is read once its app shows it, however
     /// briefly.
     public func markOpened(platform: TokenPlatform, id: String) {
-        self.openedAt[platform, default: [:]][id] = Date()
+        let now = Date()
+        self.openedAt[platform, default: [:]][id] = now
+        if platform == .claude {
+            self.claudeOpens = self.claudeOpens.filter {
+                now.timeIntervalSince($0.at) < Self.visitHistoryLimit
+            } + [(id, now)]
+        }
         if self.held[platform]?.removeValue(forKey: id) != nil {
             self.publishTasks(for: platform)
         }
@@ -170,9 +180,9 @@ public final class DesktopUnreadTaskMonitor {
         let watcher = DesktopUnreadTaskWatcher(
             reader: self.reader,
             claudeTrackerStateURL: self.claudeTrackerStateURL,
-            publish: { [weak self] platform, tasks in
+            publish: { [weak self] platform, tasks, existing in
                 Task { @MainActor [weak self] in
-                    self?.accept(tasks, for: platform)
+                    self?.accept(tasks, existing: existing, for: platform)
                 }
             },
             publishRunning: { [weak self] platform, tasks in
@@ -192,7 +202,9 @@ public final class DesktopUnreadTaskMonitor {
         self.running = [:]
         self.reported = [:]
         self.held = [:]
+        self.existing = [:]
         self.openedAt = [:]
+        self.claudeOpens = []
         for check in self.releaseChecks.values {
             check.cancel()
         }
@@ -203,19 +215,18 @@ public final class DesktopUnreadTaskMonitor {
         self.watcher?.refresh()
     }
 
-    private func accept(_ tasks: [DesktopUnreadTask], for platform: TokenPlatform) {
+    /// Holds the tasks the app no longer reports, unless opened from TokenBar.
+    private func accept(_ tasks: [DesktopUnreadTask], existing: Set<String>?, for platform: TokenPlatform) {
         guard self.watcher != nil else { return }
         let now = Date()
         let ids = Set(tasks.map(\.id))
         let opened = (self.openedAt[platform] ?? [:]).filter { now.timeIntervalSince($0.value) < Self.readLag }
         self.openedAt[platform] = opened
-        let read = (self.reported[platform] ?? []).filter { !ids.contains($0.id) && opened[$0.id] == nil }
-        if !read.isEmpty, self.isPassingVisit(of: platform, now: now) {
-            for task in read {
-                self.held[platform, default: [:]][task.id] = HeldTask(task: task, since: now)
-            }
+        for task in self.reported[platform] ?? [] where !ids.contains(task.id) && opened[task.id] == nil {
+            self.held[platform, default: [:]][task.id] = HeldTask(task: task, since: now)
         }
         self.reported[platform] = tasks
+        self.existing[platform] = existing
         self.releaseHeld(for: platform, now: now)
         self.publishTasks(for: platform)
     }
@@ -229,8 +240,6 @@ public final class DesktopUnreadTaskMonitor {
         }
     }
 
-    /// Whether the app is in front, or left it recently, after a visit too
-    /// short for the user to have read what it showed.
     private func claudeFocusChanges() -> [ClaudeFocusChange]? {
         guard let size = (try? FileManager.default.attributesOfItem(
             atPath: self.reader.claudeMainLog.path))?[.size] as? NSNumber
@@ -245,19 +254,54 @@ public final class DesktopUnreadTaskMonitor {
         return changes
     }
 
-    /// Whether a Claude visit after `since` read the session: it showed the
-    /// session, and lasted `readDwell` or switched sessions.
-    private func claudeRead(_ id: String, after since: Date, focus: [ClaudeFocusChange], now: Date) -> Bool {
-        self.claudeVisits.contains { visit in
-            let end = visit.end ?? now
-            guard end >= since,
-                  end.timeIntervalSince(visit.start) >= Self.readDwell
-                    || Self.switchesSessions(during: visit, focus: focus, now: now)
-            else {
-                return false
+    /// Whether a visit that ended after the task finished read it. Without
+    /// Claude's log, a visit reads every task once it lasts `readDwell`.
+    private func seen(
+        _ task: DesktopUnreadTask,
+        on platform: TokenPlatform,
+        focus: [ClaudeFocusChange]?,
+        now: Date) -> Bool
+    {
+        let finishedAt = task.updatedAt ?? .distantPast
+        return (self.visits[platform] ?? []).contains { visit in
+            guard (visit.end ?? now) >= finishedAt else { return false }
+            guard let focus else {
+                return (visit.end ?? now).timeIntervalSince(visit.start) >= Self.readDwell
             }
-            let shownAtStart = focus.last { $0.at <= visit.start }?.sessionID == id
-            return shownAtStart || Self.changes(during: visit, focus: focus, now: now).contains { $0.sessionID == id }
+            return self.claudeVisitRead(task.id, visit: visit, focus: focus, now: now)
+        }
+    }
+
+    /// The visit read the session if it showed the session for `readDwell`,
+    /// or the user switched to it or away from it. A session opened from
+    /// TokenBar replaces the one the window showed before the user saw it.
+    private func claudeVisitRead(_ id: String, visit: Visit, focus: [ClaudeFocusChange], now: Date) -> Bool {
+        var shown = focus.last { $0.at <= visit.start.addingTimeInterval(-1) }?.sessionID
+        var shownSince = visit.start
+        var duration: TimeInterval = 0
+        for change in Self.changes(during: visit, focus: focus, now: now) {
+            let at = max(change.at, visit.start)
+            if shown == id {
+                duration += at.timeIntervalSince(shownSince)
+            }
+            if shown == id || change.sessionID == id, !self.isOpenSwitch(change) {
+                return true
+            }
+            shown = change.sessionID
+            shownSince = at
+        }
+        if shown == id {
+            duration += (visit.end ?? now).timeIntervalSince(shownSince)
+        }
+        return duration >= Self.readDwell
+    }
+
+    /// Claude logs a switch as no session, then the new one, in the same second.
+    private func isOpenSwitch(_ change: ClaudeFocusChange) -> Bool {
+        self.claudeOpens.contains { open in
+            (change.sessionID == nil || change.sessionID == open.id)
+                && change.at > open.at.addingTimeInterval(-1)
+                && change.at < open.at.addingTimeInterval(Self.claudeOpenSwitchLag)
         }
     }
 
@@ -271,52 +315,24 @@ public final class DesktopUnreadTaskMonitor {
         focus.filter { $0.at > visit.start.addingTimeInterval(-1) && $0.at <= (visit.end ?? now) }
     }
 
-    private static func switchesSessions(during visit: Visit, focus: [ClaudeFocusChange], now: Date) -> Bool {
-        !self.changes(during: visit, focus: focus, now: now).isEmpty
-    }
-
-    private func isPassingVisit(of platform: TokenPlatform, now: Date) -> Bool {
-        guard let visit = self.visits[platform] else { return false }
-        guard (visit.end ?? now).timeIntervalSince(visit.start) < Self.readDwell else { return false }
-        if platform == .claude,
-           let focus = self.claudeFocusChanges(),
-           Self.switchesSessions(during: visit, focus: focus, now: now)
-        {
-            return false
-        }
-        return visit.end.map { now.timeIntervalSince($0) < Self.readLag } ?? true
-    }
-
-    /// Releases held tasks once the app has stayed in front long enough. Claude
-    /// logs the session its window shows, so only that one is released there.
+    /// Releases the held tasks the user has since seen, and drops those archived.
     private func releaseHeld(for platform: TokenPlatform, now: Date) {
-        guard var held = self.held[platform], !held.isEmpty else { return }
-        held = held.filter { now.timeIntervalSince($0.value.since) < Self.holdLimit }
-        if platform == .claude, let focus = self.claudeFocusChanges() {
-            held = held.filter { id, hold in !self.claudeRead(id, after: hold.since, focus: focus, now: now) }
-        } else if let visit = self.visits[platform],
-           visit.end == nil,
-           now.timeIntervalSince(visit.start) >= Self.readDwell
-        {
-            if platform == .claude {
-                switch self.reader.claudeShownSession() {
-                case let .session(id): held[id] = nil
-                case .none: break
-                case .unknown: held = [:]
-                }
-            } else {
-                held = [:]
-            }
+        guard let held = self.held[platform], !held.isEmpty else { return }
+        let focus = platform == .claude ? self.claudeFocusChanges() : nil
+        let existing = self.existing[platform]
+        self.held[platform] = held.filter { id, hold in
+            now.timeIntervalSince(hold.since) < Self.holdLimit
+                && existing?.contains(id) != false
+                && !self.seen(hold.task, on: platform, focus: focus, now: now)
         }
-        self.held[platform] = held
     }
 
-    /// Checks once when the visit reaches `readDwell`. Later, switching to a
-    /// held Claude session rewrites its record, and the recount that follows
-    /// releases it.
+    /// Checks once when the visit reaches `readDwell`. A switch the user makes
+    /// in Claude rewrites the session records, and the recount that follows
+    /// releases what it read.
     private func scheduleReleaseCheck(for platform: TokenPlatform) {
         guard let held = self.held[platform], !held.isEmpty,
-              let visit = self.visits[platform],
+              let visit = self.visits[platform]?.last,
               visit.end == nil
         else {
             return
@@ -359,12 +375,17 @@ struct DesktopUnreadTaskReader: Sendable {
     let claudeSupportDirectory: URL
     let claudeProjectsDirectory: URL
     let claudeMainLog: URL
+    let backgroundTasksDirectory: URL
 
-    init(codexHome: URL, claudeSupportDirectory: URL, claudeProjectsDirectory: URL, claudeMainLog: URL) {
+    init(
+        codexHome: URL, claudeSupportDirectory: URL, claudeProjectsDirectory: URL, claudeMainLog: URL,
+        backgroundTasksDirectory: URL = CodexBackgroundTaskReader.directory(environment: [:]))
+    {
         self.codexHome = codexHome
         self.claudeSupportDirectory = claudeSupportDirectory
         self.claudeProjectsDirectory = claudeProjectsDirectory
         self.claudeMainLog = claudeMainLog
+        self.backgroundTasksDirectory = backgroundTasksDirectory
     }
 
     init(environment: [String: String]) {
@@ -384,7 +405,8 @@ struct DesktopUnreadTaskReader: Sendable {
             claudeProjectsDirectory: claudeConfigDirectory
                 .appendingPathComponent("projects", isDirectory: true),
             claudeMainLog: fileManager.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Logs/Claude/main.log", isDirectory: false))
+                .appendingPathComponent("Library/Logs/Claude/main.log", isDirectory: false),
+            backgroundTasksDirectory: CodexBackgroundTaskReader.directory(environment: environment))
     }
 
     // MARK: Codex
@@ -486,20 +508,31 @@ struct DesktopUnreadTaskReader: Sendable {
         states: CodexTurnStateReader,
         now: Date) -> (tasks: [DesktopRunningTask], rollouts: Set<String>)
     {
-        let threads = self.visibleCodexThreads(.updatedSince(now.addingTimeInterval(-24 * 60 * 60)))
+        let background = CodexBackgroundTaskReader(directory: self.backgroundTasksDirectory).tasks(now: now)
+        var threads = self.visibleCodexThreads(.updatedSince(now.addingTimeInterval(-24 * 60 * 60)))
+        let olderIDs = Set(background.keys).subtracting(threads.map(\.id))
+        if !olderIDs.isEmpty {
+            threads += self.visibleCodexThreads(.ids(olderIDs))
+        }
         let rollouts = Set(threads.compactMap(\.rolloutPath))
         states.forget(except: rollouts)
         let tasks = threads.compactMap { thread -> DesktopRunningTask? in
+            let backgroundTask = background[thread.id].map { task in
+                DesktopRunningTask(
+                    platform: .codex, id: thread.id, title: thread.title ?? task.name,
+                    startedAt: task.startedAt, activity: task.activity,
+                    isInBackground: true, isInterrupted: task.isInterrupted)
+            }
             guard let path = thread.rolloutPath,
                   let attributes = try? FileManager.default.attributesOfItem(atPath: path),
                   let size = (attributes[.size] as? NSNumber)?.uint64Value,
                   let modifiedAt = attributes[.modificationDate] as? Date,
                   now.timeIntervalSince(modifiedAt) < DesktopRunningTaskLiveness.quietLimit
             else {
-                return nil
+                return backgroundTask
             }
             let state = states.state(of: URL(fileURLWithPath: path), size: size)
-            guard state.isRunning else { return nil }
+            guard state.isRunning else { return backgroundTask }
             return DesktopRunningTask(
                 platform: .codex,
                 id: thread.id,
@@ -1056,7 +1089,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// A turn appends to its rollout or transcript many times a second.
     private static let appendCoalescingDelay: TimeInterval = 0.3
 
-    private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask]) -> Void
+    /// Publishes the unread tasks, and the sessions that still exist
+    /// unarchived when the platform tells.
+    private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void
     private let publishRunning: @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void
     private let claudeTrackerStateURL: URL?
     private let turns = DesktopUnreadTurnReader()
@@ -1066,6 +1101,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private var codexPaths: Set<String> = []
     private var codexSessionsPrefix: String?
+    private var backgroundTasksPrefix: String?
     private var claudePrefixes: [String] = []
     private var claudeTracker = ClaudeUnreadTracker()
     private var savedClaudeTrackerState: ClaudeUnreadTracker.State?
@@ -1089,7 +1125,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     init(
         reader: DesktopUnreadTaskReader,
         claudeTrackerStateURL: URL?,
-        publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask]) -> Void,
+        publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void,
         publishRunning: @escaping @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void)
     {
         self.reader = reader
@@ -1141,6 +1177,17 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private func startStream() {
         guard self.stream == nil else { return }
         var roots: [String] = []
+        do {
+            try FileManager.default.createDirectory(
+                at: self.reader.backgroundTasksDirectory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            if let root = Self.canonicalPath(self.reader.backgroundTasksDirectory) {
+                roots.append(root)
+                self.backgroundTasksPrefix = root + "/"
+            }
+        } catch {
+            NSLog("TokenBar could not watch background task snapshots: %@", String(describing: error))
+        }
         if let codexRoot = Self.canonicalPath(self.reader.codexHome) {
             roots.append(codexRoot)
             self.codexPaths = [
@@ -1215,6 +1262,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 changed.insert(.codex)
             } else if let prefix = self.codexSessionsPrefix, path.hasPrefix(prefix) {
                 codexRolloutChanged = true
+            } else if let prefix = self.backgroundTasksPrefix,
+                      path.hasPrefix(prefix) || path == String(prefix.dropLast())
+            {
+                codexRolloutChanged = true
             } else if self.claudePrefixes.contains(where: { path.hasPrefix($0) }) {
                 changed.insert(.claude)
             }
@@ -1261,7 +1312,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         for platform in platforms {
             switch platform {
             case .codex:
-                self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns))
+                self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns), nil)
             case .claude:
                 self.recountClaude(sessions: self.reader.claudeSessions(reusing: self.claudeTracker.sessions))
             default:
@@ -1305,7 +1356,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.claudeRunningIDs = Set(running.map(\.id))
         self.claudeBackgroundIDs = Set(running.filter(\.isInBackground).map(\.id))
         self.claudeWaitingIDs = waiting
-        self.publish(.claude, self.claudeTasks(ids, sessions: sessions))
+        self.publish(
+            .claude,
+            self.claudeTasks(ids, sessions: sessions),
+            Set(sessions.filter { !$0.value.isArchived }.keys))
         self.publishRunning(.claude, running)
         self.saveClaudeTracker()
         self.scheduleClaudeExpiryRecount()

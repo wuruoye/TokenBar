@@ -13,6 +13,8 @@ public struct DesktopRunningTask: Equatable, Identifiable, Sendable {
     public let activity: String?
     /// The turn ended, and only tasks it started in the background still run.
     public let isInBackground: Bool
+    /// A background process disappeared without reporting its result.
+    public let isInterrupted: Bool
 
     public init(
         platform: TokenPlatform,
@@ -20,7 +22,8 @@ public struct DesktopRunningTask: Equatable, Identifiable, Sendable {
         title: String?,
         startedAt: Date?,
         activity: String? = nil,
-        isInBackground: Bool = false)
+        isInBackground: Bool = false,
+        isInterrupted: Bool = false)
     {
         self.platform = platform
         self.id = id
@@ -28,6 +31,7 @@ public struct DesktopRunningTask: Equatable, Identifiable, Sendable {
         self.startedAt = startedAt
         self.activity = activity
         self.isInBackground = isInBackground
+        self.isInterrupted = isInterrupted
     }
 }
 

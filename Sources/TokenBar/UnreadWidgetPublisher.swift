@@ -187,7 +187,7 @@ final class UnreadWidgetPublisher {
                     })
             },
             tasks: tasks.map { task in
-                UnreadWidgetSnapshot.Item(
+                var item = UnreadWidgetSnapshot.Item(
                     platform: task.platform.rawValue,
                     taskID: task.id,
                     title: task.title ?? task.prompt ?? "\(task.platform.displayName) task",
@@ -198,6 +198,10 @@ final class UnreadWidgetPublisher {
                         URL(fileURLWithPath: $0).lastPathComponent
                     },
                     updatedAt: task.updatedAt)
+                item.backgroundActivity = active.first {
+                    $0.platform == task.platform && $0.id == task.id && $0.isInBackground
+                }?.activity
+                return item
             },
             running: running.map(Self.runningItem),
             background: background.map(Self.runningItem))
@@ -209,6 +213,7 @@ final class UnreadWidgetPublisher {
             taskID: task.id,
             title: task.title ?? "\(task.platform.displayName) task",
             startedAt: task.startedAt,
-            activity: task.activity)
+            activity: task.activity,
+            isInterrupted: task.isInterrupted)
     }
 }

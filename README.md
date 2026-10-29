@@ -120,6 +120,8 @@ Useful shortcuts:
 
 The default background refresh interval is five minutes. Opening the menu always starts a fresh update, independent of that timer.
 
+The desktop card also accepts local Codex background-task snapshots in `~/Library/Application Support/TokenBar/background-tasks/`. A launcher publishes one JSON file per task using an atomic replacement, with `schema_version: 1`, `platform: "codex"`, `thread_id`, `task_id`, `name`, `activity`, `status`, `created_at`, optional `started_at`/`finished_at`, and `worker_pid`/`worker_signature` plus optional `job_pid`/`job_signature`. Timestamps use ISO 8601 with a timezone; process signatures are the start time from `ps -p PID -o lstart=`. Status is `starting`, `running`, `succeeded`, `failed`, or `launch_failed`. TokenBar watches file changes, restores snapshots on launch, and rechecks process identities once a minute. Active turns appear in Running; background work appears in Background or on its session's unread card. A missing process without a terminal result is shown as interrupted, with the result unknown. Commands, environment variables, and logs are not part of this protocol. `TOKENBAR_BACKGROUND_TASKS_DIR` overrides the directory for both the launcher and TokenBar.
+
 ## How counting works
 
 TokenBar normalizes Codex, Claude Code, Grok Build, and Antigravity into the same three activity levels:
