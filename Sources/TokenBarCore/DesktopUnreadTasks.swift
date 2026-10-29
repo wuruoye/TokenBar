@@ -47,8 +47,9 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
 /// The apps mark the task they show as read as soon as their window comes to
 /// the front, even when the user only passes through on the way to another
 /// app or Space. A task marked read during a visit shorter than `readDwell`
-/// stays unread here until its app stays in front that long again, showing
-/// the task where the app tells which one it shows.
+/// stays unread here until its app stays in front that long again. Claude
+/// logs each switch between its sessions, which is deliberate: a visit with a
+/// switch reads the sessions it showed however short it was.
 @MainActor
 @Observable
 public final class DesktopUnreadTaskMonitor {
@@ -69,9 +70,11 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// How long an app has to stay in front for the task it shows to count as read.
-    static let readDwell: TimeInterval = 5
+    static let readDwell: TimeInterval = 3
     /// Claude can write a read state a while after the visit that caused it.
     static let readLag: TimeInterval = 60
+    /// Claude's log reaches back a few hours, so older visits are not kept.
+    static let claudeVisitHistoryLimit: TimeInterval = 4 * 60 * 60
     /// Bounds a hold on a task that is archived before the user sees it.
     static let holdLimit: TimeInterval = 24 * 60 * 60
 
@@ -84,6 +87,10 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private var reported: [TokenPlatform: [DesktopUnreadTask]] = [:]
     @ObservationIgnored private var held: [TokenPlatform: [String: HeldTask]] = [:]
     @ObservationIgnored private var visits: [TokenPlatform: Visit] = [:]
+    /// Claude's recent visits, oldest first, the last one possibly still going.
+    @ObservationIgnored private var claudeVisits: [Visit] = []
+    /// Claude's focus changes, read again only when its log grows.
+    @ObservationIgnored private var claudeFocusCache: (logSize: UInt64, changes: [ClaudeFocusChange])?
     /// Tasks opened from TokenBar, which count as read as soon as their app shows them.
     @ObservationIgnored private var openedAt: [TokenPlatform: [String: Date]] = [:]
     @ObservationIgnored private var releaseChecks: [TokenPlatform: Task<Void, Never>] = [:]
@@ -129,9 +136,17 @@ public final class DesktopUnreadTaskMonitor {
         for (other, visit) in self.visits where other != platform && visit.end == nil {
             self.visits[other]?.end = now
             self.releaseChecks.removeValue(forKey: other)?.cancel()
+            if other == .claude, !self.claudeVisits.isEmpty {
+                self.claudeVisits[self.claudeVisits.count - 1].end = now
+            }
         }
         if let platform, self.visits[platform].map({ $0.end != nil }) ?? true {
             self.visits[platform] = Visit(start: now)
+            if platform == .claude {
+                self.claudeVisits = self.claudeVisits.filter {
+                    now.timeIntervalSince($0.end ?? now) < Self.claudeVisitHistoryLimit
+                } + [Visit(start: now)]
+            }
             self.scheduleReleaseCheck(for: platform)
         }
         let isClaudeActive = platform == .claude
@@ -194,8 +209,9 @@ public final class DesktopUnreadTaskMonitor {
         let ids = Set(tasks.map(\.id))
         let opened = (self.openedAt[platform] ?? [:]).filter { now.timeIntervalSince($0.value) < Self.readLag }
         self.openedAt[platform] = opened
-        if self.isPassingVisit(of: platform, now: now) {
-            for task in self.reported[platform] ?? [] where !ids.contains(task.id) && opened[task.id] == nil {
+        let read = (self.reported[platform] ?? []).filter { !ids.contains($0.id) && opened[$0.id] == nil }
+        if !read.isEmpty, self.isPassingVisit(of: platform, now: now) {
+            for task in read {
                 self.held[platform, default: [:]][task.id] = HeldTask(task: task, since: now)
             }
         }
@@ -215,9 +231,59 @@ public final class DesktopUnreadTaskMonitor {
 
     /// Whether the app is in front, or left it recently, after a visit too
     /// short for the user to have read what it showed.
+    private func claudeFocusChanges() -> [ClaudeFocusChange]? {
+        guard let size = (try? FileManager.default.attributesOfItem(
+            atPath: self.reader.claudeMainLog.path))?[.size] as? NSNumber
+        else {
+            return nil
+        }
+        if let cache = self.claudeFocusCache, cache.logSize == size.uint64Value {
+            return cache.changes
+        }
+        guard let changes = self.reader.claudeFocusChanges() else { return nil }
+        self.claudeFocusCache = (size.uint64Value, changes)
+        return changes
+    }
+
+    /// Whether a Claude visit after `since` read the session: it showed the
+    /// session, and lasted `readDwell` or switched sessions.
+    private func claudeRead(_ id: String, after since: Date, focus: [ClaudeFocusChange], now: Date) -> Bool {
+        self.claudeVisits.contains { visit in
+            let end = visit.end ?? now
+            guard end >= since,
+                  end.timeIntervalSince(visit.start) >= Self.readDwell
+                    || Self.switchesSessions(during: visit, focus: focus, now: now)
+            else {
+                return false
+            }
+            let shownAtStart = focus.last { $0.at <= visit.start }?.sessionID == id
+            return shownAtStart || Self.changes(during: visit, focus: focus, now: now).contains { $0.sessionID == id }
+        }
+    }
+
+    /// The log counts seconds, so a switch in the second the visit began
+    /// belongs to it.
+    private static func changes(
+        during visit: Visit,
+        focus: [ClaudeFocusChange],
+        now: Date) -> [ClaudeFocusChange]
+    {
+        focus.filter { $0.at > visit.start.addingTimeInterval(-1) && $0.at <= (visit.end ?? now) }
+    }
+
+    private static func switchesSessions(during visit: Visit, focus: [ClaudeFocusChange], now: Date) -> Bool {
+        !self.changes(during: visit, focus: focus, now: now).isEmpty
+    }
+
     private func isPassingVisit(of platform: TokenPlatform, now: Date) -> Bool {
         guard let visit = self.visits[platform] else { return false }
         guard (visit.end ?? now).timeIntervalSince(visit.start) < Self.readDwell else { return false }
+        if platform == .claude,
+           let focus = self.claudeFocusChanges(),
+           Self.switchesSessions(during: visit, focus: focus, now: now)
+        {
+            return false
+        }
         return visit.end.map { now.timeIntervalSince($0) < Self.readLag } ?? true
     }
 
@@ -226,7 +292,9 @@ public final class DesktopUnreadTaskMonitor {
     private func releaseHeld(for platform: TokenPlatform, now: Date) {
         guard var held = self.held[platform], !held.isEmpty else { return }
         held = held.filter { now.timeIntervalSince($0.value.since) < Self.holdLimit }
-        if let visit = self.visits[platform],
+        if platform == .claude, let focus = self.claudeFocusChanges() {
+            held = held.filter { id, hold in !self.claudeRead(id, after: hold.since, focus: focus, now: now) }
+        } else if let visit = self.visits[platform],
            visit.end == nil,
            now.timeIntervalSince(visit.start) >= Self.readDwell
         {
@@ -247,7 +315,7 @@ public final class DesktopUnreadTaskMonitor {
     /// held Claude session rewrites its record, and the recount that follows
     /// releases it.
     private func scheduleReleaseCheck(for platform: TokenPlatform) {
-        guard !(self.held[platform] ?? [:]).isEmpty,
+        guard let held = self.held[platform], !held.isEmpty,
               let visit = self.visits[platform],
               visit.end == nil
         else {
@@ -629,6 +697,44 @@ struct DesktopUnreadTaskReader: Sendable {
         return id == "null" ? .none : .session(id)
     }
 
+    /// The sessions Claude Desktop's window showed, oldest first, from the end
+    /// of its log, which notes each change to the second.
+    func claudeFocusChanges() -> [ClaudeFocusChange]? {
+        let marker = Data("LocalSessions.setFocusedSession: sessionId=".utf8)
+        guard let handle = try? FileHandle(forReadingFrom: self.claudeMainLog) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return nil }
+        let tailLength: UInt64 = 256 << 10
+        guard (try? handle.seek(toOffset: end > tailLength ? end - tailLength : 0)) != nil,
+              let tail = try? handle.readToEnd()
+        else {
+            return nil
+        }
+        return tail.split(separator: 0x0A).compactMap { line -> ClaudeFocusChange? in
+            guard let range = line.range(of: marker),
+                  let at = Self.claudeLogDate(line.prefix(19))
+            else {
+                return nil
+            }
+            let value = line[range.upperBound...].prefix { byte in
+                byte != 0x0D && byte != 0x20 && byte != 0x2C
+            }
+            guard let id = String(data: Data(value), encoding: .utf8), !id.isEmpty else { return nil }
+            return ClaudeFocusChange(sessionID: id == "null" ? nil : id, at: at)
+        }
+    }
+
+    /// `yyyy-MM-dd HH:mm:ss` in local time.
+    private static func claudeLogDate(_ text: Data.SubSequence) -> Date? {
+        let fields = String(decoding: text, as: UTF8.self)
+            .split(whereSeparator: { $0 == "-" || $0 == " " || $0 == ":" })
+            .compactMap { Int($0) }
+        guard fields.count == 6 else { return nil }
+        return Calendar.current.date(from: DateComponents(
+            year: fields[0], month: fields[1], day: fields[2],
+            hour: fields[3], minute: fields[4], second: fields[5]))
+    }
+
     /// The running Claude Desktop's process and when it launched.
     struct ClaudeLaunch: Equatable, Sendable {
         let pid: pid_t
@@ -755,6 +861,12 @@ enum ClaudeShownSession: Equatable, Sendable {
     case unknown
     case none
     case session(String)
+}
+
+/// Claude Desktop's window started showing a session, or `nil` for anything else.
+struct ClaudeFocusChange: Equatable, Sendable {
+    let sessionID: String?
+    let at: Date
 }
 
 struct ClaudeSessionSnapshot: Equatable, Sendable {
