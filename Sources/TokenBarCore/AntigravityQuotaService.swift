@@ -143,21 +143,61 @@ public struct AntigravityQuotaService: QuotaProviding, Sendable {
         }
 
         guard let summary = try? JSONDecoder().decode(QuotaSummary.self, from: data),
-              let group = Self.mostConstrainedGroup(in: summary.response.groups)
+              let groups = Self.primaryAndSecondaryGroups(in: summary.response.groups)
         else {
             throw AntigravityQuotaServiceError.invalidResponse
         }
+        let secondaryGroup = groups.secondary.flatMap { group -> QuotaGroupSnapshot? in
+            let session = Self.window(in: group, window: "5h", minutes: 300)
+            let weekly = Self.window(in: group, window: "weekly", minutes: 7 * 24 * 60)
+            guard session != nil || weekly != nil else { return nil }
+            return QuotaGroupSnapshot(
+                label: Self.compactGroupLabel(group.displayName),
+                session: session,
+                weekly: weekly)
+        }
         return QuotaSnapshot(
-            session: Self.window(in: group, window: "5h", minutes: 300),
-            weekly: Self.window(in: group, window: "weekly", minutes: 7 * 24 * 60),
+            session: Self.window(in: groups.primary, window: "5h", minutes: 300),
+            weekly: Self.window(in: groups.primary, window: "weekly", minutes: 7 * 24 * 60),
             resetCredits: nil,
             updatedAt: self.now(),
-            origin: .liveProvider)
+            origin: .antigravity,
+            secondaryGroup: secondaryGroup)
     }
 
-    /// Antigravity meters Gemini and third-party models as separate pools. Only
-    /// one fits a provider tab, so report the pool that runs out first and keep
-    /// both of its windows so the two rows describe the same pool.
+    /// Antigravity meters Gemini and third-party models as separate pools. Keep
+    /// the primary gauges anchored to the Gemini pool and expose the Claude/GPT
+    /// pool as the secondary group so the two pools never swap places.
+    static func primaryAndSecondaryGroups(
+        in groups: [QuotaGroup]) -> (primary: QuotaGroup, secondary: QuotaGroup?)?
+    {
+        let nonEmpty = groups.filter { !$0.buckets.isEmpty }
+        guard !nonEmpty.isEmpty else { return nil }
+        let primaryIndex = nonEmpty.firstIndex { group in
+            group.buckets.contains { ($0.bucketId ?? "").lowercased().hasPrefix("gemini") }
+                || (group.displayName ?? "").localizedCaseInsensitiveContains("gemini")
+        } ?? 0
+        let primary = nonEmpty[primaryIndex]
+        let secondary = nonEmpty.enumerated()
+            .first { $0.offset != primaryIndex }?
+            .element
+        return (primary, secondary)
+    }
+
+    private static func compactGroupLabel(_ displayName: String?) -> String {
+        guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else {
+            return "Claude & GPT"
+        }
+        if trimmed.localizedCaseInsensitiveContains("claude"),
+           trimmed.localizedCaseInsensitiveContains("gpt")
+        {
+            return "Claude & GPT"
+        }
+        return trimmed
+    }
+
     static func mostConstrainedGroup(in groups: [QuotaGroup]) -> QuotaGroup? {
         groups
             .filter { group in !group.buckets.isEmpty }

@@ -529,7 +529,8 @@ public final class DashboardModel {
             weekly: merge(snapshot.weekly, previous: previous?.weekly),
             resetCredits: snapshot.resetCredits,
             updatedAt: snapshot.updatedAt,
-            origin: snapshot.origin)
+            origin: snapshot.origin,
+            secondaryGroup: snapshot.secondaryGroup)
     }
 
     /// Keeps a percentage sampled in the same quota window when a newer provider

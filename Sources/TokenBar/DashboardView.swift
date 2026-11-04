@@ -59,6 +59,7 @@ struct DashboardOverviewView: View {
     static let headerHeight: CGFloat = 42
     static let compactHeaderHeight: CGFloat = 30
     fileprivate static let gaugeRowHeight: CGFloat = 66
+    fileprivate static let secondaryQuotaGroupHeight: CGFloat = 26
     fileprivate static let resetCreditsHeight: CGFloat = 26
     fileprivate static let quotaPlaceholderHeight: CGFloat = 20
     static let todayHeight: CGFloat = 138
@@ -109,9 +110,11 @@ struct DashboardOverviewView: View {
     static func quotaHeight(
         hasWeekly: Bool,
         hasFiveHour: Bool,
-        hasResetCredits: Bool) -> CGFloat
+        hasResetCredits: Bool,
+        hasSecondaryGroup: Bool = false) -> CGFloat
     {
         (hasWeekly || hasFiveHour ? self.gaugeRowHeight : self.quotaPlaceholderHeight)
+            + (hasSecondaryGroup ? self.secondaryQuotaGroupHeight : 0)
             + (hasResetCredits ? self.resetCreditsHeight : 0)
             + DashboardLayout.panelPadding * 2
     }
@@ -120,7 +123,8 @@ struct DashboardOverviewView: View {
         self.quotaHeight(
             hasWeekly: quota?.weekly != nil,
             hasFiveHour: quota?.session != nil,
-            hasResetCredits: quota?.resetCredits != nil)
+            hasResetCredits: quota?.resetCredits != nil,
+            hasSecondaryGroup: quota?.secondaryGroup != nil)
     }
 
     var body: some View {
@@ -439,6 +443,11 @@ private struct QuotaPanel: View {
                     .frame(height: DashboardOverviewView.quotaPlaceholderHeight)
                 }
 
+                if let secondaryGroup = snapshot?.secondaryGroup {
+                    SecondaryQuotaGroupRow(group: secondaryGroup)
+                        .frame(height: DashboardOverviewView.secondaryQuotaGroupHeight, alignment: .bottom)
+                }
+
                 if let resetCredits = snapshot?.resetCredits {
                     ResetCreditsRow(snapshot: resetCredits)
                         .frame(height: DashboardOverviewView.resetCreditsHeight, alignment: .bottom)
@@ -459,6 +468,8 @@ private struct QuotaPanel: View {
             return "Quota from Claude Desktop, sampled \(age)."
         case .liveProvider:
             return "Quota from Anthropic, sampled \(age)."
+        case .antigravity:
+            return "Quota from Antigravity, sampled \(age)."
         case nil:
             return "Quota sampled \(age)."
         }
@@ -708,6 +719,72 @@ private struct FiveHourGaugeBlock: View {
             return "Reset unknown"
         }
         return "Resets \(reset.compactFutureText)"
+    }
+}
+
+private struct SecondaryQuotaGroupRow: View {
+    let group: QuotaGroupSnapshot
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(self.group.label)
+                .fontWeight(.medium)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            HStack(spacing: 6) {
+                if let weekly = self.group.weekly, weekly.usageKnown {
+                    self.windowMetric(label: "Weekly", window: weekly)
+                }
+                if self.group.weekly?.usageKnown == true,
+                   self.group.session?.usageKnown == true
+                {
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                }
+                if let fiveHour = self.group.session, fiveHour.usageKnown {
+                    self.windowMetric(label: "5h", window: fiveHour)
+                }
+            }
+        }
+        .font(.system(size: 10.5))
+        .lineLimit(1)
+        .padding(.top, 6)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+        }
+        .help(self.helpText)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func windowMetric(label: String, window: QuotaWindowSnapshot) -> some View {
+        let remaining = window.remainingPercent.clamped(to: 0 ... 100)
+        let status = QuotaStatus(remainingPercent: remaining)
+        HStack(spacing: 3) {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text("\(Int(remaining.rounded()))% left")
+                .fontWeight(.semibold)
+                .monospacedDigit()
+                .foregroundStyle(status.textColor(normal: .primary))
+        }
+    }
+
+    private var helpText: String {
+        var parts: [String] = []
+        if let weekly = self.group.weekly, weekly.usageKnown {
+            let used = Int(weekly.usedPercent.clamped(to: 0 ... 100).rounded())
+            let reset = weekly.resetsAt.map { "resets \($0.compactFutureText)" } ?? "reset unknown"
+            parts.append("Weekly: \(used)% used (\(reset))")
+        }
+        if let fiveHour = self.group.session, fiveHour.usageKnown {
+            let used = Int(fiveHour.usedPercent.clamped(to: 0 ... 100).rounded())
+            let reset = fiveHour.resetsAt.map { "resets \($0.compactFutureText)" } ?? "reset unknown"
+            parts.append("5-hour: \(used)% used (\(reset))")
+        }
+        return "\(self.group.label) — " + parts.joined(separator: " · ")
     }
 }
 

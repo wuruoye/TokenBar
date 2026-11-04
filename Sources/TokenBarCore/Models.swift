@@ -218,12 +218,30 @@ public struct QuotaResetCreditsSnapshot: Codable, Equatable, Sendable {
 public enum QuotaSnapshotOrigin: String, Codable, Equatable, Sendable {
     case liveProvider
     case claudeDesktop
+    case antigravity
+}
+
+public struct QuotaGroupSnapshot: Codable, Equatable, Sendable {
+    public let label: String
+    public let session: QuotaWindowSnapshot?
+    public let weekly: QuotaWindowSnapshot?
+
+    public init(
+        label: String,
+        session: QuotaWindowSnapshot?,
+        weekly: QuotaWindowSnapshot?)
+    {
+        self.label = label
+        self.session = session
+        self.weekly = weekly
+    }
 }
 
 public struct QuotaSnapshot: Codable, Equatable, Sendable {
     public let session: QuotaWindowSnapshot?
     public let weekly: QuotaWindowSnapshot?
     public let resetCredits: QuotaResetCreditsSnapshot?
+    public let secondaryGroup: QuotaGroupSnapshot?
     public let updatedAt: Date
     public let origin: QuotaSnapshotOrigin?
 
@@ -232,11 +250,13 @@ public struct QuotaSnapshot: Codable, Equatable, Sendable {
         weekly: QuotaWindowSnapshot?,
         resetCredits: QuotaResetCreditsSnapshot?,
         updatedAt: Date,
-        origin: QuotaSnapshotOrigin? = nil)
+        origin: QuotaSnapshotOrigin? = nil,
+        secondaryGroup: QuotaGroupSnapshot? = nil)
     {
         self.session = session
         self.weekly = weekly
         self.resetCredits = resetCredits
+        self.secondaryGroup = secondaryGroup
         self.updatedAt = updatedAt
         self.origin = origin
     }
