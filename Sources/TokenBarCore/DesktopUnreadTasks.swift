@@ -99,11 +99,13 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private var visits: [TokenPlatform: [Visit]] = [:]
     /// Claude's focus changes, read again only when its log grows.
     @ObservationIgnored private var claudeFocusCache: (logSize: UInt64, changes: [ClaudeFocusChange])?
+    /// Antigravity's focus changes, updated when its annotations or opened tasks change.
+    @ObservationIgnored private var antigravityFocus: [ClaudeFocusChange] = []
     /// Tasks opened from TokenBar, which count as read as soon as their app shows them.
     @ObservationIgnored private var openedAt: [TokenPlatform: [String: Date]] = [:]
-    /// Claude sessions opened from TokenBar, oldest first. Claude logs the
-    /// switch to one like a switch the user makes.
-    @ObservationIgnored private var claudeOpens: [(id: String, at: Date)] = []
+    /// Sessions opened from TokenBar per platform, oldest first. Claude and
+    /// Antigravity record the switch to one like a switch the user makes.
+    @ObservationIgnored private var opens: [TokenPlatform: [(id: String, at: Date)]] = [:]
     @ObservationIgnored private var releaseChecks: [TokenPlatform: Task<Void, Never>] = [:]
     @ObservationIgnored private var openLagChecks: [TokenPlatform: Task<Void, Never>] = [:]
 
@@ -190,12 +192,15 @@ public final class DesktopUnreadTaskMonitor {
             ?? self.held[platform]?[id]?.task.updatedAt
         let effectiveOpenedAt = max(now, currentUpdatedAt ?? .distantPast)
         self.openedAt[platform, default: [:]][id] = effectiveOpenedAt
-        if platform == .claude {
-            self.claudeOpens = self.claudeOpens.filter {
+        if platform == .claude || platform == .antigravity {
+            self.opens[platform] = (self.opens[platform] ?? []).filter {
                 now.timeIntervalSince($0.at) < Self.visitHistoryLimit
             } + [(id, now)]
         }
         if platform == .antigravity {
+            self.antigravityFocus = self.antigravityFocus.filter {
+                now.timeIntervalSince($0.at) < Self.visitHistoryLimit
+            } + [ClaudeFocusChange(sessionID: id, at: now)]
             self.watcher?.markAntigravityViewed(id: id, at: effectiveOpenedAt)
         }
         _ = self.held[platform]?.removeValue(forKey: id)
@@ -209,9 +214,9 @@ public final class DesktopUnreadTaskMonitor {
             reader: self.reader,
             claudeTrackerStateURL: self.claudeTrackerStateURL,
             antigravityTrackerStateURL: self.antigravityTrackerStateURL,
-            publish: { [weak self] platform, tasks, existing in
+            publish: { [weak self] platform, tasks, existing, focus in
                 Task { @MainActor [weak self] in
-                    self?.accept(tasks, existing: existing, for: platform)
+                    self?.accept(tasks, existing: existing, focus: focus, for: platform)
                 }
             },
             publishRunning: { [weak self] platform, tasks in
@@ -234,7 +239,8 @@ public final class DesktopUnreadTaskMonitor {
         self.held = [:]
         self.existing = [:]
         self.openedAt = [:]
-        self.claudeOpens = []
+        self.opens = [:]
+        self.antigravityFocus = []
         for check in self.releaseChecks.values {
             check.cancel()
         }
@@ -250,9 +256,17 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// Holds the tasks the app no longer reports, unless opened from TokenBar.
-    private func accept(_ tasks: [DesktopUnreadTask], existing: Set<String>?, for platform: TokenPlatform) {
+    private func accept(
+        _ tasks: [DesktopUnreadTask],
+        existing: Set<String>?,
+        focus: [ClaudeFocusChange]? = nil,
+        for platform: TokenPlatform)
+    {
         guard self.watcher != nil else { return }
         let now = Date()
+        if platform == .antigravity, let focus {
+            self.antigravityFocus = focus
+        }
         let ids = Set(tasks.map(\.id))
         let opened = (self.openedAt[platform] ?? [:]).filter { now.timeIntervalSince($0.value) < Self.readLag }
         self.openedAt[platform] = opened
@@ -289,7 +303,7 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// Whether a visit that ended after the task finished read it. Without
-    /// Claude's log, a visit reads every task once it lasts `readDwell`.
+    /// focus history, a visit reads every task once it lasts `readDwell`.
     private func seen(
         _ task: DesktopUnreadTask,
         on platform: TokenPlatform,
@@ -302,14 +316,20 @@ public final class DesktopUnreadTaskMonitor {
             guard let focus else {
                 return (visit.end ?? now).timeIntervalSince(visit.start) >= Self.readDwell
             }
-            return self.claudeVisitRead(task.id, visit: visit, focus: focus, now: now)
+            return self.claudeVisitRead(task.id, on: platform, visit: visit, focus: focus, now: now)
         }
     }
 
     /// The visit read the session if it showed the session for `readDwell`,
     /// or the user switched to it or away from it. A session opened from
     /// TokenBar replaces the one the window showed before the user saw it.
-    private func claudeVisitRead(_ id: String, visit: Visit, focus: [ClaudeFocusChange], now: Date) -> Bool {
+    private func claudeVisitRead(
+        _ id: String,
+        on platform: TokenPlatform,
+        visit: Visit,
+        focus: [ClaudeFocusChange],
+        now: Date) -> Bool
+    {
         var shown = focus.last { $0.at <= visit.start.addingTimeInterval(-1) }?.sessionID
         var shownSince = visit.start
         var duration: TimeInterval = 0
@@ -318,7 +338,7 @@ public final class DesktopUnreadTaskMonitor {
             if shown == id {
                 duration += at.timeIntervalSince(shownSince)
             }
-            if shown == id || change.sessionID == id, !self.isOpenSwitch(change) {
+            if shown == id || change.sessionID == id, !self.isOpenSwitch(change, on: platform) {
                 return true
             }
             shown = change.sessionID
@@ -331,8 +351,8 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// Claude logs a switch as no session, then the new one, in the same second.
-    private func isOpenSwitch(_ change: ClaudeFocusChange) -> Bool {
-        self.claudeOpens.contains { open in
+    private func isOpenSwitch(_ change: ClaudeFocusChange, on platform: TokenPlatform) -> Bool {
+        (self.opens[platform] ?? []).contains { open in
             (change.sessionID == nil || change.sessionID == open.id)
                 && change.at > open.at.addingTimeInterval(-1)
                 && change.at < open.at.addingTimeInterval(Self.claudeOpenSwitchLag)
@@ -352,7 +372,14 @@ public final class DesktopUnreadTaskMonitor {
     /// Releases the held tasks the user has since seen, and drops those archived.
     private func releaseHeld(for platform: TokenPlatform, now: Date) {
         guard let held = self.held[platform], !held.isEmpty else { return }
-        let focus = platform == .claude ? self.claudeFocusChanges() : nil
+        let focus: [ClaudeFocusChange]? = switch platform {
+        case .claude:
+            self.claudeFocusChanges()
+        case .antigravity:
+            self.antigravityFocus.isEmpty ? nil : self.antigravityFocus
+        default:
+            nil
+        }
         let existing = self.existing[platform]
         self.held[platform] = held.filter { id, hold in
             now.timeIntervalSince(hold.since) < Self.holdLimit
@@ -1114,6 +1141,8 @@ struct DesktopUnreadTaskReader: Sendable {
                 lastUserInputAt: row.lastUserInputAt,
                 lastUserViewAt: annotation?.lastUserViewAt,
                 lastUserViewSeconds: annotation?.lastUserViewSeconds,
+                lastUserViewMillis: annotation?.lastUserViewMillis,
+                annotationModifiedAt: annotation?.modifiedAt,
                 hasAnnotation: annotation != nil,
                 markedAsUnread: annotation?.markedAsUnread == true,
                 isArchived: archivedFromFTS.contains(row.id) || annotation?.isArchived == true,
@@ -1161,6 +1190,7 @@ struct DesktopUnreadTaskReader: Sendable {
             title = Self.unescapePbtxtString(String(match.output.1)).flatMap(DesktopUnreadTurnReader.flattened)
         }
         var lastUserViewSeconds: Int64?
+        var lastUserViewMillis: Int64?
         var lastUserViewAt: Date?
         if let match = text.firstMatch(
             of: #/last_user_view_time\s*:\s*\{[^}]*\bseconds\s*:\s*(-?\d+)(?:\s+nanos\s*:\s*(-?\d+))?[^}]*\}/#)
@@ -1168,6 +1198,7 @@ struct DesktopUnreadTaskReader: Sendable {
             if let seconds = Int64(match.output.1) {
                 let nanos = match.output.2.flatMap { Int64($0) } ?? 0
                 lastUserViewSeconds = seconds
+                lastUserViewMillis = seconds * 1_000 + nanos / 1_000_000
                 lastUserViewAt = Date(
                     timeIntervalSince1970: TimeInterval(seconds) + TimeInterval(nanos) / 1_000_000_000)
             }
@@ -1178,6 +1209,7 @@ struct DesktopUnreadTaskReader: Sendable {
             modifiedAt: modifiedAt,
             title: title,
             lastUserViewSeconds: lastUserViewSeconds,
+            lastUserViewMillis: lastUserViewMillis,
             lastUserViewAt: lastUserViewAt,
             markedAsUnread: markedAsUnread,
             isArchived: isArchived)
@@ -1332,8 +1364,8 @@ enum ClaudeShownSession: Equatable, Sendable {
     case session(String)
 }
 
-/// Claude Desktop's window started showing a session, or `nil` for anything else.
-struct ClaudeFocusChange: Equatable, Sendable {
+/// Claude Desktop's or Antigravity's window started showing a session, or `nil` for anything else.
+struct ClaudeFocusChange: Codable, Equatable, Sendable {
     let sessionID: String?
     let at: Date
 }
@@ -1358,6 +1390,7 @@ struct AntigravityAnnotation: Equatable, Sendable {
     let modifiedAt: Date
     let title: String?
     let lastUserViewSeconds: Int64?
+    let lastUserViewMillis: Int64?
     let lastUserViewAt: Date?
     let markedAsUnread: Bool
     let isArchived: Bool
@@ -1373,6 +1406,8 @@ struct AntigravitySessionSnapshot: Equatable, Sendable {
     let lastUserInputAt: Date?
     let lastUserViewAt: Date?
     let lastUserViewSeconds: Int64?
+    var lastUserViewMillis: Int64? = nil
+    var annotationModifiedAt: Date? = nil
     let hasAnnotation: Bool
     let markedAsUnread: Bool
     let isArchived: Bool
@@ -1382,6 +1417,22 @@ struct AntigravitySessionSnapshot: Equatable, Sendable {
     let hasForegroundSubagents: Bool
     let hasBackgroundSubagents: Bool
     let subagentActivity: String?
+
+    func focusAt(includingInput: Bool) -> Date? {
+        let viewAt = self.lastUserViewAt ?? .distantPast
+        let inputAt = includingInput ? (self.lastUserInputAt ?? .distantPast) : .distantPast
+        let latest = max(viewAt, inputAt)
+        return latest > .distantPast ? latest : nil
+    }
+
+    func focusMillis(includingInput: Bool) -> Int64 {
+        let viewMillis = self.lastUserViewMillis
+            ?? self.lastUserViewAt.map { Int64(($0.timeIntervalSince1970 * 1_000).rounded()) }
+            ?? 0
+        guard includingInput else { return viewMillis }
+        let inputMillis = self.lastUserInputAt.map { Int64(($0.timeIntervalSince1970 * 1_000).rounded()) } ?? 0
+        return max(viewMillis, inputMillis)
+    }
 }
 
 /// Tracks Antigravity's unread conversations. Antigravity writes
@@ -1392,19 +1443,62 @@ struct AntigravitySessionSnapshot: Equatable, Sendable {
 /// is in front keeps it from flashing unread, without hiding turns that finish
 /// in other conversations or while Antigravity is in the background.
 struct AntigravityUnreadTracker {
+    static let openSwitchLag: TimeInterval = 10
+    static let focusHistoryLimit: TimeInterval = 4 * 60 * 60
+
     struct Progress: Codable, Equatable {
         var lastModifiedSeconds: Int64
         var isWorking: Bool
+        var lastFocusMillis: Int64? = nil
     }
 
     struct State: Codable, Equatable {
         var progress: [String: Progress] = [:]
         var viewedSeconds: [String: Int64] = [:]
+        /// `last_user_view_time` values (in milliseconds) written while the
+        /// user did not actually view the conversation — such as when
+        /// Antigravity rewrites the outgoing conversation's annotation while
+        /// TokenBar switches the window to another conversation.
+        var unseenViewMillis: [String: Int64] = [:]
+        var shownSessionID: String? = nil
+        var focusChanges: [ClaudeFocusChange] = []
+
+        init(
+            progress: [String: Progress] = [:],
+            viewedSeconds: [String: Int64] = [:],
+            unseenViewMillis: [String: Int64] = [:],
+            shownSessionID: String? = nil,
+            focusChanges: [ClaudeFocusChange] = [])
+        {
+            self.progress = progress
+            self.viewedSeconds = viewedSeconds
+            self.unseenViewMillis = unseenViewMillis
+            self.shownSessionID = shownSessionID
+            self.focusChanges = focusChanges
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.progress = try container.decodeIfPresent([String: Progress].self, forKey: .progress) ?? [:]
+            self.viewedSeconds = try container.decodeIfPresent([String: Int64].self, forKey: .viewedSeconds) ?? [:]
+            self.unseenViewMillis = try container.decodeIfPresent([String: Int64].self, forKey: .unseenViewMillis) ?? [:]
+            self.shownSessionID = try container.decodeIfPresent(String.self, forKey: .shownSessionID)
+            self.focusChanges = try container.decodeIfPresent([ClaudeFocusChange].self, forKey: .focusChanges) ?? []
+        }
+    }
+
+    private struct PendingOpen: Equatable {
+        let id: String
+        let at: Date
+        let atMillis: Int64
+        let baselineViewMillis: Int64
+        var switchedAtMillis: Int64?
     }
 
     private(set) var sessions: [String: AntigravitySessionSnapshot] = [:]
     private(set) var state: State
     private var hasBaseline: Bool
+    private var pendingOpen: PendingOpen?
 
     init(restoring state: State? = nil) {
         self.state = state ?? State()
@@ -1417,7 +1511,115 @@ struct AntigravityUnreadTracker {
         isAntigravityActive: Bool,
         now: Date) -> Set<String>
     {
-        if self.hasBaseline, isAntigravityActive, let shownID = Self.shownSessionID(in: sessions),
+        if let pending = self.pendingOpen {
+            if now.timeIntervalSince(pending.at) >= Self.openSwitchLag {
+                self.pendingOpen = nil
+            } else if pending.switchedAtMillis == nil,
+                      let targetViewMillis = sessions[pending.id]?.focusMillis(includingInput: false),
+                      targetViewMillis > pending.baselineViewMillis
+            {
+                self.pendingOpen?.switchedAtMillis = targetViewMillis
+            }
+        }
+
+        func isOpenSwitchSideEffect(id: String, viewMillis: Int64) -> Bool {
+            guard let pending = self.pendingOpen,
+                  pending.id != id,
+                  now.timeIntervalSince(pending.at) < Self.openSwitchLag
+            else {
+                return false
+            }
+            if let switchedAt = pending.switchedAtMillis {
+                return viewMillis <= switchedAt + 100
+            }
+            return viewMillis <= pending.atMillis + 3_000
+        }
+
+        if !self.hasBaseline {
+            if self.state.shownSessionID == nil,
+               let initial = Self.initialShownSession(in: sessions)
+            {
+                self.state.shownSessionID = initial.id
+                if self.state.focusChanges.isEmpty {
+                    self.state.focusChanges = [ClaudeFocusChange(sessionID: initial.id, at: initial.at)]
+                }
+            }
+        } else {
+            for (id, session) in sessions where !session.isArchived {
+                let previousFocusMillis = self.state.progress[id]?.lastFocusMillis
+                    ?? self.sessions[id]?.focusMillis(includingInput: true)
+                    ?? 0
+                let previousAnnotationSeconds: Int64 = if let unseen = self.state.unseenViewMillis[id],
+                                                         previousFocusMillis <= unseen
+                {
+                    0
+                } else {
+                    previousFocusMillis / 1_000
+                }
+                let previousEffectiveViewed = max(
+                    previousAnnotationSeconds,
+                    self.state.viewedSeconds[id] ?? 0)
+                let hadUnreadTurn = session.markedAsUnread
+                    || session.lastModifiedSeconds > previousEffectiveViewed
+                let currentViewMillis = session.focusMillis(includingInput: false)
+                if hadUnreadTurn, currentViewMillis > previousFocusMillis {
+                    let isWorking = foregroundRunningIDs.contains(id)
+                    let turnAdvancedInBackground = !isAntigravityActive
+                        && (self.state.progress[id].map { previous in
+                            session.lastModifiedSeconds > previous.lastModifiedSeconds
+                                || (previous.isWorking && !isWorking)
+                        } ?? false)
+                    if isOpenSwitchSideEffect(id: id, viewMillis: currentViewMillis) || turnAdvancedInBackground {
+                        self.state.unseenViewMillis[id] = max(
+                            self.state.unseenViewMillis[id] ?? 0,
+                            currentViewMillis)
+                    }
+                }
+            }
+
+            let currentShownID = self.state.shownSessionID
+            let pendingID = self.pendingOpen?.id
+            let advancedCandidates = sessions.values.compactMap { session
+                -> (id: String, at: Date, millis: Int64, previousMillis: Int64)? in
+                guard !session.isArchived,
+                      let at = session.focusAt(includingInput: isAntigravityActive)
+                else {
+                    return nil
+                }
+                let millis = session.focusMillis(includingInput: isAntigravityActive)
+                let previousMillis = self.state.progress[session.id]?.lastFocusMillis
+                    ?? self.sessions[session.id]?.focusMillis(includingInput: true)
+                    ?? 0
+                guard millis > previousMillis,
+                      !isOpenSwitchSideEffect(id: session.id, viewMillis: millis)
+                else {
+                    return nil
+                }
+                return (session.id, at, millis, previousMillis)
+            }
+            if let nextShown = advancedCandidates.max(by: { lhs, rhs in
+                let lhsIsPending = lhs.id == pendingID
+                let rhsIsPending = rhs.id == pendingID
+                if lhsIsPending != rhsIsPending {
+                    return !lhsIsPending
+                }
+                let lhsIsSwitch = lhs.id != currentShownID
+                let rhsIsSwitch = rhs.id != currentShownID
+                if lhsIsSwitch != rhsIsSwitch {
+                    return !lhsIsSwitch
+                }
+                if lhs.millis != rhs.millis {
+                    return lhs.millis < rhs.millis
+                }
+                return lhs.previousMillis > rhs.previousMillis
+            }) {
+                self.recordFocusChange(to: nextShown.id, at: nextShown.at, now: now)
+            }
+        }
+
+        if self.hasBaseline,
+           isAntigravityActive,
+           let shownID = self.state.shownSessionID ?? Self.initialShownSession(in: sessions)?.id,
            let shown = sessions[shownID]
         {
             let isWorking = foregroundRunningIDs.contains(shownID)
@@ -1425,10 +1627,11 @@ struct AntigravityUnreadTracker {
                 shown.lastModifiedSeconds > previous.lastModifiedSeconds
                     || (previous.isWorking && !isWorking)
             } ?? true
-            if advanced, shown.lastModifiedSeconds > 0 {
+            if !isWorking || advanced, shown.lastModifiedSeconds > 0 {
                 self.state.viewedSeconds[shownID] = max(
                     self.state.viewedSeconds[shownID] ?? 0,
                     shown.lastModifiedSeconds)
+                self.state.unseenViewMillis.removeValue(forKey: shownID)
             }
         }
 
@@ -1438,12 +1641,25 @@ struct AntigravityUnreadTracker {
                 id,
                 Progress(
                     lastModifiedSeconds: session.lastModifiedSeconds,
-                    isWorking: foregroundRunningIDs.contains(id))
+                    isWorking: foregroundRunningIDs.contains(id),
+                    lastFocusMillis: session.focusMillis(includingInput: true))
             )
         })
+        self.state.unseenViewMillis = self.state.unseenViewMillis.filter { id, unseen in
+            guard let session = sessions[id], !session.isArchived else { return false }
+            let viewMillis = session.focusMillis(includingInput: false)
+            guard viewMillis > 0, viewMillis <= unseen else { return false }
+            return (self.state.viewedSeconds[id] ?? 0) < session.lastModifiedSeconds
+        }
         self.state.viewedSeconds = self.state.viewedSeconds.filter { id, viewed in
             guard let session = sessions[id], !session.isArchived else { return false }
-            return (session.lastUserViewSeconds ?? 0) < viewed
+            let annotationSeconds = Self.effectiveAnnotationViewSeconds(
+                for: session,
+                unseenViewMillis: self.state.unseenViewMillis[id])
+            return annotationSeconds < viewed
+        }
+        self.state.focusChanges = self.state.focusChanges.filter {
+            now.timeIntervalSince($0.at) < Self.focusHistoryLimit
         }
         self.hasBaseline = true
 
@@ -1460,28 +1676,81 @@ struct AntigravityUnreadTracker {
                     return nil
                 }
             }
-            let viewed = max(session.lastUserViewSeconds ?? 0, self.state.viewedSeconds[id] ?? 0)
+            let annotationSeconds = Self.effectiveAnnotationViewSeconds(
+                for: session,
+                unseenViewMillis: self.state.unseenViewMillis[id])
+            let viewed = max(annotationSeconds, self.state.viewedSeconds[id] ?? 0)
             return session.lastModifiedSeconds > viewed ? id : nil
         })
     }
 
-    mutating func markViewed(id: String, at now: Date) {
-        let nowSeconds = Int64(floor(now.timeIntervalSince1970))
+    mutating func markViewed(id: String, at effectiveOpenedAt: Date, now: Date = Date()) {
+        let effectiveSeconds = Int64(floor(effectiveOpenedAt.timeIntervalSince1970))
         let sessionModified = self.sessions[id]?.lastModifiedSeconds ?? 0
         self.state.viewedSeconds[id] = max(
             self.state.viewedSeconds[id] ?? 0,
-            max(sessionModified, nowSeconds))
+            max(sessionModified, effectiveSeconds))
+        self.state.unseenViewMillis.removeValue(forKey: id)
+        let nowMillis = Int64((now.timeIntervalSince1970 * 1_000).rounded())
+        let baselineViewMillis = self.sessions[id]?.focusMillis(includingInput: false) ?? 0
+        self.pendingOpen = PendingOpen(
+            id: id,
+            at: now,
+            atMillis: nowMillis,
+            baselineViewMillis: baselineViewMillis,
+            switchedAtMillis: nil)
+        self.recordFocusChange(to: id, at: now, now: now, forceAppend: true)
     }
 
-    private static func shownSessionID(in sessions: [String: AntigravitySessionSnapshot]) -> String? {
+    private mutating func recordFocusChange(
+        to sessionID: String,
+        at: Date,
+        now: Date,
+        forceAppend: Bool = false)
+    {
+        let changed = self.state.shownSessionID != sessionID
+        self.state.shownSessionID = sessionID
+        guard changed || forceAppend || self.state.focusChanges.isEmpty else { return }
+        self.state.focusChanges = self.state.focusChanges.filter {
+            now.timeIntervalSince($0.at) < Self.focusHistoryLimit
+        } + [ClaudeFocusChange(sessionID: sessionID, at: at)]
+    }
+
+    private static func effectiveAnnotationViewSeconds(
+        for session: AntigravitySessionSnapshot,
+        unseenViewMillis: Int64?) -> Int64
+    {
+        if let unseenViewMillis, session.focusMillis(includingInput: false) <= unseenViewMillis {
+            return 0
+        }
+        return session.lastUserViewSeconds ?? 0
+    }
+
+    private static func initialShownSession(
+        in sessions: [String: AntigravitySessionSnapshot]) -> (id: String, at: Date, millis: Int64)?
+    {
         sessions.values
             .filter { !$0.isArchived }
-            .compactMap { session -> (id: String, at: Date)? in
-                let latest = max(session.lastUserViewAt ?? .distantPast, session.lastUserInputAt ?? .distantPast)
-                return latest > .distantPast ? (session.id, latest) : nil
+            .compactMap { session -> (id: String, at: Date, millis: Int64, inputAt: Date, modifiedAt: Date)? in
+                guard let at = session.focusAt(includingInput: true) else { return nil }
+                return (
+                    session.id,
+                    at,
+                    session.focusMillis(includingInput: true),
+                    session.lastUserInputAt ?? .distantPast,
+                    session.annotationModifiedAt ?? .distantPast
+                )
             }
-            .max { $0.at < $1.at }?
-            .id
+            .max {
+                if $0.millis != $1.millis {
+                    return $0.millis < $1.millis
+                }
+                if $0.inputAt != $1.inputAt {
+                    return $0.inputAt < $1.inputAt
+                }
+                return $0.modifiedAt < $1.modifiedAt
+            }
+            .map { ($0.id, $0.at, $0.millis) }
     }
 }
 
@@ -1659,9 +1928,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// A turn appends to its rollout or transcript many times a second.
     private static let appendCoalescingDelay: TimeInterval = 0.3
 
-    /// Publishes the unread tasks, and the sessions that still exist
-    /// unarchived when the platform tells.
-    private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void
+    /// Publishes the unread tasks, the sessions that still exist unarchived
+    /// when the platform tells, and focus changes when tracked by the watcher.
+    private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?, [ClaudeFocusChange]?) -> Void
     private let publishRunning: @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void
     private let claudeTrackerStateURL: URL?
     private let antigravityTrackerStateURL: URL?
@@ -1718,7 +1987,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         reader: DesktopUnreadTaskReader,
         claudeTrackerStateURL: URL?,
         antigravityTrackerStateURL: URL? = nil,
-        publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void,
+        publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?, [ClaudeFocusChange]?) -> Void,
         publishRunning: @escaping @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void)
     {
         self.reader = reader
@@ -1992,7 +2261,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         for platform in platforms {
             switch platform {
             case .codex:
-                self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns), nil)
+                self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns), nil, nil)
             case .claude:
                 self.recountClaude(sessions: self.reader.claudeSessions(reusing: self.claudeTracker.sessions))
             case .antigravity:
@@ -2049,7 +2318,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.publish(
             .claude,
             self.claudeTasks(ids, sessions: sessions),
-            Set(sessions.filter { !$0.value.isArchived }.keys))
+            Set(sessions.filter { !$0.value.isArchived }.keys),
+            nil)
         self.publishRunning(.claude, running)
         self.saveClaudeTracker()
         self.scheduleClaudeExpiryRecount()
@@ -2111,7 +2381,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.publish(
             .antigravity,
             self.antigravityTasks(unreadIDs, sessions: sessions),
-            Set(sessions.filter { !$0.value.isArchived }.keys))
+            Set(sessions.filter { !$0.value.isArchived }.keys),
+            self.antigravityTracker.state.focusChanges)
         self.publishRunning(.antigravity, running)
         self.saveAntigravityTracker()
     }
