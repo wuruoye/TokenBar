@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum AntigravityQuotaServiceError: LocalizedError, Sendable {
@@ -22,23 +23,42 @@ public enum AntigravityQuotaServiceError: LocalizedError, Sendable {
 
 /// Reads the quota summary Antigravity's own language server serves on loopback.
 ///
-/// The IDE writes both the port and the CSRF token that guards its local RPC
-/// into its own logs, so TokenBar reads what Antigravity already recorded and
-/// asks the local server the same question the IDE asks. This never touches
-/// `~/.gemini/jetski-standalone-oauth-token` and never contacts Google.
+/// Antigravity 2.0 writes its daemon port and CSRF token to
+/// `~/.gemini/antigravity/daemon/*.json`, and older builds log them under
+/// `~/Library/Logs/Antigravity`. TokenBar reads what Antigravity already
+/// recorded and asks the local server the same question the IDE asks. This
+/// never touches `~/.gemini/jetski-standalone-oauth-token` and never contacts
+/// Google.
 public struct AntigravityQuotaService: QuotaProviding, Sendable {
     public let platform = TokenPlatform.antigravity
+
+    struct DaemonEndpoint: Equatable, Sendable {
+        let port: Int
+        let token: String
+    }
+
+    private struct DaemonRecord: Decodable {
+        let pid: Int32?
+        let httpPort: Int?
+        let csrfToken: String?
+    }
 
     private static let quotaPath =
         "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 
+    private let loadDaemonEndpoints: @Sendable () -> [DaemonEndpoint]
     private let loadMainLog: @Sendable () throws -> Data
     private let loadServerLog: @Sendable () throws -> Data
     private let send: @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let now: @Sendable () -> Date
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        let daemonDirectory = Self.antigravityHomeURL(environment: environment)
+            .appendingPathComponent("daemon", isDirectory: true)
         let logDirectory = Self.logDirectory(environment: environment)
+        self.loadDaemonEndpoints = {
+            Self.daemonEndpoints(in: daemonDirectory)
+        }
         self.loadMainLog = {
             try Self.loadLog(at: logDirectory.appendingPathComponent("main.log"))
         }
@@ -50,11 +70,13 @@ public struct AntigravityQuotaService: QuotaProviding, Sendable {
     }
 
     init(
+        loadDaemonEndpoints: @escaping @Sendable () -> [DaemonEndpoint] = { [] },
         loadMainLog: @escaping @Sendable () throws -> Data,
         loadServerLog: @escaping @Sendable () throws -> Data,
         send: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse),
         now: @escaping @Sendable () -> Date = Date.init)
     {
+        self.loadDaemonEndpoints = loadDaemonEndpoints
         self.loadMainLog = loadMainLog
         self.loadServerLog = loadServerLog
         self.send = send
@@ -62,13 +84,36 @@ public struct AntigravityQuotaService: QuotaProviding, Sendable {
     }
 
     public func fetchQuota() async throws -> QuotaSnapshot {
-        let mainLog = try self.loadMainLog()
-        let serverLog = try self.loadServerLog()
-        guard let token = Self.latestCSRFToken(in: mainLog),
-              let port = Self.latestHTTPPort(in: serverLog)
-        else {
-            throw AntigravityQuotaServiceError.serverUnavailable
+        var daemonError: AntigravityQuotaServiceError?
+        for endpoint in self.loadDaemonEndpoints() {
+            do {
+                return try await self.fetchQuota(port: endpoint.port, token: endpoint.token)
+            } catch let error as AntigravityQuotaServiceError {
+                if case .serverUnavailable = error {
+                    continue
+                }
+                daemonError = daemonError ?? error
+            }
         }
+
+        do {
+            let mainLog = try self.loadMainLog()
+            let serverLog = try self.loadServerLog()
+            guard let token = Self.latestCSRFToken(in: mainLog),
+                  let port = Self.latestHTTPPort(in: serverLog)
+            else {
+                throw daemonError ?? AntigravityQuotaServiceError.serverUnavailable
+            }
+            return try await self.fetchQuota(port: port, token: token)
+        } catch let error as AntigravityQuotaServiceError {
+            if let daemonError, case .logUnavailable = error {
+                throw daemonError
+            }
+            throw error
+        }
+    }
+
+    private func fetchQuota(port: Int, token: String) async throws -> QuotaSnapshot {
         guard let url = URL(string: "http://127.0.0.1:\(port)\(Self.quotaPath)") else {
             throw AntigravityQuotaServiceError.serverUnavailable
         }
@@ -181,6 +226,78 @@ public struct AntigravityQuotaService: QuotaProviding, Sendable {
         } catch {
             throw AntigravityQuotaServiceError.logUnavailable
         }
+    }
+
+    public static func antigravityHomeURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment) -> URL
+    {
+        if let configured = environment["ANTIGRAVITY_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !configured.isEmpty
+        {
+            return URL(fileURLWithPath: configured, isDirectory: true)
+        }
+        let home = environment["HOME"].flatMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } ?? FileManager.default.homeDirectoryForCurrentUser.path
+        return URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".gemini/antigravity", isDirectory: true)
+    }
+
+    static func daemonEndpoints(in directory: URL) -> [DaemonEndpoint] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles])) ?? []
+        let candidates = files.compactMap { url -> (url: URL, modifiedAt: Date, isHub: Bool)? in
+            guard url.pathExtension == "json",
+                  let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true,
+                  (values.fileSize ?? .max) <= 64 * 1024
+            else {
+                return nil
+            }
+            return (
+                url,
+                values.contentModificationDate ?? .distantPast,
+                url.lastPathComponent.hasPrefix("hub_"))
+        }.sorted { left, right in
+            if left.isHub != right.isHub {
+                return left.isHub && !right.isHub
+            }
+            return left.modifiedAt > right.modifiedAt
+        }
+        let decoder = JSONDecoder()
+        var seen = Set<Int>()
+        var endpoints: [DaemonEndpoint] = []
+        for candidate in candidates {
+            guard let data = try? Data(contentsOf: candidate.url),
+                  let record = try? decoder.decode(DaemonRecord.self, from: data),
+                  let port = record.httpPort,
+                  (1 ... 65_535).contains(port),
+                  let token = record.csrfToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !token.isEmpty
+            else {
+                continue
+            }
+            if let pid = record.pid, !Self.isProcessAlive(pid) {
+                continue
+            }
+            if seen.insert(port).inserted {
+                endpoints.append(DaemonEndpoint(port: port, token: token))
+            }
+        }
+        return endpoints
+    }
+
+    private static func isProcessAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
     }
 
     private static func logDirectory(environment: [String: String]) -> URL {

@@ -81,7 +81,7 @@ struct TokenBarSettingsView: View {
             Section("Desktop") {
                 Toggle("Show desktop card", isOn: self.$settings.showsDesktopCard)
 
-                Text("A card on the desktop, below your windows, lists unread and running Codex and Claude tasks and glows while anything is unread. Drag it to move it; right-click it to hide it.")
+                Text("A card on the desktop, below your windows, lists unread and running Codex, Claude, and Antigravity tasks and glows while anything is unread. Drag it to move it; right-click it to hide it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

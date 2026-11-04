@@ -1,11 +1,11 @@
 import Foundation
 
-/// A Codex or Claude desktop task whose turn is still running, or whose
-/// background tasks are.
+/// A Codex, Claude, or Antigravity desktop task whose turn is still running,
+/// or whose background tasks are.
 public struct DesktopRunningTask: Equatable, Identifiable, Sendable {
     public let platform: TokenPlatform
-    /// The Codex thread ID or Claude Desktop session ID that each app's deep
-    /// link opens.
+    /// The Codex thread ID, Claude Desktop session ID, or Antigravity
+    /// conversation ID.
     public let id: String
     public let title: String?
     public let startedAt: Date?
@@ -479,6 +479,106 @@ final class ClaudeActivityReader {
         }
         if let number = input["start"] as? Int, steps.indices.contains(number - 1) {
             steps[number - 1].status = "in_progress"
+        }
+    }
+}
+
+/// Follows what a running Antigravity turn is doing from its append-only
+/// `transcript.jsonl`: the latest tool call summary, or else the latest model
+/// progress note since the user prompt that opened the turn. Confined to the
+/// unread watcher's queue.
+final class AntigravityActivityReader {
+    private struct Progress {
+        var offset: UInt64
+        var activity: String?
+    }
+
+    private enum Entry {
+        case prompt
+        case step(String)
+    }
+
+    private static let markers = ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""].map { Data($0.utf8) }
+
+    private var progress: [String: Progress] = [:]
+
+    func activity(in url: URL, size: UInt64) -> String? {
+        if var known = self.progress[url.path], known.offset <= size {
+            if known.offset < size {
+                known = self.advance(known, in: url, to: size)
+                self.progress[url.path] = known
+            }
+            return known.activity
+        }
+        var entries: [Entry] = []
+        DesktopUnreadTurnReader.scanBackward(in: url, markers: Self.markers) { line in
+            guard let entry = Self.entry(line) else { return false }
+            entries.append(entry)
+            if case .prompt = entry {
+                return true
+            }
+            return false
+        }
+        var activity: String?
+        for entry in entries.reversed() {
+            switch entry {
+            case .prompt:
+                activity = nil
+            case let .step(text):
+                activity = text
+            }
+        }
+        self.progress[url.path] = Progress(offset: size, activity: activity)
+        return activity
+    }
+
+    func forget(except paths: Set<String>) {
+        self.progress = self.progress.filter { paths.contains($0.key) }
+    }
+
+    private func advance(_ known: Progress, in url: URL, to size: UInt64) -> Progress {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return known }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: known.offset)) != nil,
+              let appended = try? handle.read(upToCount: Int(size - known.offset)),
+              let lastNewline = appended.lastIndex(of: 0x0A)
+        else {
+            return known
+        }
+        var next = known
+        for line in appended[..<lastNewline].split(separator: 0x0A)
+            where Self.markers.contains(where: { line.range(of: $0) != nil })
+        {
+            switch Self.entry(Data(line)) {
+            case .prompt:
+                next.activity = nil
+            case let .step(text):
+                next.activity = text
+            case nil:
+                break
+            }
+        }
+        next.offset = known.offset + UInt64(appended.distance(from: appended.startIndex, to: lastNewline)) + 1
+        return next
+    }
+
+    private static func entry(_ line: Data) -> Entry? {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            return nil
+        }
+        switch object["type"] as? String {
+        case "USER_INPUT" where object["source"] as? String == "USER_EXPLICIT":
+            return DesktopUnreadTurnReader.antigravityHumanText(object["content"] as? String) == nil
+                ? nil
+                : .prompt
+        case "PLANNER_RESPONSE" where object["source"] as? String == "MODEL":
+            let calls = object["tool_calls"] as? [[String: Any]] ?? []
+            if let tool = calls.lazy.compactMap(DesktopUnreadTurnReader.antigravityToolActivity).last {
+                return .step(tool)
+            }
+            return DesktopUnreadTurnReader.replySummary(object["content"] as? String).map(Entry.step)
+        default:
+            return nil
         }
     }
 }

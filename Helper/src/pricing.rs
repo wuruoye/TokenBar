@@ -715,12 +715,15 @@ fn bundled_anthropic_rate(
 ) -> Option<AnthropicModelRate> {
     let (input, cache_write_5m, cache_write_1h, cache_read, output) =
         match normalized_model_id {
+        "claude-fable-5-1" | "claude-mythos-5-1" => (10.0, 12.5, 20.0, 0.25, 50.0),
         "claude-fable-5" | "claude-mythos-5" => (10.0, 12.5, 20.0, 1.0, 50.0),
+        "claude-opus-5-5" => (4.0, 5.0, 8.0, 0.2, 20.0),
         "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6"
         | "claude-opus-4-7" | "claude-opus-4-8" => (5.0, 6.25, 10.0, 0.5, 25.0),
         "claude-opus-4" | "claude-opus-4-1" | "claude-3-opus" => {
             (15.0, 18.75, 30.0, 1.5, 75.0)
         }
+        "claude-sonnet-5-5" => (2.0, 2.5, 4.0, 0.1, 10.0),
         "claude-sonnet-5"
             if effective_date <= NaiveDate::from_ymd_opt(2026, 8, 31).unwrap() =>
         {
@@ -730,6 +733,7 @@ fn bundled_anthropic_rate(
         | "claude-sonnet-4-6" | "claude-3-7-sonnet" | "claude-3-5-sonnet" => {
             (3.0, 3.75, 6.0, 0.3, 15.0)
         }
+        "claude-haiku-5-5" => (0.1, 0.125, 0.2, 0.01, 0.5),
         "claude-haiku-4-5" | "claude-haiku-4-6" => (1.0, 1.25, 2.0, 0.1, 5.0),
         "claude-3-5-haiku" => (0.8, 1.0, 1.6, 0.08, 4.0),
         "claude-3-haiku" => (0.25, 0.3, 0.5, 0.03, 1.25),
@@ -948,13 +952,31 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
             break;
         }
     }
+    if let Some((base, _)) = normalized
+        .strip_suffix(')')
+        .and_then(|value| value.rsplit_once('('))
+    {
+        normalized = base.trim().to_string();
+    }
     if let Some(index) = normalized.find("-20") {
         normalized.truncate(index);
     }
     if let Some(index) = normalized.find("-v1") {
         normalized.truncate(index);
     }
-    for suffix in ["-thinking", "-fast"] {
+    for suffix in [
+        "-thinking",
+        "-minimal",
+        "-medium",
+        "-xhigh",
+        "-high",
+        "-ultra",
+        "-max",
+        "-auto",
+        "-none",
+        "-low",
+        "-fast",
+    ] {
         if let Some(model) = normalized.strip_suffix(suffix) {
             normalized = model.to_string();
         }
@@ -965,6 +987,9 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
         ("claude-5-1-mythos", "claude-mythos-5-1"),
         ("claude-5-fable", "claude-fable-5"),
         ("claude-5-mythos", "claude-mythos-5"),
+        ("claude-5-5-opus", "claude-opus-5-5"),
+        ("claude-5-5-sonnet", "claude-sonnet-5-5"),
+        ("claude-5-5-haiku", "claude-haiku-5-5"),
         ("claude-5-opus", "claude-opus-5"),
         ("claude-5-sonnet", "claude-sonnet-5"),
         ("claude-4-8-opus", "claude-opus-4-8"),
@@ -979,6 +1004,9 @@ pub(crate) fn normalize_anthropic_model_id(model_id: &str) -> String {
         ("mythos-5-1", "claude-mythos-5-1"),
         ("fable-5", "claude-fable-5"),
         ("mythos-5", "claude-mythos-5"),
+        ("opus-5-5", "claude-opus-5-5"),
+        ("sonnet-5-5", "claude-sonnet-5-5"),
+        ("haiku-5-5", "claude-haiku-5-5"),
         ("opus-5", "claude-opus-5"),
         ("sonnet-5", "claude-sonnet-5"),
         ("opus-4-8", "claude-opus-4-8"),
@@ -1501,6 +1529,7 @@ fn bundled_google_row(
         long_context_min_prompt_tokens: GOOGLE_LONG_CONTEXT_THRESHOLD,
     };
     Some(match normalized_model_id {
+        "gemini-4-argon" => flat(2.0, 0.1, 10.0),
         "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.6-flash" if raised => {
             flat(1.5, 0.15, 7.5)
         }
@@ -1509,6 +1538,7 @@ fn bundled_google_row(
         "gemini-3.5-flash-lite" => flat(0.3, 0.03, 2.5),
         "gemini-3.1-flash-lite" => flat(0.25, 0.025, 1.5),
         "gemini-3.1-pro" => tiered((2.0, 0.2, 12.0), (4.0, 0.4, 18.0)),
+        "gemini-3-flash" => flat(0.5, 0.05, 3.0),
         "gemini-2.5-pro" => tiered((1.25, 0.125, 10.0), (2.5, 0.25, 15.0)),
         "gemini-2.5-flash" => flat(0.3, 0.03, 2.5),
         "gemini-2.5-flash-lite" => flat(0.1, 0.01, 0.4),
@@ -1524,15 +1554,39 @@ fn normalize_google_model_id(model_id: &str) -> String {
             break;
         }
     }
+    if let Some((base, _)) = normalized
+        .strip_suffix(')')
+        .and_then(|value| value.rsplit_once('('))
+    {
+        normalized = base.trim().to_string();
+    }
     if let Some(index) = normalized.find("-preview") {
         normalized.truncate(index);
     }
-    for suffix in ["-latest", "-thinking", "-exp"] {
+    for suffix in [
+        "-latest",
+        "-thinking",
+        "-exp",
+        "-minimal",
+        "-medium",
+        "-xhigh",
+        "-high",
+        "-ultra",
+        "-max",
+        "-auto",
+        "-none",
+        "-low",
+        "-fast",
+    ] {
         if let Some(model) = normalized.strip_suffix(suffix) {
             normalized = model.to_string();
         }
     }
-    normalized
+    match normalized.as_str() {
+        "gemini-4-argon-d" => "gemini-4-argon".to_string(),
+        "gemini-3.8-flash-n" => "gemini-3.8-flash".to_string(),
+        _ => normalized,
+    }
 }
 
 /// Reads the Gemini rows of OpenRouter's model catalog.

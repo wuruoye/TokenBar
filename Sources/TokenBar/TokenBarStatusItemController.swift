@@ -308,6 +308,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             : nil
         let codexUnread = self.unreadTasks.count(for: .codex)
         let claudeUnread = self.unreadTasks.count(for: .claude)
+        let antigravityUnread = self.unreadTasks.count(for: .antigravity)
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
@@ -318,7 +319,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             grokToday: grok?.today,
             grokWeekly: grok?.weekly,
             antigravityToday: antigravity?.today,
-            antigravityWeekly: antigravity?.weekly)
+            antigravityWeekly: antigravity?.weekly,
+            antigravityUnreadCount: antigravityUnread)
         self.statusLabelLayout = layout
         button.image = layout.image
 
@@ -343,10 +345,11 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 "Grok Build. Today, \(grok.today) tokens. Weekly quota, \(grok.weekly) remaining.")
         }
         if let antigravity {
+            let antigravityUnreadText = Self.unreadStatusText(antigravityUnread)
             toolTips.append(
-                "Antigravity · Today: \(antigravity.today) tokens · Weekly: \(antigravity.weekly) left")
+                "Antigravity · Today: \(antigravity.today) tokens · Weekly: \(antigravity.weekly) left\(antigravityUnreadText.toolTip)")
             accessibilityLabels.append(
-                "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.")
+                "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.\(antigravityUnreadText.accessibility)")
         }
         button.toolTip = toolTips.joined(separator: "\n")
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
@@ -987,6 +990,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func configureSessionItem(_ item: NSMenuItem, session: SessionSummary) {
         let title = session.menuDisplayTitle
+        let model = session.menuModelText
         let detail = session.menuDetail
         let time = Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).menuClockText
         let isRemote = session.isSynchronizedRemote
@@ -997,13 +1001,15 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         row.configure(
             title: title,
             cost: session.menuCostText,
+            model: model,
             detail: detail,
             trailing: time,
             showsChevron: true,
             badge: session.menuServiceTierBadge)
+        let summaryLines = [title, model, detail].compactMap { $0 }.joined(separator: "\n")
         row.toolTip = isRemote
-            ? "\(title)\n\(detail)\nEnded \(time)\nSynced session (read-only) · Hover to inspect turns"
-            : "\(title)\n\(detail)\nEnded \(time)\nClick to open in "
+            ? "\(summaryLines)\nEnded \(time)\nSynced session (read-only) · Hover to inspect turns"
+            : "\(summaryLines)\nEnded \(time)\nClick to open in "
                 + "\(session.platformID.displayName) · Hover to inspect turns"
         row.onActivate = isRemote ? nil : { [weak self, weak item] in
             guard let self else { return }
@@ -1417,6 +1423,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         row.configure(
             title: turn.menuRowTitle,
             cost: turn.menuCostText,
+            model: turn.menuModelText,
             detail: turn.menuDetail,
             trailing: "\(turn.startedAt.menuClockText) · \(turn.menuDurationText)",
             showsChevron: physicalRequests.count > 1
@@ -1462,6 +1469,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             row.configure(
                 title: request.agentRequestMenuTitle,
                 cost: request.menuCostText,
+                model: request.menuModelText,
                 detail: request.menuDetail,
                 trailing: "\(request.startedAt.menuClockText) · \(request.menuDurationText)",
                 showsChevron: self.settings.showsFullRequestContentOnHover
@@ -1631,13 +1639,16 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     private func openSessionInApp(_ session: SessionSummary) {
         do {
             try self.sessionLauncher.open(session)
+            if session.platformID == .antigravity || session.platformID == .codex {
+                self.unreadTasks.markOpened(platform: session.platformID, id: session.id)
+            }
         } catch {
             self.showOpenSessionError(error)
         }
     }
 
-    /// Opens a task clicked in the widget the way the Codex or Claude task
-    /// notification opens it.
+    /// Opens a task clicked in the desktop card in Codex, Claude, or
+    /// Antigravity.
     func openUnreadTask(platform: TokenPlatform, id: String) {
         do {
             try self.sessionLauncher.openUnreadTask(platform: platform, id: id)
@@ -1791,7 +1802,8 @@ enum StatusLabelRenderer {
         grokToday: String? = nil,
         grokWeekly: String? = nil,
         antigravityToday: String? = nil,
-        antigravityWeekly: String? = nil) -> StatusLabelLayout
+        antigravityWeekly: String? = nil,
+        antigravityUnreadCount: Int = 0) -> StatusLabelLayout
     {
         var values: [(scope: DashboardScope, today: String, weekly: String, unreadCount: Int)] = [
             (.codex, codexToday, codexWeekly, codexUnreadCount),
@@ -1803,7 +1815,7 @@ enum StatusLabelRenderer {
             values.append((.grok, grokToday, grokWeekly, 0))
         }
         if let antigravityToday, let antigravityWeekly {
-            values.append((.antigravity, antigravityToday, antigravityWeekly, 0))
+            values.append((.antigravity, antigravityToday, antigravityWeekly, antigravityUnreadCount))
         }
         let images = values.map { value in
             self.image(

@@ -7,7 +7,8 @@ protocol TokenMenuHighlighting: AnyObject {
 
 @MainActor
 final class TokenMenuRowView: NSView, TokenMenuHighlighting {
-    static let rowHeight: CGFloat = 42
+    static let rowHeight: CGFloat = 56
+    private static let compactRowHeight: CGFloat = 42
 
     var onActivate: (() -> Void)?
 
@@ -15,12 +16,14 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
     private let titleField = NSTextField(labelWithString: "")
     private let badgeField = NSTextField(labelWithString: "")
     private let costField = NSTextField(labelWithString: "")
+    private let modelField = NSTextField(labelWithString: "")
     private let detailField = NSTextField(labelWithString: "")
     private let trailingField = NSTextField(labelWithString: "")
     private let chevronView = NSImageView()
     private var showsChevron = false
     private var isMenuHighlighted = false
     private var isPressed = false
+    private var currentRowHeight: CGFloat = TokenMenuRowView.rowHeight
 
     init(width: CGFloat) {
         self.fixedWidth = width
@@ -49,6 +52,10 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.costField.lineBreakMode = .byClipping
         self.costField.cell?.truncatesLastVisibleLine = false
         self.configureLabel(
+            self.modelField,
+            font: .systemFont(ofSize: 10.5, weight: .regular))
+        self.modelField.isHidden = true
+        self.configureLabel(
             self.detailField,
             font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular))
         self.configureLabel(
@@ -65,6 +72,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.addSubview(self.titleField)
         self.addSubview(self.badgeField)
         self.addSubview(self.costField)
+        self.addSubview(self.modelField)
         self.addSubview(self.detailField)
         self.addSubview(self.trailingField)
         self.addSubview(self.chevronView)
@@ -81,7 +89,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
     override var allowsVibrancy: Bool { true }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: self.fixedWidth, height: Self.rowHeight)
+        NSSize(width: self.fixedWidth, height: self.currentRowHeight)
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -111,11 +119,13 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         let chevronX = self.bounds.width - trailing - chevronWidth
         self.chevronView.frame = NSRect(
             x: chevronX,
-            y: 15,
+            y: round((self.bounds.height - 12) / 2),
             width: chevronWidth,
             height: 12)
 
         let availableRight = self.bounds.width - trailing - chevronWidth - chevronGap
+        let hasModel = !self.modelField.isHidden && !self.modelField.stringValue.isEmpty
+        let titleY: CGFloat = hasModel ? 35 : 21
 
         // Top line: title and badge, with the cost at the right edge.
         let hasCost = !self.costField.stringValue.isEmpty
@@ -124,7 +134,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             : 0
         self.costField.frame = NSRect(
             x: availableRight - costWidth,
-            y: 21,
+            y: titleY,
             width: costWidth,
             height: 17)
         let titleRight = hasCost ? availableRight - costWidth - 8 : availableRight
@@ -132,7 +142,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         if self.badgeField.isHidden {
             self.titleField.frame = NSRect(
                 x: leading,
-                y: 21,
+                y: titleY,
                 width: titleAreaWidth,
                 height: 17)
             self.badgeField.frame = .zero
@@ -143,14 +153,25 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             let titleWidth = min(maxTitleWidth, self.measuredWidth(self.titleField) + 6)
             self.titleField.frame = NSRect(
                 x: leading,
-                y: 21,
+                y: titleY,
                 width: titleWidth,
                 height: 17)
             self.badgeField.frame = NSRect(
                 x: leading + titleWidth + badgeGap,
-                y: 23,
+                y: titleY + 2,
                 width: badgeWidth,
                 height: 13)
+        }
+
+        // Middle line: model name and reasoning effort.
+        if hasModel {
+            self.modelField.frame = NSRect(
+                x: leading,
+                y: 19,
+                width: max(0, availableRight - leading),
+                height: 15)
+        } else {
+            self.modelField.frame = .zero
         }
 
         // Bottom line: details, with the time at the right edge.
@@ -213,6 +234,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
     func configure(
         title: String,
         cost: String?,
+        model: String? = nil,
         detail: String,
         trailing: String,
         showsChevron: Bool,
@@ -223,12 +245,23 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
         self.badgeField.isHidden = badge == nil
         self.costField.stringValue = cost ?? ""
         self.costField.isHidden = cost == nil
+        let normalizedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasModel = normalizedModel.map { !$0.isEmpty } ?? false
+        self.modelField.stringValue = hasModel ? (normalizedModel ?? "") : ""
+        self.modelField.isHidden = !hasModel
+        self.currentRowHeight = hasModel ? Self.rowHeight : Self.compactRowHeight
+        if self.frame.height != self.currentRowHeight {
+            self.frame.size.height = self.currentRowHeight
+            self.invalidateIntrinsicContentSize()
+        }
         self.detailField.stringValue = detail
         self.trailingField.stringValue = trailing
         self.showsChevron = showsChevron
         self.chevronView.isHidden = !showsChevron
         self.setAccessibilityLabel([title, badge].compactMap { $0 }.joined(separator: ", "))
-        let accessibleDetail = [cost, detail, trailing].compactMap { $0 }.joined(separator: ". ")
+        let accessibleDetail = [cost, hasModel ? normalizedModel : nil, detail, trailing]
+            .compactMap { $0 }
+            .joined(separator: ". ")
         self.setAccessibilityHelp(accessibleDetail)
         self.needsLayout = true
     }
@@ -261,6 +294,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             self.badgeField.backgroundColor = .selectedMenuItemTextColor.withAlphaComponent(0.16)
             self.badgeField.layer?.borderColor = NSColor.selectedMenuItemTextColor.withAlphaComponent(0.28).cgColor
             self.costField.textColor = .selectedMenuItemTextColor
+            self.modelField.textColor = .selectedMenuItemTextColor.withAlphaComponent(0.78)
             self.detailField.textColor = .selectedMenuItemTextColor.withAlphaComponent(0.78)
             self.trailingField.textColor = .selectedMenuItemTextColor.withAlphaComponent(0.78)
             self.chevronView.contentTintColor = .selectedMenuItemTextColor
@@ -271,6 +305,7 @@ final class TokenMenuRowView: NSView, TokenMenuHighlighting {
             self.badgeField.backgroundColor = badgeAccent.withAlphaComponent(0.13)
             self.badgeField.layer?.borderColor = badgeAccent.withAlphaComponent(0.26).cgColor
             self.costField.textColor = .labelColor
+            self.modelField.textColor = .secondaryLabelColor
             self.detailField.textColor = .secondaryLabelColor
             self.trailingField.textColor = .secondaryLabelColor
             self.chevronView.contentTintColor = .tertiaryLabelColor

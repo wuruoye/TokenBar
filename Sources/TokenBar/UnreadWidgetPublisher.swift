@@ -7,9 +7,9 @@ import TokenBarCore
 @MainActor
 @Observable
 final class UnreadWidgetPublisher {
-    /// Codex and Claude publish separately when a task finishes or is read, so a
-    /// short delay lets one update cover both.
-    private static let coalescingDelay: Duration = .milliseconds(400)
+    /// Providers publish separately when a task finishes or is read, so a
+    /// short delay lets one update cover them together.
+    private static let coalescingDelay: Duration = .milliseconds(150)
     static let recentLimit = 2
     /// Read tasks kept beyond the ones shown, so one that runs again comes back
     /// once it is done.
@@ -19,6 +19,8 @@ final class UnreadWidgetPublisher {
     /// unread, while the unread mark of one that ends elsewhere can trail the
     /// end of the turn by a moment.
     private static let finishGrace: Duration = .seconds(3)
+    private static let activityRefreshDelay: Duration = .seconds(1)
+    private static let minimumActivityRefreshSpacing: Duration = .seconds(4)
 
     private(set) var snapshot = UnreadWidgetSnapshot(platforms: [], tasks: [], running: [])
 
@@ -31,6 +33,10 @@ final class UnreadWidgetPublisher {
     /// Tasks whose turn ended without becoming unread yet.
     @ObservationIgnored private var finishedTurns: [String: (item: UnreadWidgetSnapshot.Item, at: ContinuousClock.Instant)] = [:]
     @ObservationIgnored private var pendingSettle: Task<Void, Never>?
+    @ObservationIgnored private var pendingActivityRefreshPlatforms: Set<TokenPlatform> = []
+    @ObservationIgnored private var pendingActivityRefresh: Task<Void, Never>?
+    @ObservationIgnored private var lastActivityRefreshAt: ContinuousClock.Instant?
+    @ObservationIgnored private var hasPublishedInitialSnapshot = false
     @ObservationIgnored private var isStarted = false
 
     init(unreadTasks: DesktopUnreadTaskMonitor, model: DashboardModel, settings: TokenBarSettings) {
@@ -51,10 +57,14 @@ final class UnreadWidgetPublisher {
     func stop() {
         guard self.isStarted else { return }
         self.isStarted = false
+        self.hasPublishedInitialSnapshot = false
         self.pendingPublish?.cancel()
         self.pendingPublish = nil
         self.pendingSettle?.cancel()
         self.pendingSettle = nil
+        self.pendingActivityRefresh?.cancel()
+        self.pendingActivityRefresh = nil
+        self.pendingActivityRefreshPlatforms.removeAll()
     }
 
     private func observe() {
@@ -64,6 +74,7 @@ final class UnreadWidgetPublisher {
             _ = self.model.activity
             _ = self.model.weeklyQuotaUsageHistories
             _ = self.settings.showsClaude
+            _ = self.settings.showsAntigravity
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isStarted else { return }
@@ -79,8 +90,53 @@ final class UnreadWidgetPublisher {
             try? await Task.sleep(for: Self.coalescingDelay)
             guard let self, !Task.isCancelled, self.isStarted else { return }
             self.pendingPublish = nil
+            let previous = self.snapshot
             let next = Self.snapshot(of: self.unreadTasks, model: self.model, settings: self.settings)
-            self.snapshot = self.recordingReads(from: self.snapshot, in: next)
+            self.snapshot = self.recordingReads(from: previous, in: next)
+            if self.hasPublishedInitialSnapshot {
+                let nextRunningIDs = Set(next.running.map(\.id))
+                let previousTaskIDs = Set(previous.tasks.map(\.id))
+                let finishedPlatforms = previous.running
+                    .filter { !nextRunningIDs.contains($0.id) }
+                    .compactMap { TokenPlatform(rawValue: $0.platform) }
+                let newUnreadPlatforms = next.tasks
+                    .filter { !previousTaskIDs.contains($0.id) }
+                    .compactMap { TokenPlatform(rawValue: $0.platform) }
+                let refreshPlatforms = Set(finishedPlatforms).union(newUnreadPlatforms)
+                if !refreshPlatforms.isEmpty {
+                    self.scheduleActivityRefresh(platforms: refreshPlatforms)
+                }
+            } else {
+                self.hasPublishedInitialSnapshot = true
+            }
+        }
+    }
+
+    private func scheduleActivityRefresh(platforms: Set<TokenPlatform>) {
+        self.pendingActivityRefreshPlatforms.formUnion(platforms)
+        guard self.pendingActivityRefresh == nil else { return }
+        let now = ContinuousClock.now
+        var delay = Self.activityRefreshDelay
+        if let last = self.lastActivityRefreshAt {
+            let elapsed = now - last
+            if elapsed < Self.minimumActivityRefreshSpacing {
+                let remaining = Self.minimumActivityRefreshSpacing - elapsed
+                if remaining > delay {
+                    delay = remaining
+                }
+            }
+        }
+        self.pendingActivityRefresh = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled, self.isStarted else { return }
+            let platforms = self.pendingActivityRefreshPlatforms
+            self.pendingActivityRefreshPlatforms.removeAll()
+            self.pendingActivityRefresh = nil
+            self.lastActivityRefreshAt = ContinuousClock.now
+            await self.model.refreshActivity()
+            if platforms.contains(.antigravity), self.settings.showsAntigravity {
+                await self.model.refreshQuota(for: .antigravity)
+            }
         }
     }
 
@@ -148,16 +204,22 @@ final class UnreadWidgetPublisher {
         }
     }
 
-    /// Matches the menu bar, which hides Claude's unread count with its section.
-    /// A task that started another turn is listed as running, not unread, while
-    /// one whose turn ended with tasks left in the background is listed under
-    /// those once it is read.
+    /// Matches the menu bar, which hides each optional provider's unread count
+    /// with its section. A task that started another turn is listed as running,
+    /// while one whose turn ended with tasks left in the background is listed
+    /// under those once it is read.
     static func snapshot(
         of unreadTasks: DesktopUnreadTaskMonitor,
         model: DashboardModel,
         settings: TokenBarSettings) -> UnreadWidgetSnapshot
     {
-        let platforms: [TokenPlatform] = settings.showsClaude ? [.codex, .claude] : [.codex]
+        var platforms: [TokenPlatform] = [.codex]
+        if settings.showsClaude {
+            platforms.append(.claude)
+        }
+        if settings.showsAntigravity {
+            platforms.append(.antigravity)
+        }
         let unread = platforms.flatMap { unreadTasks.tasks[$0] ?? [] }
         let unreadIDs = Set(unread.map { "\($0.platform.rawValue)/\($0.id)" })
         let active = platforms

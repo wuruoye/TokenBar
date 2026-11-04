@@ -75,6 +75,10 @@ public extension RequestSummary {
             .joined(separator: " · ")
     }
 
+    var menuModelText: String? {
+        formattedModelEffortText(requests: self.physicalRequests)
+    }
+
     var menuServiceTier: ActivityServiceTier {
         let physicalTier = ActivityServiceTier.combining(
             self.physicalRequests.map { $0.serviceTier ?? .unknown })
@@ -166,6 +170,12 @@ public extension SessionSummary {
             .joined(separator: " · ")
     }
 
+    var menuModelText: String? {
+        formattedModelEffortText(
+            requests: self.requests.flatMap(\.physicalRequests),
+            fallbackModels: self.models)
+    }
+
     var menuServiceTier: ActivityServiceTier {
         ActivityServiceTier.combining(self.requests.map(\.menuServiceTier))
     }
@@ -238,6 +248,75 @@ public extension DailySummary {
     var menuPerformanceText: String? {
         joinedPerformanceText([self.menuAverageTTFTText, self.menuAverageTPSText])
     }
+}
+
+private let reasoningEffortOrder: [String] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto",
+]
+
+private func formattedModelEffortText(
+    requests: [RequestSummary],
+    fallbackModels: [String] = []) -> String?
+{
+    var orderedModels: [String] = []
+    var effortsByModel: [String: Set<String>] = [:]
+    var tokensByModel: [String: Int64] = [:]
+
+    for request in requests {
+        guard let rawModel = request.model.compactMenuText,
+              rawModel.lowercased() != "unknown"
+        else {
+            continue
+        }
+        if effortsByModel[rawModel] == nil {
+            orderedModels.append(rawModel)
+            effortsByModel[rawModel] = []
+        }
+        tokensByModel[rawModel, default: 0] += request.tokens.total
+        if let effort = request.reasoningEffort?.compactMenuText?.lowercased(),
+           !effort.isEmpty
+        {
+            effortsByModel[rawModel, default: []].insert(effort)
+        }
+    }
+
+    for fallback in fallbackModels {
+        guard let rawModel = fallback.compactMenuText,
+              rawModel.lowercased() != "unknown",
+              effortsByModel[rawModel] == nil
+        else {
+            continue
+        }
+        orderedModels.append(rawModel)
+        effortsByModel[rawModel] = []
+    }
+
+    guard !orderedModels.isEmpty else { return nil }
+
+    let sortedModels = orderedModels.enumerated().sorted { left, right in
+        let leftTokens = tokensByModel[left.element] ?? 0
+        let rightTokens = tokensByModel[right.element] ?? 0
+        if leftTokens != rightTokens {
+            return leftTokens > rightTokens
+        }
+        return left.offset < right.offset
+    }.map(\.element)
+
+    let useParentheses = sortedModels.count > 1
+    let parts = sortedModels.map { model -> String in
+        let efforts = (effortsByModel[model] ?? []).sorted { left, right in
+            let leftIndex = reasoningEffortOrder.firstIndex(of: left) ?? Int.max
+            let rightIndex = reasoningEffortOrder.firstIndex(of: right) ?? Int.max
+            if leftIndex != rightIndex {
+                return leftIndex < rightIndex
+            }
+            return left < right
+        }
+        guard !efforts.isEmpty else { return model }
+        let effortText = efforts.joined(separator: "/")
+        return useParentheses ? "\(model) (\(effortText))" : "\(model) · \(effortText)"
+    }
+    return parts.joined(separator: " · ")
 }
 
 private func averageTimeToFirstToken(for requests: [RequestSummary]) -> Double? {

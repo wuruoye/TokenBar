@@ -406,8 +406,26 @@ pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
 }
 
 pub fn reasoning_effort_from_model(model_id: &str) -> Option<String> {
-    let (model, effort) = model_id.trim().strip_suffix(')')?.rsplit_once('(')?;
-    (!model.is_empty()).then(|| normalize_reasoning_effort(effort)).flatten()
+    let trimmed = model_id.trim();
+    if let Some((model, effort)) = trimmed.strip_suffix(')').and_then(|value| value.rsplit_once('('))
+    {
+        if !model.is_empty() {
+            if let Some(normalized) = normalize_reasoning_effort(effort) {
+                return Some(normalized);
+            }
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for suffix in [
+        "-minimal", "-medium", "-xhigh", "-high", "-ultra", "-max", "-auto", "-none", "-low",
+    ] {
+        if let Some(base) = lower.strip_suffix(suffix) {
+            if !base.is_empty() {
+                return normalize_reasoning_effort(suffix.trim_start_matches('-'));
+            }
+        }
+    }
+    None
 }
 
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
@@ -423,12 +441,19 @@ pub fn normalize_model_for_grouping(model_id: &str) -> String {
     }
 
     for suffix in [
-        "-minimal", "-medium", "-xhigh", "-high", "-auto", "-none", "-low", "-fast",
+        "-minimal", "-medium", "-xhigh", "-high", "-ultra", "-max", "-auto", "-none", "-low",
+        "-fast",
     ] {
         if name.ends_with(suffix) {
             name.truncate(name.len() - suffix.len());
             break;
         }
+    }
+
+    match name.as_str() {
+        "gemini-4-argon-d" => name = "gemini-4-argon".to_string(),
+        "gemini-3.8-flash-n" => name = "gemini-3.8-flash".to_string(),
+        _ => {}
     }
 
     if let Some(base) = strip_date_snapshot(&name) {

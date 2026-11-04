@@ -760,6 +760,7 @@ enum DemoPreviewRenderer {
         sessionRow.configure(
             title: session.menuDisplayTitle,
             cost: session.menuCostText,
+            model: session.menuModelText,
             detail: session.menuDetail,
             trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
             showsChevron: true,
@@ -769,6 +770,7 @@ enum DemoPreviewRenderer {
         requestRow.configure(
             title: request.menuRowTitle,
             cost: request.menuCostText,
+            model: request.menuModelText,
             detail: request.menuDetail,
             trailing: "\(request.startedAt.demoClockText) · \(request.menuDurationText)",
             showsChevron: true,
@@ -780,6 +782,7 @@ enum DemoPreviewRenderer {
             row.configure(
                 title: physicalRequest.agentRequestMenuTitle,
                 cost: physicalRequest.menuCostText,
+                model: physicalRequest.menuModelText,
                 detail: physicalRequest.menuDetail,
                 trailing: "\(physicalRequest.startedAt.demoClockText) · \(physicalRequest.menuDurationText)",
                 showsChevron: true,
@@ -898,6 +901,7 @@ enum DemoPreviewRenderer {
             row.configure(
                 title: session.menuDisplayTitle,
                 cost: session.menuCostText,
+                model: session.menuModelText,
                 detail: session.menuDetail,
                 trailing: Date(timeIntervalSince1970: Double(session.endedAtMs) / 1000).demoClockText,
                 showsChevron: true,
@@ -1063,13 +1067,18 @@ enum DemoPreviewRenderer {
                 .init(
                     id: "codex",
                     name: "Codex",
-                    unreadCount: 2,
+                    unreadCount: 1,
                     today: .init(tokens: 359_000_000, costUsd: 182.4, weeklyQuotaUsedToday: 6.2, tokensPerSecond: 52)),
                 .init(
                     id: "claude",
                     name: "Claude",
                     unreadCount: 1,
                     today: .init(tokens: 141_000_000, costUsd: 96.1, weeklyQuotaUsedToday: 11, tokensPerSecond: 71)),
+                .init(
+                    id: "antigravity",
+                    name: "Antigravity",
+                    unreadCount: 1,
+                    today: .init(tokens: 84_000_000, costUsd: 38.6, weeklyQuotaUsedToday: 4.5, tokensPerSecond: 64)),
             ],
             tasks: [
                 .init(
@@ -1082,6 +1091,15 @@ enum DemoPreviewRenderer {
                     workspaceName: "TokenBar",
                     updatedAt: now.addingTimeInterval(-300)),
                 .init(
+                    platform: "antigravity",
+                    taskID: "demo-antigravity",
+                    title: "Wire Antigravity quota daemon",
+                    prompt: "Read the daemon port and token when main.log omits them.",
+                    reply: "Quota refreshes now read active daemon records first and fall back to the local logs.",
+                    turnDuration: 94,
+                    workspaceName: "TokenBar",
+                    updatedAt: now.addingTimeInterval(-900)),
+                .init(
                     platform: "codex",
                     taskID: "demo-codex-1",
                     title: "Fix weekly pace rounding",
@@ -1090,15 +1108,6 @@ enum DemoPreviewRenderer {
                     turnDuration: 48,
                     workspaceName: "TokenBar",
                     updatedAt: now.addingTimeInterval(-1_800)),
-                .init(
-                    platform: "codex",
-                    taskID: "demo-codex-2",
-                    title: "Review sync server logs",
-                    prompt: "Check why the Linux client stopped uploading yesterday.",
-                    reply: "Its token expired at 18:02; uploads resume after you sign in again.",
-                    turnDuration: 4_380,
-                    workspaceName: "Sync",
-                    updatedAt: now.addingTimeInterval(-7_200)),
             ],
             running: [
                 .init(
@@ -1108,11 +1117,11 @@ enum DemoPreviewRenderer {
                     startedAt: now.addingTimeInterval(-95),
                     activity: "Sampling the helper while it scans a week of logs"),
                 .init(
-                    platform: "claude",
-                    taskID: "demo-claude-running",
-                    title: "Migrate the daily loads",
-                    startedAt: now.addingTimeInterval(-640),
-                    activity: "Run the backfill for October"),
+                    platform: "antigravity",
+                    taskID: "demo-antigravity-running",
+                    title: "Verify subagent attribution",
+                    startedAt: now.addingTimeInterval(-320),
+                    activity: "Run cargo check on Helper"),
             ],
             background: [
                 .init(

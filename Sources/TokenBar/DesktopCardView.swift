@@ -586,14 +586,15 @@ private struct CardHeader: View {
                 self.usage(figures: 3)
                 self.usage(figures: 2)
                 self.usage(figures: 1)
+                self.usage(figures: 1, spacing: 6)
             }
         }
     }
 
     /// Every piece of text shares one size and baseline; each icon sits on
     /// the same line, centered on the digits.
-    private func usage(figures: Int) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+    private func usage(figures: Int, spacing: CGFloat = 10) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: spacing) {
             ForEach(self.snapshot.platforms) { platform in
                 if let today = platform.today {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
@@ -1195,9 +1196,14 @@ private enum CardAccent {
     static let unread = Color(red: 1.0, green: 0.30, blue: 0.24)
 
     static func tint(for platform: String) -> Color {
-        platform == TokenPlatform.claude.rawValue
-            ? Color(red: 0.85, green: 0.47, blue: 0.34)
-            : .primary
+        switch platform {
+        case TokenPlatform.claude.rawValue:
+            Color(red: 0.85, green: 0.47, blue: 0.34)
+        case TokenPlatform.antigravity.rawValue:
+            Color(red: 0.26, green: 0.52, blue: 0.96)
+        default:
+            .primary
+        }
     }
 
     /// Work left in the background turns a muted ring.

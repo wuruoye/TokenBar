@@ -11,6 +11,7 @@ mod proto;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::NaiveDate;
 use rayon::prelude::*;
@@ -18,8 +19,9 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::pricing::{AnthropicPricing, GooglePricing};
 use crate::usage::{
-    content_preview_from_str, normalize_workspace_key, workspace_label_from_key, CostSource,
-    TokenBreakdown, UnifiedMessage,
+    content_preview_from_str, normalize_model_for_grouping, normalize_workspace_key,
+    reasoning_effort_from_model, workspace_label_from_key, CostSource, TokenBreakdown,
+    UnifiedMessage,
 };
 use crate::{RequestDetail, SessionTitleMap};
 
@@ -60,8 +62,19 @@ pub struct LocalParseOptions {
 #[derive(Debug, Clone, Default)]
 struct ConversationMetadata {
     conversation_id: String,
+    root_conversation_id: String,
+    is_subagent: bool,
+    agent_name: Option<String>,
     workspace_key: Option<String>,
     workspace_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SummaryRecord {
+    title: Option<String>,
+    parent_conversation_id: Option<String>,
+    agent_name: Option<String>,
+    workspace_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,10 +96,13 @@ pub fn parse_local_antigravity_messages(
     anthropic_pricing: &AnthropicPricing,
     google_pricing: &GooglePricing,
 ) -> Result<Vec<UnifiedMessage>, String> {
+    let summaries = antigravity_home(&options)
+        .map(|root| load_summary_records(&root))
+        .unwrap_or_default();
     let paths = discover_conversation_files(&options)?;
     let parsed = paths
         .par_iter()
-        .map(|path| parse_conversation_file(path))
+        .map(|path| parse_conversation_file(path, &summaries))
         .collect::<Vec<_>>();
 
     let mut messages = Vec::new();
@@ -127,33 +143,39 @@ pub fn parse_local_antigravity_messages(
     Ok(messages)
 }
 
-/// Reads the conversation titles Antigravity keeps in its summary index.
+/// Reads the conversation titles Antigravity keeps in its summary index and
+/// per-conversation annotation files.
 pub fn load_antigravity_session_titles(options: &LocalParseOptions) -> SessionTitleMap {
     let mut titles = SessionTitleMap::new();
     let Some(root) = antigravity_home(options) else {
         return titles;
     };
-    let Ok(blob) = fs::read(root.join("agyhub_summaries_proto.pb")) else {
-        return titles;
-    };
-    for (number, value) in proto::fields(&blob) {
-        if number != 1 {
-            continue;
+    if let Ok(blob) = fs::read(root.join("agyhub_summaries_proto.pb")) {
+        for (number, value) in proto::fields(&blob) {
+            if number != 1 {
+                continue;
+            }
+            let Some(entry) = value.as_bytes() else {
+                continue;
+            };
+            let Some(conversation_id) = proto::string(entry, &[1]) else {
+                continue;
+            };
+            let Some(title) = proto::string(entry, &[2, 1]).and_then(nonempty_trimmed) else {
+                continue;
+            };
+            titles.insert(
+                ("antigravity".to_string(), conversation_id.to_string()),
+                title,
+            );
         }
-        let Some(entry) = value.as_bytes() else {
-            continue;
-        };
-        let Some(conversation_id) = proto::string(entry, &[1]) else {
-            continue;
-        };
-        let Some(title) = proto::string(entry, &[2, 1]) else {
-            continue;
-        };
-        titles.insert(
-            ("antigravity".to_string(), conversation_id.to_string()),
-            title.trim().to_string(),
-        );
     }
+    for (conversation_id, record) in load_summary_records(&root) {
+        if let Some(title) = record.title {
+            titles.insert(("antigravity".to_string(), conversation_id), title);
+        }
+    }
+    load_annotation_titles(&root, &mut titles);
     titles
 }
 
@@ -165,7 +187,7 @@ pub fn extract_request_detail(
     if start_ms > end_ms {
         return Err("request start must not be after request end".to_string());
     }
-    let connection = open_readonly(session_path)?;
+    let connection = open_readonly_or_sandbox_immutable(session_path)?;
     let steps = read_steps(&connection)?;
 
     let mut prompt: Option<String> = None;
@@ -277,27 +299,321 @@ fn append_extension(path: &Path, suffix: &str) -> PathBuf {
 
 /// Opens the conversation read-only so a running Antigravity keeps ownership of
 /// the database.
-fn open_readonly(path: &Path) -> Result<Connection, String> {
-    Connection::open_with_flags(
+fn open_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = connection.busy_timeout(Duration::from_millis(1000));
+    Ok(connection)
+}
+
+fn is_shm_access_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly)
+    )
+}
+
+fn open_readonly_or_sandbox_immutable(path: &Path) -> Result<Connection, String> {
+    match open_readonly(path) {
+        Ok(connection) => Ok(connection),
+        Err(error) if is_shm_access_error(&error) => open_immutable(path),
+        Err(error) => Err(format!(
+            "could not open Antigravity conversation {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn open_immutable(path: &Path) -> Result<Connection, String> {
+    let encoded = path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23");
+    let uri = format!("file:{encoded}?immutable=1");
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| {
         format!(
-            "could not open Antigravity conversation {}: {error}",
+            "could not open Antigravity database immutable {}: {error}",
             path.display()
         )
     })
 }
 
-fn parse_conversation_file(path: &Path) -> Vec<UnifiedMessage> {
-    let Ok(connection) = open_readonly(path) else {
-        return Vec::new();
+fn table_columns(connection: &Connection, table: &str) -> HashSet<String> {
+    connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .ok()
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .ok()
+                .map(|rows| rows.filter_map(Result::ok).collect::<HashSet<_>>())
+        })
+        .unwrap_or_default()
+}
+
+fn load_summary_records(root: &Path) -> HashMap<String, SummaryRecord> {
+    let mut records = HashMap::new();
+    let db_path = root.join("conversation_summaries.db");
+    if !db_path.is_file() {
+        return records;
+    }
+    let mut connection = match open_readonly_or_sandbox_immutable(&db_path) {
+        Ok(connection) => connection,
+        Err(_) => return records,
     };
-    let metadata = read_conversation_metadata(&connection, path);
-    let Ok(steps) = read_steps(&connection) else {
-        return Vec::new();
+    let mut columns = table_columns(&connection, "conversation_summaries");
+    if columns.is_empty() {
+        let probe_err = connection
+            .prepare("SELECT 1 FROM sqlite_master LIMIT 1")
+            .err();
+        if probe_err.as_ref().is_some_and(is_shm_access_error) {
+            if let Ok(fallback) = open_immutable(&db_path) {
+                columns = table_columns(&fallback, "conversation_summaries");
+                connection = fallback;
+            }
+        }
+    }
+    if !columns.contains("conversation_id") {
+        return records;
+    }
+
+    let select_col = |name: &str| {
+        if columns.contains(name) {
+            name.to_string()
+        } else {
+            format!("NULL AS {name}")
+        }
     };
+    let query = format!(
+        "SELECT conversation_id, {}, {}, {}, {} FROM conversation_summaries",
+        select_col("title"),
+        select_col("parent_conversation_id"),
+        select_col("agent_name"),
+        select_col("workspace_uris"),
+    );
+    let Ok(mut statement) = connection.prepare(&query) else {
+        return records;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    }) else {
+        return records;
+    };
+
+    for row in rows.filter_map(Result::ok) {
+        let (id, title, parent_id, agent_name, workspace_uris) = row;
+        let Some(id) = id.as_deref().and_then(nonempty_trimmed) else {
+            continue;
+        };
+        let workspace_key = workspace_uris
+            .as_deref()
+            .and_then(first_workspace_key_from_uris);
+        records.insert(
+            id,
+            SummaryRecord {
+                title: title.as_deref().and_then(nonempty_trimmed),
+                parent_conversation_id: parent_id.as_deref().and_then(nonempty_trimmed),
+                agent_name: agent_name.as_deref().and_then(nonempty_trimmed),
+                workspace_key,
+            },
+        );
+    }
+    records
+}
+
+fn first_workspace_key_from_uris(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(uris) = serde_json::from_str::<Vec<String>>(trimmed) {
+        for uri in uris {
+            if let Some(key) = strip_file_scheme(&uri).and_then(|value| normalize_workspace_key(&value))
+            {
+                return Some(key);
+            }
+        }
+        return None;
+    }
+    strip_file_scheme(trimmed).and_then(|value| normalize_workspace_key(&value))
+}
+
+fn load_annotation_titles(root: &Path, titles: &mut SessionTitleMap) {
+    let Ok(entries) = fs::read_dir(root.join("annotations")) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pbtxt") {
+            continue;
+        }
+        let Some(conversation_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(nonempty_trimmed)
+        else {
+            continue;
+        };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(title) = parse_pbtxt_top_level_title(&contents) {
+            titles.insert(("antigravity".to_string(), conversation_id), title);
+        }
+    }
+}
+
+fn parse_pbtxt_top_level_title(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("title:") else {
+            continue;
+        };
+        let quoted = rest.trim();
+        if quoted.len() < 2 || !quoted.starts_with('"') || !quoted.ends_with('"') {
+            continue;
+        }
+        let decoded = decode_pbtxt_string(&quoted[1..quoted.len() - 1]);
+        if let Some(title) = nonempty_trimmed(&decoded) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn decode_pbtxt_string(escaped: &str) -> String {
+    let bytes = escaped.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' || index + 1 >= bytes.len() {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        match bytes[index] {
+            b'0'..=b'7' => {
+                let mut value = (bytes[index] - b'0') as u16;
+                index += 1;
+                for _ in 0..2 {
+                    if index < bytes.len() && (b'0'..=b'7').contains(&bytes[index]) {
+                        value = value * 8 + (bytes[index] - b'0') as u16;
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push((value & 0xff) as u8);
+            }
+            b'n' => {
+                out.push(b'\n');
+                index += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                index += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                index += 1;
+            }
+            b'"' => {
+                out.push(b'"');
+                index += 1;
+            }
+            b'\'' => {
+                out.push(b'\'');
+                index += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                index += 1;
+            }
+            other => {
+                out.push(other);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn nonempty_trimmed(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn resolve_lineage<'a>(
+    conversation_id: &'a str,
+    summaries: &'a HashMap<String, SummaryRecord>,
+) -> (&'a str, Option<&'a SummaryRecord>, Option<&'a SummaryRecord>) {
+    let own = summaries.get(conversation_id);
+    let mut current = conversation_id;
+    let mut visited = HashSet::new();
+    visited.insert(current);
+    for _ in 0..16 {
+        let Some(parent) = summaries
+            .get(current)
+            .and_then(|record| record.parent_conversation_id.as_deref())
+            .filter(|parent| !parent.is_empty() && *parent != current)
+        else {
+            break;
+        };
+        if !visited.insert(parent) {
+            break;
+        }
+        current = parent;
+    }
+    let root = summaries.get(current);
+    (current, own, root)
+}
+
+fn parse_conversation_file(
+    path: &Path,
+    summaries: &HashMap<String, SummaryRecord>,
+) -> Vec<UnifiedMessage> {
+    let mut connection = match open_readonly_or_sandbox_immutable(path) {
+        Ok(connection) => connection,
+        Err(_) => return Vec::new(),
+    };
+    let steps = match read_steps(&connection) {
+        Ok(steps) => steps,
+        Err(_) => {
+            let probe_err = connection
+                .prepare("SELECT 1 FROM sqlite_master LIMIT 1")
+                .err();
+            if !probe_err.as_ref().is_some_and(is_shm_access_error) {
+                return Vec::new();
+            }
+            let Ok(fallback) = open_immutable(path) else {
+                return Vec::new();
+            };
+            let Ok(steps) = read_steps(&fallback) else {
+                return Vec::new();
+            };
+            connection = fallback;
+            steps
+        }
+    };
+    let metadata = read_conversation_metadata(&connection, path, summaries);
     let models = read_model_names(&connection);
     build_messages(&metadata, &steps, &models)
 }
@@ -305,12 +621,22 @@ fn parse_conversation_file(path: &Path) -> Vec<UnifiedMessage> {
 fn read_conversation_metadata(
     connection: &Connection,
     path: &Path,
+    summaries: &HashMap<String, SummaryRecord>,
 ) -> ConversationMetadata {
     let conversation_id = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let (root_id, own_summary, root_summary) = resolve_lineage(&conversation_id, summaries);
+    let is_subagent = root_id != conversation_id;
+    let agent_name = if is_subagent {
+        own_summary
+            .and_then(|record| record.agent_name.clone())
+            .or_else(|| Some("subagent".to_string()))
+    } else {
+        None
+    };
     let blob = connection
         .prepare("SELECT data FROM trajectory_metadata_blob")
         .ok()
@@ -325,10 +651,19 @@ fn read_conversation_metadata(
     let workspace_key = proto::string(&blob, &[7])
         .or_else(|| proto::string(&blob, &[1, 1]))
         .and_then(strip_file_scheme)
-        .and_then(|value| normalize_workspace_key(&value));
+        .and_then(|value| normalize_workspace_key(&value))
+        .or_else(|| own_summary.and_then(|record| record.workspace_key.clone()))
+        .or_else(|| {
+            is_subagent
+                .then(|| root_summary.and_then(|record| record.workspace_key.clone()))
+                .flatten()
+        });
     let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
     ConversationMetadata {
+        root_conversation_id: root_id.to_string(),
         conversation_id,
+        is_subagent,
+        agent_name,
         workspace_key,
         workspace_label,
     }
@@ -428,9 +763,15 @@ fn read_output(step_type: i64, payload: &[u8]) -> Option<String> {
     Some(text.to_string())
 }
 
-/// Maps Antigravity's numeric model key to the model name recorded alongside
-/// each generation.
-fn read_model_names(connection: &Connection) -> HashMap<u64, String> {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelDescriptor {
+    model_id: String,
+    reasoning_effort: Option<String>,
+}
+
+/// Maps Antigravity's numeric model key to the model name and reasoning effort
+/// recorded alongside each generation.
+fn read_model_names(connection: &Connection) -> HashMap<u64, ModelDescriptor> {
     let mut names = HashMap::new();
     let Ok(mut statement) = connection.prepare("SELECT data FROM gen_metadata") else {
         return names;
@@ -445,19 +786,66 @@ fn read_model_names(connection: &Connection) -> HashMap<u64, String> {
         let Some(model) = proto::string(generation, &[19]) else {
             continue;
         };
+        let display_name = proto::string(generation, &[21]);
         let key = proto::varint(generation, &[4, USAGE_MODEL_KEY])
             .or_else(|| proto::varint(generation, &[3]));
         if let Some(key) = key {
-            names.entry(key).or_insert_with(|| model.to_string());
+            names
+                .entry(key)
+                .or_insert_with(|| parse_generation_model(model, display_name));
         }
     }
     names
 }
 
+fn parse_generation_model(raw_model: &str, display_name: Option<&str>) -> ModelDescriptor {
+    let reasoning_effort = display_name
+        .and_then(reasoning_effort_from_model)
+        .or_else(|| reasoning_effort_from_model(raw_model))
+        .or_else(|| match raw_model.trim().to_ascii_lowercase().as_str() {
+            "gemini-4-argon-d" | "gemini-3.8-flash-n" => Some("high".to_string()),
+            _ => None,
+        });
+    let model_id = normalize_antigravity_model_id(raw_model, display_name);
+    ModelDescriptor {
+        model_id,
+        reasoning_effort,
+    }
+}
+
+fn normalize_antigravity_model_id(raw_model: &str, display_name: Option<&str>) -> String {
+    let trimmed = raw_model.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "gemini-4-argon-d" => return "gemini-4-argon".to_string(),
+        "gemini-3.8-flash-n" => return "gemini-3.8-flash".to_string(),
+        _ => {}
+    }
+    if let Some(display) = display_name {
+        if reasoning_effort_from_model(display).is_some() {
+            if let Some((base_label, _)) = display
+                .trim()
+                .strip_suffix(')')
+                .and_then(|value| value.rsplit_once('('))
+            {
+                let slug = base_label
+                    .split_whitespace()
+                    .map(|word| word.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                if !slug.is_empty() && lower.starts_with(&format!("{slug}-")) {
+                    return slug;
+                }
+            }
+        }
+    }
+    normalize_model_for_grouping(trimmed)
+}
+
 fn build_messages(
     metadata: &ConversationMetadata,
     steps: &[StepRecord],
-    models: &HashMap<u64, String>,
+    models: &HashMap<u64, ModelDescriptor>,
 ) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut pending_prompt: Option<String> = None;
@@ -480,18 +868,20 @@ fn build_messages(
         let Some(timestamp) = step.finished_at_ms.or(step.started_at_ms) else {
             continue;
         };
-        let model_id = resolve_model_id(step, models);
+        let descriptor = resolve_model(step, models);
         let mut message = UnifiedMessage::new_with_agent(
             "antigravity",
-            model_id.clone(),
-            provider_for_model(&model_id),
-            metadata.conversation_id.clone(),
+            descriptor.model_id.clone(),
+            provider_for_model(&descriptor.model_id),
+            metadata.root_conversation_id.clone(),
             timestamp,
             tokens,
             0.0,
-            None,
+            metadata.agent_name.clone(),
         );
+        message.reasoning_effort = descriptor.reasoning_effort;
         message.physical_session_id = Some(metadata.conversation_id.clone());
+        message.is_subagent = metadata.is_subagent;
         message.set_workspace(
             metadata.workspace_key.clone(),
             metadata.workspace_label.clone(),
@@ -533,16 +923,37 @@ fn build_messages(
 /// Antigravity records no model key on its own title and summary requests. A
 /// conversation is pinned to one model in practice, so fall back to that model
 /// and only report `unknown` when the conversation used several.
-fn resolve_model_id(step: &StepRecord, models: &HashMap<u64, String>) -> String {
+fn resolve_model(step: &StepRecord, models: &HashMap<u64, ModelDescriptor>) -> ModelDescriptor {
     if let Some(model) = step.model_key.and_then(|key| models.get(&key)) {
         return model.clone();
     }
-    let mut distinct = models.values().collect::<Vec<_>>();
-    distinct.sort();
-    distinct.dedup();
-    match distinct.as_slice() {
-        [model] => (*model).clone(),
-        _ => "unknown".to_string(),
+    let mut distinct_ids = models
+        .values()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<Vec<_>>();
+    distinct_ids.sort();
+    distinct_ids.dedup();
+    match distinct_ids.as_slice() {
+        [model_id] => {
+            let mut distinct_efforts = models
+                .values()
+                .map(|entry| entry.reasoning_effort.as_deref())
+                .collect::<Vec<_>>();
+            distinct_efforts.sort();
+            distinct_efforts.dedup();
+            let reasoning_effort = match distinct_efforts.as_slice() {
+                [Some(effort)] => Some((*effort).to_string()),
+                _ => None,
+            };
+            ModelDescriptor {
+                model_id: (*model_id).to_string(),
+                reasoning_effort,
+            }
+        }
+        _ => ModelDescriptor {
+            model_id: "unknown".to_string(),
+            reasoning_effort: None,
+        },
     }
 }
 

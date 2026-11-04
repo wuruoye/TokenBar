@@ -16,9 +16,9 @@ enum ClaudeTurnState: Equatable, Sendable {
     case ended
 }
 
-/// Reads the last turn of a Codex or Claude task from the end of its transcript.
-/// Unread tasks have finished, so each transcript is read once per size and
-/// modification date. Confined to the unread watcher's queue.
+/// Reads the last turn of a Codex, Claude, or Antigravity task from the end of
+/// its transcript. Unread tasks have finished, so each transcript is read once
+/// per size and modification date. Confined to the unread watcher's queue.
 final class DesktopUnreadTurnReader {
     private enum Entry {
         case prompt(String, at: Date?)
@@ -56,6 +56,7 @@ final class DesktopUnreadTurnReader {
 
     private var cache: [String: CachedTurn] = [:]
     private var turnStates: [String: CachedTurnState] = [:]
+    private var antigravityWaitingStates: [String: (size: UInt64, modifiedAt: Date, waiting: Bool)] = [:]
     private var claudeTranscripts: [String: FoundTranscript] = [:]
 
     func codexTurn(rolloutURL: URL) -> DesktopUnreadTurn {
@@ -129,6 +130,59 @@ final class DesktopUnreadTurnReader {
                 return nil
             }
         }
+    }
+
+    func antigravityTurn(transcriptURL: URL, fallbackPreview: String? = nil) -> DesktopUnreadTurn {
+        var turn = self.cachedTurn(
+            at: transcriptURL,
+            markers: ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""])
+        { object in
+            let at = Self.antigravityTimestamp(object)
+            switch object["type"] as? String {
+            case "USER_INPUT":
+                guard object["source"] as? String == "USER_EXPLICIT" else { return nil }
+                return Self.antigravityHumanText(object["content"] as? String).map { .prompt($0, at: at) }
+            case "PLANNER_RESPONSE":
+                guard object["source"] as? String == "MODEL" else { return nil }
+                let text = Self.replySummary(object["content"] as? String)
+                    ?? Self.antigravityUserInput(object["tool_calls"])
+                return text.map { .reply($0, at: at, duration: nil) }
+            default:
+                return nil
+            }
+        }
+        if turn.reply == nil {
+            turn.reply = Self.replySummary(fallbackPreview)
+        }
+        return turn
+    }
+
+    func antigravityWaitingForUser(transcript: URL, size: UInt64, modifiedAt: Date) -> Bool {
+        if let cached = self.antigravityWaitingStates[transcript.path],
+           cached.size == size,
+           cached.modifiedAt == modifiedAt
+        {
+            return cached.waiting
+        }
+        var waiting = false
+        let markers = ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""].map { Data($0.utf8) }
+        Self.scanBackward(in: transcript, markers: markers) { line in
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                return false
+            }
+            switch object["type"] as? String {
+            case "PLANNER_RESPONSE" where object["source"] as? String == "MODEL":
+                waiting = Self.antigravityPausesForUser(object["tool_calls"])
+                return true
+            case "USER_INPUT" where object["source"] as? String == "USER_EXPLICIT":
+                waiting = false
+                return true
+            default:
+                return false
+            }
+        }
+        self.antigravityWaitingStates[transcript.path] = (size, modifiedAt, waiting)
+        return waiting
     }
 
     /// A finished Claude turn ends with an assistant message that stopped for a
@@ -212,6 +266,70 @@ final class DesktopUnreadTurnReader {
         return nil
     }
 
+    /// An Antigravity tool call by its own summary, or else by the file,
+    /// command, search, or subagent it works on.
+    static func antigravityToolActivity(_ call: [String: Any]) -> String? {
+        guard let name = call["name"] as? String, !name.isEmpty else { return nil }
+        let args = (call["args"] as? [String: Any])
+            ?? (call["arguments"] as? [String: Any])
+            ?? [:]
+        for key in ["toolSummary", "toolAction", "Description"] {
+            if let summary = (args[key] as? String).flatMap(self.flattened) {
+                return summary
+            }
+        }
+        if name == "invoke_subagent",
+           let role = (args["Role"] as? String).flatMap(self.flattened)
+        {
+            return "Subagent · \(role)"
+        }
+        if let path = (args["Path"] as? String)
+            ?? (args["TargetFile"] as? String)
+            ?? (args["AbsolutePath"] as? String)
+            ?? (args["DirectoryPath"] as? String)
+            ?? (args["SearchPath"] as? String),
+            !path.isEmpty
+        {
+            let fileName = URL(fileURLWithPath: path).lastPathComponent
+            switch name {
+            case "read_file", "view_file", "view_file_outline", "view_code_item":
+                return "Read \(fileName)"
+            case "edit_file", "replace_file_content", "multi_replace_file_content":
+                return "Edit \(fileName)"
+            case "write_file", "write_to_file":
+                return "Write \(fileName)"
+            case "list_dir":
+                return "List \(fileName)"
+            case "grep_search", "find_by_name":
+                if let query = ((args["Query"] as? String) ?? (args["Pattern"] as? String))
+                    .flatMap(self.flattened)
+                {
+                    return "Search \(query) in \(fileName)"
+                }
+                return "Search \(fileName)"
+            default:
+                return "\(name) \(fileName)"
+            }
+        }
+        for (key, verb) in [
+            ("CommandLine", "Run"),
+            ("Query", "Search"),
+            ("query", "Search"),
+            ("Pattern", "Find"),
+            ("Url", "Read"),
+            ("url", "Read"),
+        ] {
+            if let line = (args[key] as? String)?
+                .split(separator: "\n")
+                .first
+                .flatMap({ self.flattened(String($0)) })
+            {
+                return "\(verb) \(line)"
+            }
+        }
+        return nil
+    }
+
     /// Collapses whitespace so text fits the few lines a widget row has.
     static func flattened(_ text: String) -> String? {
         let words = text.split(whereSeparator: \.isWhitespace)
@@ -227,6 +345,12 @@ final class DesktopUnreadTurnReader {
         (object["timestamp"] as? String).flatMap {
             try? Date($0, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true))
         }
+    }
+
+    private static func antigravityTimestamp(_ object: [String: Any]) -> Date? {
+        guard let raw = object["created_at"] as? String else { return nil }
+        return (try? Date(raw, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
+            ?? (try? Date(raw, strategy: Date.ISO8601FormatStyle()))
     }
 
     /// Codex labels text blocks `Text` in its own items and `text` in model
@@ -278,6 +402,73 @@ final class DesktopUnreadTurnReader {
             return nil
         }
         return self.flattened(trimmed)
+    }
+
+    /// Antigravity wraps user messages in `<USER_REQUEST>` alongside harness
+    /// metadata, and writes compacted context summaries as `<CONTEXT_SUMMARY>`.
+    static func antigravityHumanText(_ text: String?) -> String? {
+        guard var text else { return nil }
+        if let start = text.range(of: "<USER_REQUEST>") {
+            text = String(text[start.upperBound...])
+            if let end = text.range(of: "</USER_REQUEST>") {
+                text = String(text[..<end.lowerBound])
+            }
+        } else if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
+            return nil
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return self.flattened(trimmed)
+    }
+
+    private static func antigravityPausesForUser(_ toolCalls: Any?) -> Bool {
+        guard let calls = toolCalls as? [[String: Any]] else { return false }
+        return calls.contains { call in
+            let name = call["name"] as? String ?? ""
+            if name == "ask_question" {
+                return true
+            }
+            let args = (call["args"] as? [String: Any])
+                ?? (call["arguments"] as? [String: Any])
+                ?? [:]
+            if let metadata = args["ArtifactMetadata"] as? [String: Any],
+               metadata["RequestFeedback"] as? Bool == true
+            {
+                return true
+            }
+            return false
+        }
+    }
+
+    private static func antigravityUserInput(_ toolCalls: Any?) -> String? {
+        guard let calls = toolCalls as? [[String: Any]] else { return nil }
+        var texts: [String] = []
+        for call in calls {
+            let name = call["name"] as? String ?? ""
+            let args = (call["args"] as? [String: Any])
+                ?? (call["arguments"] as? [String: Any])
+                ?? [:]
+            if name == "ask_question" {
+                let questions = (args["questions"] as? [[String: Any]] ?? [])
+                    .compactMap { $0["question"] as? String }
+                texts.append(questions.isEmpty ? "Waiting for your answer" : questions.joined(separator: " "))
+            } else if let metadata = args["ArtifactMetadata"] as? [String: Any],
+                      metadata["RequestFeedback"] as? Bool == true
+            {
+                if let summary = (metadata["Summary"] as? String).flatMap(self.replySummary) {
+                    texts.append(summary)
+                } else if let path = (args["Path"] as? String) ?? (args["TargetFile"] as? String) {
+                    texts.append("Review \(URL(fileURLWithPath: path).lastPathComponent)")
+                } else {
+                    texts.append("Waiting for review")
+                }
+            } else if name == "notify_user",
+                      let message = (args["Message"] as? String).flatMap(self.replySummary)
+            {
+                texts.append(message)
+            }
+        }
+        return texts.isEmpty ? nil : self.flattened(texts.joined(separator: " · "))
     }
 
     /// Reduces a Markdown reply to its opening text: code blocks, table rules,

@@ -45,7 +45,7 @@ struct CodexBackgroundTaskReader: Sendable {
             .appendingPathComponent("Library/Application Support/TokenBar/background-tasks", isDirectory: true)
     }
 
-    func tasks(now: Date) -> [String: Task] {
+    func tasks(platform: String = "codex", now: Date) -> [String: Task] {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: self.directory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])) ?? []
         let decoder = JSONDecoder()
@@ -55,7 +55,7 @@ struct CodexBackgroundTaskReader: Sendable {
                   info.isRegularFile == true, (info.fileSize ?? .max) <= 64 * 1024,
                   let data = try? Data(contentsOf: url),
                   let record = try? decoder.decode(Record.self, from: data),
-                  record.schemaVersion == 1, record.platform == "codex",
+                  record.schemaVersion == 1, record.platform == platform,
                   UUID(uuidString: record.threadID) != nil,
                   !record.taskID.isEmpty, !record.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   ["starting", "running"].contains(record.status)

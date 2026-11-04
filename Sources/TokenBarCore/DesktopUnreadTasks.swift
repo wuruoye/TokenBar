@@ -7,8 +7,8 @@ import SQLite3
 /// One finished task that a desktop app's sidebar still marks as unread.
 public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
     public let platform: TokenPlatform
-    /// The Codex thread ID or Claude Desktop session ID that each app's deep
-    /// link opens.
+    /// The Codex thread ID, Claude Desktop session ID, or Antigravity
+    /// conversation ID.
     public let id: String
     public let title: String?
     /// The last prompt the user sent in the task, flattened to one line.
@@ -86,7 +86,9 @@ public final class DesktopUnreadTaskMonitor {
     @ObservationIgnored private var watcher: DesktopUnreadTaskWatcher?
 
     @ObservationIgnored private let claudeTrackerStateURL: URL?
+    @ObservationIgnored private let antigravityTrackerStateURL: URL?
     @ObservationIgnored private var isClaudeActive = true
+    @ObservationIgnored private var isAntigravityActive = true
     /// The unread tasks each app reports, before held tasks are added.
     @ObservationIgnored private var reported: [TokenPlatform: [DesktopUnreadTask]] = [:]
     /// Tasks an app marked read before the user saw them.
@@ -103,13 +105,16 @@ public final class DesktopUnreadTaskMonitor {
     /// switch to one like a switch the user makes.
     @ObservationIgnored private var claudeOpens: [(id: String, at: Date)] = []
     @ObservationIgnored private var releaseChecks: [TokenPlatform: Task<Void, Never>] = [:]
+    @ObservationIgnored private var openLagChecks: [TokenPlatform: Task<Void, Never>] = [:]
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        claudeTrackerStateURL: URL? = DesktopUnreadTaskMonitor.defaultClaudeTrackerStateURL())
+        claudeTrackerStateURL: URL? = DesktopUnreadTaskMonitor.defaultClaudeTrackerStateURL(),
+        antigravityTrackerStateURL: URL? = DesktopUnreadTaskMonitor.defaultAntigravityTrackerStateURL())
     {
         self.reader = DesktopUnreadTaskReader(environment: environment)
         self.claudeTrackerStateURL = claudeTrackerStateURL
+        self.antigravityTrackerStateURL = antigravityTrackerStateURL
     }
 
     public nonisolated static func defaultClaudeTrackerStateURL() -> URL {
@@ -118,6 +123,14 @@ public final class DesktopUnreadTaskMonitor {
         return base
             .appendingPathComponent("TokenBar", isDirectory: true)
             .appendingPathComponent("claude-unread-state.json", isDirectory: false)
+    }
+
+    public nonisolated static func defaultAntigravityTrackerStateURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("TokenBar", isDirectory: true)
+            .appendingPathComponent("antigravity-unread-state.json", isDirectory: false)
     }
 
     public var counts: [TokenPlatform: Int] {
@@ -130,15 +143,19 @@ public final class DesktopUnreadTaskMonitor {
 
     public nonisolated static let claudeBundleIdentifier = "com.anthropic.claudefordesktop"
     public nonisolated static let codexBundleIdentifier = "com.openai.codex"
+    public nonisolated static let antigravityBundleIdentifier = "com.google.antigravity"
 
     /// Hears which app is in front. Claude counts a turn that ends in the
     /// session its window shows as read, even while another app is in front,
     /// so TokenBar keeps such a turn unread until Claude comes to the front on
-    /// it.
+    /// it. Antigravity suppresses unread in memory while its focused window
+    /// shows the finishing conversation without immediately rewriting the
+    /// conversation's annotation file.
     public func setFrontmostApplication(_ bundleIdentifier: String?) {
         let platform: TokenPlatform? = switch bundleIdentifier {
         case Self.claudeBundleIdentifier: .claude
         case Self.codexBundleIdentifier: .codex
+        case Self.antigravityBundleIdentifier: .antigravity
         default: nil
         }
         let now = Date()
@@ -158,21 +175,32 @@ public final class DesktopUnreadTaskMonitor {
             self.isClaudeActive = isClaudeActive
             self.watcher?.setClaudeActive(isClaudeActive)
         }
+        let isAntigravityActive = platform == .antigravity
+        if isAntigravityActive != self.isAntigravityActive {
+            self.isAntigravityActive = isAntigravityActive
+            self.watcher?.setAntigravityActive(isAntigravityActive)
+        }
     }
 
     /// A task opened from TokenBar is read once its app shows it, however
     /// briefly.
     public func markOpened(platform: TokenPlatform, id: String) {
         let now = Date()
-        self.openedAt[platform, default: [:]][id] = now
+        let currentUpdatedAt = self.reported[platform]?.first(where: { $0.id == id })?.updatedAt
+            ?? self.held[platform]?[id]?.task.updatedAt
+        let effectiveOpenedAt = max(now, currentUpdatedAt ?? .distantPast)
+        self.openedAt[platform, default: [:]][id] = effectiveOpenedAt
         if platform == .claude {
             self.claudeOpens = self.claudeOpens.filter {
                 now.timeIntervalSince($0.at) < Self.visitHistoryLimit
             } + [(id, now)]
         }
-        if self.held[platform]?.removeValue(forKey: id) != nil {
-            self.publishTasks(for: platform)
+        if platform == .antigravity {
+            self.watcher?.markAntigravityViewed(id: id, at: effectiveOpenedAt)
         }
+        _ = self.held[platform]?.removeValue(forKey: id)
+        self.publishTasks(for: platform)
+        self.scheduleOpenLagCheck(for: platform)
     }
 
     public func start() {
@@ -180,6 +208,7 @@ public final class DesktopUnreadTaskMonitor {
         let watcher = DesktopUnreadTaskWatcher(
             reader: self.reader,
             claudeTrackerStateURL: self.claudeTrackerStateURL,
+            antigravityTrackerStateURL: self.antigravityTrackerStateURL,
             publish: { [weak self] platform, tasks, existing in
                 Task { @MainActor [weak self] in
                     self?.accept(tasks, existing: existing, for: platform)
@@ -192,6 +221,7 @@ public final class DesktopUnreadTaskMonitor {
             })
         self.watcher = watcher
         watcher.setClaudeActive(self.isClaudeActive)
+        watcher.setAntigravityActive(self.isAntigravityActive)
         watcher.start()
     }
 
@@ -209,6 +239,10 @@ public final class DesktopUnreadTaskMonitor {
             check.cancel()
         }
         self.releaseChecks = [:]
+        for check in self.openLagChecks.values {
+            check.cancel()
+        }
+        self.openLagChecks = [:]
     }
 
     public func refresh() {
@@ -351,11 +385,20 @@ public final class DesktopUnreadTaskMonitor {
     }
 
     /// Publishes the reported tasks and the held ones that are neither
-    /// reported again nor running a new turn.
+    /// reported again nor running a new turn. Tasks just opened from TokenBar
+    /// clear immediately unless a newer turn finished after the click.
     private func publishTasks(for platform: TokenPlatform) {
-        let reported = self.reported[platform] ?? []
-        let excluded = Set(reported.map(\.id) + (self.running[platform] ?? []).map(\.id))
-        let held = (self.held[platform] ?? [:]).filter { !excluded.contains($0.key) }
+        let now = Date()
+        let opened = (self.openedAt[platform] ?? [:]).filter {
+            now.timeIntervalSince($0.value) < Self.readLag
+        }
+        self.openedAt[platform] = opened
+        let reported = (self.reported[platform] ?? []).filter { task in
+            guard let openedAt = opened[task.id] else { return true }
+            return (task.updatedAt ?? .distantPast) > openedAt
+        }
+        let excluded = Set((self.reported[platform] ?? []).map(\.id) + (self.running[platform] ?? []).map(\.id))
+        let held = (self.held[platform] ?? [:]).filter { !excluded.contains($0.key) && opened[$0.key] == nil }
         self.held[platform] = held
         let tasks = held.isEmpty ? reported : (reported + held.values.map(\.task)).sorted {
             ($0.updatedAt ?? .distantPast, $0.id) > ($1.updatedAt ?? .distantPast, $1.id)
@@ -366,25 +409,43 @@ public final class DesktopUnreadTaskMonitor {
         guard self.tasks[platform] != tasks else { return }
         self.tasks[platform] = tasks
     }
+
+    private func scheduleOpenLagCheck(for platform: TokenPlatform) {
+        guard let latest = self.openedAt[platform]?.values.max() else { return }
+        let remaining = max(0.1, Self.readLag - Date().timeIntervalSince(latest) + 0.1)
+        self.openLagChecks[platform]?.cancel()
+        self.openLagChecks[platform] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(remaining))
+            guard !Task.isCancelled, let self else { return }
+            self.openLagChecks[platform] = nil
+            self.publishTasks(for: platform)
+        }
+    }
 }
 
 struct DesktopUnreadTaskReader: Sendable {
-    static let platforms: [TokenPlatform] = [.codex, .claude]
+    static let platforms: [TokenPlatform] = [.codex, .claude, .antigravity]
 
     let codexHome: URL
     let claudeSupportDirectory: URL
     let claudeProjectsDirectory: URL
     let claudeMainLog: URL
+    let antigravityHome: URL
     let backgroundTasksDirectory: URL
 
     init(
-        codexHome: URL, claudeSupportDirectory: URL, claudeProjectsDirectory: URL, claudeMainLog: URL,
+        codexHome: URL,
+        claudeSupportDirectory: URL,
+        claudeProjectsDirectory: URL,
+        claudeMainLog: URL,
+        antigravityHome: URL = AntigravityQuotaService.antigravityHomeURL(environment: [:]),
         backgroundTasksDirectory: URL = CodexBackgroundTaskReader.directory(environment: [:]))
     {
         self.codexHome = codexHome
         self.claudeSupportDirectory = claudeSupportDirectory
         self.claudeProjectsDirectory = claudeProjectsDirectory
         self.claudeMainLog = claudeMainLog
+        self.antigravityHome = antigravityHome
         self.backgroundTasksDirectory = backgroundTasksDirectory
     }
 
@@ -406,6 +467,7 @@ struct DesktopUnreadTaskReader: Sendable {
                 .appendingPathComponent("projects", isDirectory: true),
             claudeMainLog: fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Logs/Claude/main.log", isDirectory: false),
+            antigravityHome: AntigravityQuotaService.antigravityHomeURL(environment: environment),
             backgroundTasksDirectory: CodexBackgroundTaskReader.directory(environment: environment))
     }
 
@@ -783,6 +845,14 @@ struct DesktopUnreadTaskReader: Sendable {
     /// end when it quits. Checking the known process is one lookup, while
     /// finding a new one goes through every process.
     func claudeLaunch(reusing known: ClaudeLaunch?) -> ClaudeLaunch? {
+        Self.appLaunch(executableName: "Claude", reusing: known)
+    }
+
+    func antigravityLaunch(reusing known: ClaudeLaunch?) -> ClaudeLaunch? {
+        Self.appLaunch(executableName: "Antigravity", reusing: known)
+    }
+
+    private static func appLaunch(executableName: String, reusing known: ClaudeLaunch?) -> ClaudeLaunch? {
         if let known, Self.processStartedAt(known.pid) == known.startedAt {
             return known
         }
@@ -794,12 +864,13 @@ struct DesktopUnreadTaskReader: Sendable {
         size = processes.count * MemoryLayout<kinfo_proc>.stride
         guard sysctl(&mib, u_int(mib.count), &processes, &size, nil, 0) == 0 else { return nil }
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let suffix = ".app/Contents/MacOS/\(executableName)"
         for process in processes.prefix(size / MemoryLayout<kinfo_proc>.stride) {
             let name = withUnsafeBytes(of: process.kp_proc.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-            guard name == "Claude",
+            guard name == executableName,
                   proc_pidpath(process.kp_proc.p_pid, &path, UInt32(path.count)) > 0,
                   String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                      .hasSuffix(".app/Contents/MacOS/Claude")
+                      .hasSuffix(suffix)
             else {
                 continue
             }
@@ -896,6 +967,363 @@ struct DesktopUnreadTaskReader: Sendable {
         }
     }
 
+    // MARK: Antigravity
+
+    func antigravityTranscriptURL(conversationID: String) -> URL? {
+        guard !conversationID.isEmpty,
+              !conversationID.contains("/"),
+              !conversationID.contains("..")
+        else {
+            return nil
+        }
+        return self.antigravityHome
+            .appendingPathComponent("brain", isDirectory: true)
+            .appendingPathComponent(conversationID, isDirectory: true)
+            .appendingPathComponent(".system_generated/logs/transcript.jsonl", isDirectory: false)
+    }
+
+    /// Reads Antigravity's conversation summary database and per-conversation
+    /// `.pbtxt` annotations, rolling subagent run state up to each root
+    /// conversation the Hub sidebar displays.
+    func antigravitySessions(
+        reusingSessions knownSessions: [String: AntigravitySessionSnapshot] = [:],
+        reusingAnnotations knownAnnotations: [String: AntigravityAnnotation])
+        -> (
+            sessions: [String: AntigravitySessionSnapshot],
+            annotations: [String: AntigravityAnnotation],
+            needsRetry: Bool
+        )
+    {
+        let annotations = self.antigravityAnnotations(reusing: knownAnnotations)
+        let databaseURL = self.antigravityHome.appendingPathComponent("conversation_summaries.db", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            return ([:], annotations, false)
+        }
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard Self.openReadonlySQLite(at: databaseURL, probeTable: "conversation_summaries", into: &database) else {
+            return (knownSessions, annotations, true)
+        }
+
+        let columns = Self.columnNames(of: "conversation_summaries", in: database)
+        guard columns.contains("conversation_id") else {
+            return (knownSessions, annotations, true)
+        }
+        func column(_ name: String) -> String {
+            columns.contains(name) ? name : "NULL"
+        }
+
+        let archivedFromFTS = Self.antigravityArchivedIDs(in: database)
+        let sql = """
+            SELECT conversation_id, \(column("title")), \(column("preview")),
+                   \(column("step_count")), \(column("last_modified_time")),
+                   \(column("last_user_input_time")), \(column("workspace_uris")),
+                   \(column("status")), \(column("agent_name")),
+                   \(column("parent_conversation_id")), \(column("nesting_depth")),
+                   \(column("not_fully_idle")), \(column("killed"))
+            FROM conversation_summaries
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return (knownSessions, annotations, true)
+        }
+
+        struct RawSummary {
+            let id: String
+            let title: String?
+            let preview: String?
+            let stepCount: Int
+            let lastModifiedAt: Date?
+            let lastUserInputAt: Date?
+            let workspacePath: String?
+            let hasActiveRunStatus: Bool
+            let agentName: String?
+            let parentID: String?
+            let nestingDepth: Int
+            let notFullyIdle: Bool
+            let isKilled: Bool
+        }
+
+        var rows: [String: RawSummary] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = Self.text(statement, 0) else { continue }
+            let status = Self.text(statement, 7) ?? ""
+            let hasActiveRunStatus = switch status {
+            case "CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING":
+                true
+            default:
+                false
+            }
+            rows[id] = RawSummary(
+                id: id,
+                title: Self.text(statement, 1).flatMap(DesktopUnreadTurnReader.flattened),
+                preview: Self.text(statement, 2),
+                stepCount: Int(sqlite3_column_int64(statement, 3)),
+                lastModifiedAt: Self.text(statement, 4).flatMap(Self.antigravitySQLiteDate),
+                lastUserInputAt: Self.text(statement, 5).flatMap(Self.antigravitySQLiteDate),
+                workspacePath: Self.text(statement, 6).flatMap(Self.antigravityWorkspacePath),
+                hasActiveRunStatus: hasActiveRunStatus,
+                agentName: Self.text(statement, 8).flatMap(DesktopUnreadTurnReader.flattened),
+                parentID: Self.text(statement, 9),
+                nestingDepth: Int(sqlite3_column_int64(statement, 10)),
+                notFullyIdle: sqlite3_column_int64(statement, 11) != 0,
+                isKilled: sqlite3_column_int64(statement, 12) != 0)
+        }
+
+        var foregroundSubagents = Set<String>()
+        var backgroundSubagents = Set<String>()
+        var subagentActivities: [String: [String]] = [:]
+        for row in rows.values where row.parentID != nil && !row.isKilled {
+            guard row.hasActiveRunStatus || row.notFullyIdle else { continue }
+            var current = row.id
+            var hops = 0
+            while let parent = rows[current]?.parentID, hops < 16 {
+                current = parent
+                hops += 1
+            }
+            guard current != row.id else { continue }
+            if row.hasActiveRunStatus {
+                foregroundSubagents.insert(current)
+            } else {
+                backgroundSubagents.insert(current)
+            }
+            if let label = row.agentName ?? row.title {
+                let text = "Subagent · \(label)"
+                if subagentActivities[current]?.contains(text) != true {
+                    subagentActivities[current, default: []].append(text)
+                }
+            }
+        }
+
+        var sessions: [String: AntigravitySessionSnapshot] = [:]
+        for row in rows.values
+            where row.parentID == nil
+                && row.nestingDepth == 0
+                && (row.stepCount > 0 || row.hasActiveRunStatus || row.notFullyIdle)
+        {
+            let annotation = annotations[row.id]
+            let lastModifiedSeconds = row.lastModifiedAt.map { Int64(floor($0.timeIntervalSince1970)) } ?? 0
+            sessions[row.id] = AntigravitySessionSnapshot(
+                id: row.id,
+                title: annotation?.title ?? row.title,
+                preview: row.preview,
+                workspacePath: row.workspacePath,
+                lastModifiedAt: row.lastModifiedAt,
+                lastModifiedSeconds: lastModifiedSeconds,
+                lastUserInputAt: row.lastUserInputAt,
+                lastUserViewAt: annotation?.lastUserViewAt,
+                lastUserViewSeconds: annotation?.lastUserViewSeconds,
+                hasAnnotation: annotation != nil,
+                markedAsUnread: annotation?.markedAsUnread == true,
+                isArchived: archivedFromFTS.contains(row.id) || annotation?.isArchived == true,
+                isKilled: row.isKilled,
+                hasActiveRunStatus: row.hasActiveRunStatus,
+                notFullyIdle: row.notFullyIdle,
+                hasForegroundSubagents: foregroundSubagents.contains(row.id),
+                hasBackgroundSubagents: backgroundSubagents.contains(row.id),
+                subagentActivity: subagentActivities[row.id].map { $0.joined(separator: " · ") })
+        }
+        return (sessions, annotations, false)
+    }
+
+    private func antigravityAnnotations(
+        reusing known: [String: AntigravityAnnotation]) -> [String: AntigravityAnnotation]
+    {
+        let directory = self.antigravityHome.appendingPathComponent("annotations", isDirectory: true)
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles])) ?? []
+        var annotations: [String: AntigravityAnnotation] = [:]
+        for file in files where file.pathExtension == "pbtxt" {
+            let id = file.deletingPathExtension().lastPathComponent
+            guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let modifiedAt = values.contentModificationDate,
+                  (values.fileSize ?? .max) <= 256 * 1024
+            else {
+                continue
+            }
+            if let cached = known[id], cached.modifiedAt == modifiedAt {
+                annotations[id] = cached
+            } else if let data = try? Data(contentsOf: file),
+                      let text = String(data: data, encoding: .utf8)
+            {
+                annotations[id] = Self.parseAntigravityAnnotation(text, modifiedAt: modifiedAt)
+            }
+        }
+        return annotations
+    }
+
+    static func parseAntigravityAnnotation(_ text: String, modifiedAt: Date) -> AntigravityAnnotation {
+        var title: String?
+        if let match = text.firstMatch(of: #/(?:^|\s)title\s*:\s*"((?:\\.|[^"\\])*)"/#) {
+            title = Self.unescapePbtxtString(String(match.output.1)).flatMap(DesktopUnreadTurnReader.flattened)
+        }
+        var lastUserViewSeconds: Int64?
+        var lastUserViewAt: Date?
+        if let match = text.firstMatch(
+            of: #/last_user_view_time\s*:\s*\{[^}]*\bseconds\s*:\s*(-?\d+)(?:\s+nanos\s*:\s*(-?\d+))?[^}]*\}/#)
+        {
+            if let seconds = Int64(match.output.1) {
+                let nanos = match.output.2.flatMap { Int64($0) } ?? 0
+                lastUserViewSeconds = seconds
+                lastUserViewAt = Date(
+                    timeIntervalSince1970: TimeInterval(seconds) + TimeInterval(nanos) / 1_000_000_000)
+            }
+        }
+        let markedAsUnread = text.contains(#/marked_as_unread\s*:\s*true\b/#)
+        let isArchived = text.contains(#/\barchived\s*:\s*true\b/#)
+        return AntigravityAnnotation(
+            modifiedAt: modifiedAt,
+            title: title,
+            lastUserViewSeconds: lastUserViewSeconds,
+            lastUserViewAt: lastUserViewAt,
+            markedAsUnread: markedAsUnread,
+            isArchived: isArchived)
+    }
+
+    private static func unescapePbtxtString(_ escaped: String) -> String? {
+        var bytes: [UInt8] = []
+        var index = escaped.startIndex
+        while index < escaped.endIndex {
+            let char = escaped[index]
+            guard char == "\\" else {
+                bytes.append(contentsOf: String(char).utf8)
+                index = escaped.index(after: index)
+                continue
+            }
+            let next = escaped.index(after: index)
+            guard next < escaped.endIndex else { break }
+            let code = escaped[next]
+            switch code {
+            case "n":
+                bytes.append(0x0A)
+                index = escaped.index(after: next)
+            case "r":
+                bytes.append(0x0D)
+                index = escaped.index(after: next)
+            case "t":
+                bytes.append(0x09)
+                index = escaped.index(after: next)
+            case "\"":
+                bytes.append(0x22)
+                index = escaped.index(after: next)
+            case "'":
+                bytes.append(0x27)
+                index = escaped.index(after: next)
+            case "\\":
+                bytes.append(0x5C)
+                index = escaped.index(after: next)
+            case "0" ... "7":
+                var end = next
+                var count = 0
+                while end < escaped.endIndex, ("0" ... "7").contains(escaped[end]), count < 3 {
+                    end = escaped.index(after: end)
+                    count += 1
+                }
+                if let value = UInt8(escaped[next ..< end], radix: 8) {
+                    bytes.append(value)
+                }
+                index = end
+            default:
+                bytes.append(contentsOf: String(code).utf8)
+                index = escaped.index(after: next)
+            }
+        }
+        return String(bytes: bytes, encoding: .utf8)
+    }
+
+    private static func openReadonlySQLite(
+        at url: URL,
+        probeTable: String,
+        into handle: inout OpaquePointer?) -> Bool
+    {
+        let openCode = sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil)
+        if openCode == SQLITE_OK {
+            sqlite3_busy_timeout(handle, 1000)
+            if !self.columnNames(of: probeTable, in: handle).isEmpty {
+                return true
+            }
+            let prepareCode = sqlite3_errcode(handle)
+            sqlite3_close(handle)
+            handle = nil
+            // Only fall back to `immutable=1` when a sandbox blocks `-shm` access;
+            // falling back on transient lock errors would hide fresh `-wal` frames.
+            guard prepareCode == SQLITE_CANTOPEN || prepareCode == SQLITE_READONLY else {
+                return false
+            }
+        } else {
+            sqlite3_close(handle)
+            handle = nil
+            guard openCode == SQLITE_CANTOPEN || openCode == SQLITE_READONLY else {
+                return false
+            }
+        }
+        let immutableURI = url.absoluteString + "?immutable=1"
+        guard sqlite3_open_v2(
+            immutableURI,
+            &handle,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_URI,
+            nil) == SQLITE_OK
+        else {
+            sqlite3_close(handle)
+            handle = nil
+            return false
+        }
+        return true
+    }
+
+    private static func antigravityArchivedIDs(in database: OpaquePointer?) -> Set<String> {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let sql = "SELECT DISTINCT conversation_id FROM conversations_fts WHERE archived != 0"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return []
+        }
+        var ids = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let id = Self.text(statement, 0) {
+                ids.insert(id)
+            }
+        }
+        return ids
+    }
+
+    static func antigravitySQLiteDate(_ raw: String) -> Date? {
+        var normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        if let space = normalized.firstIndex(of: " ") {
+            normalized.replaceSubrange(space ... space, with: "T")
+        }
+        if let tIndex = normalized.firstIndex(of: "T") {
+            let timePart = normalized[normalized.index(after: tIndex)...]
+            if !timePart.hasSuffix("Z"),
+               !timePart.hasSuffix("z"),
+               !timePart.contains("+"),
+               !timePart.contains("-")
+            {
+                normalized.append("Z")
+            }
+        }
+        return (try? Date(normalized, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
+            ?? (try? Date(normalized, strategy: Date.ISO8601FormatStyle()))
+    }
+
+    static func antigravityWorkspacePath(_ raw: String) -> String? {
+        guard let data = raw.data(using: .utf8),
+              let uris = try? JSONDecoder().decode([String].self, from: data),
+              let first = uris.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !first.isEmpty
+        else {
+            return nil
+        }
+        if let url = URL(string: first), url.isFileURL {
+            return url.path.isEmpty ? nil : url.path
+        }
+        let stripped = first.hasPrefix("file://") ? String(first.dropFirst("file://".count)) : first
+        return stripped.isEmpty ? nil : stripped
+    }
 }
 
 enum ClaudeShownSession: Equatable, Sendable {
@@ -924,6 +1352,137 @@ struct ClaudeSessionSnapshot: Equatable, Sendable {
     /// Claude is still setting up a new session, such as creating its
     /// worktree, and has not started its first turn or written a transcript.
     var startingSince: Date? = nil
+}
+
+struct AntigravityAnnotation: Equatable, Sendable {
+    let modifiedAt: Date
+    let title: String?
+    let lastUserViewSeconds: Int64?
+    let lastUserViewAt: Date?
+    let markedAsUnread: Bool
+    let isArchived: Bool
+}
+
+struct AntigravitySessionSnapshot: Equatable, Sendable {
+    let id: String
+    let title: String?
+    let preview: String?
+    let workspacePath: String?
+    let lastModifiedAt: Date?
+    let lastModifiedSeconds: Int64
+    let lastUserInputAt: Date?
+    let lastUserViewAt: Date?
+    let lastUserViewSeconds: Int64?
+    let hasAnnotation: Bool
+    let markedAsUnread: Bool
+    let isArchived: Bool
+    let isKilled: Bool
+    let hasActiveRunStatus: Bool
+    let notFullyIdle: Bool
+    let hasForegroundSubagents: Bool
+    let hasBackgroundSubagents: Bool
+    let subagentActivity: String?
+}
+
+/// Tracks Antigravity's unread conversations. Antigravity writes
+/// `last_user_view_time` to `annotations/<id>.pbtxt` when switching views or
+/// focusing its window, and suppresses unread in memory while the user stays in
+/// the focused window watching the active conversation finish. Recording the
+/// `lastModifiedSeconds` observed on that active conversation while Antigravity
+/// is in front keeps it from flashing unread, without hiding turns that finish
+/// in other conversations or while Antigravity is in the background.
+struct AntigravityUnreadTracker {
+    struct Progress: Codable, Equatable {
+        var lastModifiedSeconds: Int64
+        var isWorking: Bool
+    }
+
+    struct State: Codable, Equatable {
+        var progress: [String: Progress] = [:]
+        var viewedSeconds: [String: Int64] = [:]
+    }
+
+    private(set) var sessions: [String: AntigravitySessionSnapshot] = [:]
+    private(set) var state: State
+    private var hasBaseline: Bool
+
+    init(restoring state: State? = nil) {
+        self.state = state ?? State()
+        self.hasBaseline = state != nil
+    }
+
+    mutating func update(
+        sessions: [String: AntigravitySessionSnapshot],
+        foregroundRunningIDs: Set<String>,
+        isAntigravityActive: Bool,
+        now: Date) -> Set<String>
+    {
+        if self.hasBaseline, isAntigravityActive, let shownID = Self.shownSessionID(in: sessions),
+           let shown = sessions[shownID]
+        {
+            let isWorking = foregroundRunningIDs.contains(shownID)
+            let advanced = self.state.progress[shownID].map { previous in
+                shown.lastModifiedSeconds > previous.lastModifiedSeconds
+                    || (previous.isWorking && !isWorking)
+            } ?? true
+            if advanced, shown.lastModifiedSeconds > 0 {
+                self.state.viewedSeconds[shownID] = max(
+                    self.state.viewedSeconds[shownID] ?? 0,
+                    shown.lastModifiedSeconds)
+            }
+        }
+
+        self.sessions = sessions
+        self.state.progress = Dictionary(uniqueKeysWithValues: sessions.map { id, session in
+            (
+                id,
+                Progress(
+                    lastModifiedSeconds: session.lastModifiedSeconds,
+                    isWorking: foregroundRunningIDs.contains(id))
+            )
+        })
+        self.state.viewedSeconds = self.state.viewedSeconds.filter { id, viewed in
+            guard let session = sessions[id], !session.isArchived else { return false }
+            return (session.lastUserViewSeconds ?? 0) < viewed
+        }
+        self.hasBaseline = true
+
+        return Set(sessions.compactMap { id, session -> String? in
+            guard !session.isArchived else { return nil }
+            if session.markedAsUnread {
+                return id
+            }
+            guard !foregroundRunningIDs.contains(id) else { return nil }
+            if !session.hasAnnotation {
+                guard let modifiedAt = session.lastModifiedAt,
+                      now.timeIntervalSince(modifiedAt) < 7 * 24 * 60 * 60
+                else {
+                    return nil
+                }
+            }
+            let viewed = max(session.lastUserViewSeconds ?? 0, self.state.viewedSeconds[id] ?? 0)
+            return session.lastModifiedSeconds > viewed ? id : nil
+        })
+    }
+
+    mutating func markViewed(id: String, at now: Date) {
+        let nowSeconds = Int64(floor(now.timeIntervalSince1970))
+        let sessionModified = self.sessions[id]?.lastModifiedSeconds ?? 0
+        self.state.viewedSeconds[id] = max(
+            self.state.viewedSeconds[id] ?? 0,
+            max(sessionModified, nowSeconds))
+    }
+
+    private static func shownSessionID(in sessions: [String: AntigravitySessionSnapshot]) -> String? {
+        sessions.values
+            .filter { !$0.isArchived }
+            .compactMap { session -> (id: String, at: Date)? in
+                let latest = max(session.lastUserViewAt ?? .distantPast, session.lastUserInputAt ?? .distantPast)
+                return latest > .distantPast ? (session.id, latest) : nil
+            }
+            .max { $0.at < $1.at }?
+            .id
+    }
 }
 
 /// Combines Claude's lagging unread store with the session records the app writes
@@ -1105,30 +1664,52 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private let publish: @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void
     private let publishRunning: @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void
     private let claudeTrackerStateURL: URL?
+    private let antigravityTrackerStateURL: URL?
     private let turns = DesktopUnreadTurnReader()
     private let codexTurnStates = CodexTurnStateReader()
     private let claudeBackgroundTasks = ClaudeBackgroundTaskReader()
     private let claudeActivities = ClaudeActivityReader()
+    private let antigravityActivities = AntigravityActivityReader()
     private var stream: FSEventStreamRef?
     private var codexPaths: Set<String> = []
     private var codexSessionsPrefix: String?
     private var backgroundTasksPrefix: String?
     private var claudePrefixes: [String] = []
+    private var antigravitySummaryDBPath: String?
+    private var antigravitySummaryProtoPath: String?
+    private var antigravityAnnotationsPrefix: String?
+    private var antigravityBrainPrefix: String?
+    private var antigravityConversationsPrefix: String?
     private var claudeTracker = ClaudeUnreadTracker()
     private var savedClaudeTrackerState: ClaudeUnreadTracker.State?
+    private var antigravityTracker = AntigravityUnreadTracker()
+    private var savedAntigravityTrackerState: AntigravityUnreadTracker.State?
+    private var antigravityAnnotations: [String: AntigravityAnnotation] = [:]
     private var claudeRecountScheduledAt: Date?
     private var claudeRereadScheduled = false
+    private var antigravityStateRecountScheduled = false
+    private var antigravityRetryScheduled = false
     private var codexRunningIDs: Set<String> = []
     private var claudeRunningIDs: Set<String> = []
     private var claudeWaitingIDs: Set<String> = []
     private var claudeBackgroundIDs: Set<String> = []
+    private var antigravityRunningIDs: Set<String> = []
+    private var antigravityWaitingIDs: Set<String> = []
     private var isClaudeActive = true
+    private var isAntigravityActive = true
     private var claudeLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
+    private var antigravityLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
     }
     private lazy var claudeTranscripts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .claude)
+    }
+    private lazy var antigravityTranscripts = AppendedFileWatcher(queue: self.queue) { [weak self] in
+        self?.scheduleAppendRecount(of: .antigravity)
+    }
+    private lazy var antigravityStateFiles = AppendedFileWatcher(queue: self.queue) { [weak self] in
+        self?.scheduleAntigravityStateRecount()
     }
     private var appendRecountsScheduled: Set<TokenPlatform> = []
     private var isStopped = false
@@ -1136,11 +1717,13 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     init(
         reader: DesktopUnreadTaskReader,
         claudeTrackerStateURL: URL?,
+        antigravityTrackerStateURL: URL? = nil,
         publish: @escaping @Sendable (TokenPlatform, [DesktopUnreadTask], Set<String>?) -> Void,
         publishRunning: @escaping @Sendable (TokenPlatform, [DesktopRunningTask]) -> Void)
     {
         self.reader = reader
         self.claudeTrackerStateURL = claudeTrackerStateURL
+        self.antigravityTrackerStateURL = antigravityTrackerStateURL
         self.publish = publish
         self.publishRunning = publishRunning
     }
@@ -1148,6 +1731,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     func start() {
         self.queue.async {
             self.restoreClaudeTracker()
+            self.restoreAntigravityTracker()
             self.startStream()
             self.recount(DesktopUnreadTaskReader.platforms)
             self.recountCodexRunning()
@@ -1160,6 +1744,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.isStopped = true
             self.codexRollouts.watch([])
             self.claudeTranscripts.watch([])
+            self.antigravityTranscripts.watch([])
+            self.antigravityStateFiles.watch([])
             guard let stream = self.stream else { return }
             FSEventStreamStop(stream)
             FSEventStreamInvalidate(stream)
@@ -1174,6 +1760,15 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    func markAntigravityViewed(id: String, at now: Date) {
+        self.queue.async {
+            guard !self.isStopped else { return }
+            self.antigravityTracker.markViewed(id: id, at: now)
+            self.saveAntigravityTracker()
+            self.recount([.antigravity])
+        }
+    }
+
     /// Claude coming to the front shows the user the session in its window.
     func setClaudeActive(_ isActive: Bool) {
         self.queue.async {
@@ -1181,6 +1776,16 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.isClaudeActive = isActive
             if isActive, !self.isStopped {
                 self.recount([.claude])
+            }
+        }
+    }
+
+    func setAntigravityActive(_ isActive: Bool) {
+        self.queue.async {
+            guard isActive != self.isAntigravityActive else { return }
+            self.isAntigravityActive = isActive
+            if isActive, !self.isStopped {
+                self.recount([.antigravity])
             }
         }
     }
@@ -1213,6 +1818,14 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 claudeRoot + "/Local Storage/leveldb/",
                 claudeRoot + "/claude-code-sessions/",
             ]
+        }
+        if let antigravityRoot = Self.canonicalPath(self.reader.antigravityHome) {
+            roots.append(antigravityRoot)
+            self.antigravitySummaryDBPath = antigravityRoot + "/conversation_summaries.db"
+            self.antigravitySummaryProtoPath = antigravityRoot + "/agyhub_summaries_proto.pb"
+            self.antigravityAnnotationsPrefix = antigravityRoot + "/annotations/"
+            self.antigravityBrainPrefix = antigravityRoot + "/brain/"
+            self.antigravityConversationsPrefix = antigravityRoot + "/conversations/"
         }
         guard !roots.isEmpty else { return }
 
@@ -1263,10 +1876,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 | kFSEventStreamEventFlagKernelDropped)
         var changed = Set<TokenPlatform>()
         var codexRolloutChanged = false
+        var antigravityTranscriptChanged = false
         for (index, path) in paths.enumerated() {
             if index < flags.count, flags[index] & rescanFlags != 0 {
                 changed.formUnion(DesktopUnreadTaskReader.platforms)
                 codexRolloutChanged = true
+                antigravityTranscriptChanged = true
                 break
             }
             if self.codexPaths.contains(path) {
@@ -1277,8 +1892,30 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                       path.hasPrefix(prefix) || path == String(prefix.dropLast())
             {
                 codexRolloutChanged = true
+                antigravityTranscriptChanged = true
             } else if self.claudePrefixes.contains(where: { path.hasPrefix($0) }) {
                 changed.insert(.claude)
+            } else if let summaryDB = self.antigravitySummaryDBPath,
+                      path == summaryDB || path.hasPrefix(summaryDB + "-")
+            {
+                changed.insert(.antigravity)
+            } else if let summaryProto = self.antigravitySummaryProtoPath,
+                      path == summaryProto
+            {
+                changed.insert(.antigravity)
+            } else if let annotations = self.antigravityAnnotationsPrefix,
+                      path.hasPrefix(annotations) || path == String(annotations.dropLast())
+            {
+                changed.insert(.antigravity)
+            } else if let conversations = self.antigravityConversationsPrefix,
+                      path.hasPrefix(conversations) || path == String(conversations.dropLast())
+            {
+                changed.insert(.antigravity)
+            } else if let brain = self.antigravityBrainPrefix,
+                      path.hasPrefix(brain),
+                      path.hasSuffix("/transcript.jsonl") || path.hasSuffix("/transcript_full.jsonl")
+            {
+                antigravityTranscriptChanged = true
             }
         }
         self.recount(DesktopUnreadTaskReader.platforms.filter { changed.contains($0) })
@@ -1286,6 +1923,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         // creates its rollout before the vnode watch covers it.
         if changed.contains(.codex) || codexRolloutChanged {
             self.recountCodexRunning()
+        }
+        if !changed.contains(.antigravity), antigravityTranscriptChanged {
+            self.recountAntigravityRunning()
         }
         if changed.contains(.claude) {
             self.scheduleClaudeReread()
@@ -1303,6 +1943,33 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func scheduleAntigravityStateRecount() {
+        guard !self.antigravityStateRecountScheduled else { return }
+        self.antigravityStateRecountScheduled = true
+        self.queue.asyncAfter(deadline: .now() + 0.25) {
+            self.antigravityStateRecountScheduled = false
+            self.recount([.antigravity])
+        }
+    }
+
+    private func scheduleAntigravityRetry() {
+        guard !self.antigravityRetryScheduled else { return }
+        self.antigravityRetryScheduled = true
+        self.queue.asyncAfter(deadline: .now() + 0.5) {
+            self.antigravityRetryScheduled = false
+            self.recount([.antigravity])
+        }
+    }
+
+    private func watchAntigravityStateFiles() {
+        let candidates = [
+            self.reader.antigravityHome.appendingPathComponent("conversation_summaries.db").path,
+            self.reader.antigravityHome.appendingPathComponent("conversation_summaries.db-wal").path,
+            self.reader.antigravityHome.appendingPathComponent("agyhub_summaries_proto.pb").path,
+        ]
+        self.antigravityStateFiles.watch(Set(candidates.filter { FileManager.default.fileExists(atPath: $0) }))
+    }
+
     private func scheduleAppendRecount(of platform: TokenPlatform) {
         guard self.appendRecountsScheduled.insert(platform).inserted else { return }
         self.queue.asyncAfter(deadline: .now() + Self.appendCoalescingDelay) {
@@ -1312,6 +1979,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 self.recountCodexRunning()
             case .claude:
                 self.recountClaudeRunning()
+            case .antigravity:
+                self.recountAntigravityRunning()
             default:
                 break
             }
@@ -1326,6 +1995,16 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns), nil)
             case .claude:
                 self.recountClaude(sessions: self.reader.claudeSessions(reusing: self.claudeTracker.sessions))
+            case .antigravity:
+                let (sessions, annotations, needsRetry) = self.reader.antigravitySessions(
+                    reusingSessions: self.antigravityTracker.sessions,
+                    reusingAnnotations: self.antigravityAnnotations)
+                self.antigravityAnnotations = annotations
+                self.watchAntigravityStateFiles()
+                self.recountAntigravity(sessions: sessions)
+                if needsRetry {
+                    self.scheduleAntigravityRetry()
+                }
             default:
                 continue
             }
@@ -1410,7 +2089,153 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             guard !self.isStopped else { return }
             self.recountCodexRunning()
             self.recountClaudeRunning()
+            self.recountAntigravityRunning()
             self.scheduleRunningRefresh()
+        }
+    }
+
+    private func recountAntigravity(sessions: [String: AntigravitySessionSnapshot]) {
+        let now = Date()
+        let (running, waiting, transcripts) = self.antigravityRunningTasks(sessions, now: now)
+        let foregroundIDs = Set(running.filter { !$0.isInBackground }.map(\.id))
+        let unreadIDs = self.antigravityTracker.update(
+            sessions: sessions,
+            foregroundRunningIDs: foregroundIDs,
+            isAntigravityActive: self.isAntigravityActive,
+            now: now)
+        let watchedPaths = Set(transcripts.values.map(\.path))
+        self.antigravityTranscripts.watch(watchedPaths)
+        self.antigravityActivities.forget(except: watchedPaths)
+        self.antigravityRunningIDs = Set(running.map(\.id))
+        self.antigravityWaitingIDs = waiting
+        self.publish(
+            .antigravity,
+            self.antigravityTasks(unreadIDs, sessions: sessions),
+            Set(sessions.filter { !$0.value.isArchived }.keys))
+        self.publishRunning(.antigravity, running)
+        self.saveAntigravityTracker()
+    }
+
+    private func recountAntigravityRunning() {
+        self.recount([.antigravity])
+    }
+
+    private func antigravityRunningTasks(
+        _ sessions: [String: AntigravitySessionSnapshot],
+        now: Date) -> (tasks: [DesktopRunningTask], waiting: Set<String>, transcripts: [String: URL])
+    {
+        var waiting = Set<String>()
+        var transcripts: [String: URL] = [:]
+        let externalBackground = CodexBackgroundTaskReader(directory: self.reader.backgroundTasksDirectory)
+            .tasks(platform: TokenPlatform.antigravity.rawValue, now: now)
+        self.antigravityLaunch = self.reader.antigravityLaunch(reusing: self.antigravityLaunch)
+        let isAppRunning = self.antigravityLaunch != nil
+
+        let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
+            guard !session.isArchived else { return nil }
+            let externalTask = externalBackground[id].map { task in
+                DesktopRunningTask(
+                    platform: .antigravity,
+                    id: id,
+                    title: session.title ?? task.name,
+                    startedAt: task.startedAt,
+                    activity: task.activity,
+                    isInBackground: true,
+                    isInterrupted: task.isInterrupted)
+            }
+            guard isAppRunning, !session.isKilled else {
+                return externalTask
+            }
+            let wantsStatusCheck = session.hasActiveRunStatus
+                || session.notFullyIdle
+                || session.hasForegroundSubagents
+                || session.hasBackgroundSubagents
+                || self.antigravityWaitingIDs.contains(id)
+                || session.lastModifiedAt.map({ now.timeIntervalSince($0) < 6 * 60 * 60 }) == true
+            guard wantsStatusCheck else {
+                return externalTask
+            }
+
+            var transcriptActivity: String?
+            var transcriptModifiedAt: Date?
+            if let transcript = self.reader.antigravityTranscriptURL(conversationID: id),
+               let attributes = try? FileManager.default.attributesOfItem(atPath: transcript.path),
+               let size = (attributes[.size] as? NSNumber)?.uint64Value,
+               let modifiedAt = attributes[.modificationDate] as? Date
+            {
+                transcriptModifiedAt = modifiedAt
+                if session.hasActiveRunStatus || session.notFullyIdle || session.hasForegroundSubagents
+                    || session.hasBackgroundSubagents
+                    || now.timeIntervalSince(modifiedAt) < DesktopRunningTaskLiveness.quietLimit
+                {
+                    transcripts[id] = transcript
+                }
+                if self.turns.antigravityWaitingForUser(
+                    transcript: transcript,
+                    size: size,
+                    modifiedAt: modifiedAt)
+                {
+                    waiting.insert(id)
+                    return externalTask
+                }
+                if session.hasActiveRunStatus || session.notFullyIdle
+                    || session.hasForegroundSubagents || session.hasBackgroundSubagents
+                {
+                    transcriptActivity = self.antigravityActivities.activity(in: transcript, size: size)
+                }
+            }
+
+            let latestActivityAt = max(
+                session.lastModifiedAt ?? .distantPast,
+                transcriptModifiedAt ?? .distantPast)
+            if session.hasActiveRunStatus || session.hasForegroundSubagents,
+               now.timeIntervalSince(latestActivityAt) < DesktopRunningTaskLiveness.quietLimit
+            {
+                return DesktopRunningTask(
+                    platform: .antigravity,
+                    id: id,
+                    title: session.title,
+                    startedAt: session.lastUserInputAt ?? session.lastModifiedAt,
+                    activity: transcriptActivity ?? session.subagentActivity)
+            }
+
+            if session.notFullyIdle || session.hasBackgroundSubagents {
+                return DesktopRunningTask(
+                    platform: .antigravity,
+                    id: id,
+                    title: session.title,
+                    startedAt: session.lastModifiedAt,
+                    activity: session.subagentActivity ?? transcriptActivity,
+                    isInBackground: true)
+            }
+
+            return externalTask
+        }.sorted {
+            ($0.startedAt ?? .distantPast, $0.id) > ($1.startedAt ?? .distantPast, $1.id)
+        }
+        return (tasks, waiting, transcripts)
+    }
+
+    private func antigravityTasks(
+        _ ids: Set<String>,
+        sessions: [String: AntigravitySessionSnapshot]) -> [DesktopUnreadTask]
+    {
+        ids.compactMap { id -> DesktopUnreadTask? in
+            guard let session = sessions[id] else { return nil }
+            let turn = self.reader.antigravityTranscriptURL(conversationID: id).map {
+                self.turns.antigravityTurn(transcriptURL: $0, fallbackPreview: session.preview)
+            }
+            return DesktopUnreadTask(
+                platform: .antigravity,
+                id: id,
+                title: session.title,
+                prompt: turn?.prompt,
+                reply: turn?.reply,
+                turnDuration: turn?.duration,
+                workspacePath: session.workspacePath,
+                updatedAt: session.lastModifiedAt)
+        }.sorted {
+            ($0.updatedAt ?? .distantPast, $0.id) > ($1.updatedAt ?? .distantPast, $1.id)
         }
     }
 
@@ -1569,6 +2394,34 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func restoreAntigravityTracker() {
+        guard let url = self.antigravityTrackerStateURL,
+              let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(AntigravityUnreadTracker.State.self, from: data)
+        else {
+            return
+        }
+        self.antigravityTracker = AntigravityUnreadTracker(restoring: state)
+        self.savedAntigravityTrackerState = state
+    }
+
+    private func saveAntigravityTracker() {
+        guard let url = self.antigravityTrackerStateURL,
+              self.antigravityTracker.state != self.savedAntigravityTrackerState
+        else {
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try JSONEncoder().encode(self.antigravityTracker.state).write(to: url, options: [.atomic])
+            self.savedAntigravityTrackerState = self.antigravityTracker.state
+        } catch {
+            NSLog("TokenBar could not save the Antigravity unread state: %@", String(describing: error))
+        }
+    }
+
     private static func canonicalPath(_ url: URL) -> String? {
         guard let resolved = realpath(url.path, nil) else { return nil }
         defer { free(resolved) }
@@ -1600,7 +2453,7 @@ final class AppendedFileWatcher {
             guard descriptor >= 0 else { continue }
             let source = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: descriptor,
-                eventMask: [.write, .extend, .delete, .rename],
+                eventMask: [.write, .extend, .attrib, .delete, .rename],
                 queue: self.queue)
             source.setEventHandler { [weak self, weak source] in
                 guard let self, let source else { return }
