@@ -266,6 +266,25 @@ final class DesktopUnreadTurnReader {
         return nil
     }
 
+    /// Antigravity serializes each value in `tool_calls[].args` as a JSON
+    /// fragment string in `transcript.jsonl`.
+    static func antigravityArgumentValue(_ raw: Any?) -> Any? {
+        guard let text = raw as? String else { return raw }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first,
+              first == "\"" || first == "{" || first == "[" || trimmed == "true" || trimmed == "false",
+              let data = trimmed.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        else {
+            return text
+        }
+        return decoded
+    }
+
+    static func antigravityArgumentString(_ args: [String: Any], _ key: String) -> String? {
+        self.antigravityArgumentValue(args[key]) as? String
+    }
+
     /// An Antigravity tool call by its own summary, or else by the file,
     /// command, search, or subagent it works on.
     static func antigravityToolActivity(_ call: [String: Any]) -> String? {
@@ -274,20 +293,25 @@ final class DesktopUnreadTurnReader {
             ?? (call["arguments"] as? [String: Any])
             ?? [:]
         for key in ["toolSummary", "toolAction", "Description"] {
-            if let summary = (args[key] as? String).flatMap(self.flattened) {
+            if let summary = self.antigravityArgumentString(args, key).flatMap(self.flattened) {
                 return summary
             }
         }
         if name == "invoke_subagent",
-           let role = (args["Role"] as? String).flatMap(self.flattened)
+           let role = self.antigravityArgumentString(args, "Role").flatMap(self.flattened)
         {
             return "Subagent · \(role)"
         }
-        if let path = (args["Path"] as? String)
-            ?? (args["TargetFile"] as? String)
-            ?? (args["AbsolutePath"] as? String)
-            ?? (args["DirectoryPath"] as? String)
-            ?? (args["SearchPath"] as? String),
+        if name == "schedule",
+           let prompt = self.antigravityArgumentString(args, "Prompt").flatMap(self.flattened)
+        {
+            return "Schedule · \(prompt)"
+        }
+        if let path = self.antigravityArgumentString(args, "Path")
+            ?? self.antigravityArgumentString(args, "TargetFile")
+            ?? self.antigravityArgumentString(args, "AbsolutePath")
+            ?? self.antigravityArgumentString(args, "DirectoryPath")
+            ?? self.antigravityArgumentString(args, "SearchPath"),
             !path.isEmpty
         {
             let fileName = URL(fileURLWithPath: path).lastPathComponent
@@ -301,7 +325,8 @@ final class DesktopUnreadTurnReader {
             case "list_dir":
                 return "List \(fileName)"
             case "grep_search", "find_by_name":
-                if let query = ((args["Query"] as? String) ?? (args["Pattern"] as? String))
+                if let query = (self.antigravityArgumentString(args, "Query")
+                    ?? self.antigravityArgumentString(args, "Pattern"))
                     .flatMap(self.flattened)
                 {
                     return "Search \(query) in \(fileName)"
@@ -319,7 +344,7 @@ final class DesktopUnreadTurnReader {
             ("Url", "Read"),
             ("url", "Read"),
         ] {
-            if let line = (args[key] as? String)?
+            if let line = self.antigravityArgumentString(args, key)?
                 .split(separator: "\n")
                 .first
                 .flatMap({ self.flattened(String($0)) })
@@ -347,7 +372,7 @@ final class DesktopUnreadTurnReader {
         }
     }
 
-    private static func antigravityTimestamp(_ object: [String: Any]) -> Date? {
+    static func antigravityTimestamp(_ object: [String: Any]) -> Date? {
         guard let raw = object["created_at"] as? String else { return nil }
         return (try? Date(raw, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
             ?? (try? Date(raw, strategy: Date.ISO8601FormatStyle()))
@@ -431,8 +456,8 @@ final class DesktopUnreadTurnReader {
             let args = (call["args"] as? [String: Any])
                 ?? (call["arguments"] as? [String: Any])
                 ?? [:]
-            if let metadata = args["ArtifactMetadata"] as? [String: Any],
-               metadata["RequestFeedback"] as? Bool == true
+            if let metadata = self.antigravityArgumentValue(args["ArtifactMetadata"]) as? [String: Any],
+               (self.antigravityArgumentValue(metadata["RequestFeedback"]) as? Bool) == true
             {
                 return true
             }
@@ -449,21 +474,25 @@ final class DesktopUnreadTurnReader {
                 ?? (call["arguments"] as? [String: Any])
                 ?? [:]
             if name == "ask_question" {
-                let questions = (args["questions"] as? [[String: Any]] ?? [])
-                    .compactMap { $0["question"] as? String }
+                let questions = (self.antigravityArgumentValue(args["questions"]) as? [[String: Any]] ?? [])
+                    .compactMap { self.antigravityArgumentValue($0["question"]) as? String }
                 texts.append(questions.isEmpty ? "Waiting for your answer" : questions.joined(separator: " "))
-            } else if let metadata = args["ArtifactMetadata"] as? [String: Any],
-                      metadata["RequestFeedback"] as? Bool == true
+            } else if let metadata = self.antigravityArgumentValue(args["ArtifactMetadata"]) as? [String: Any],
+                      (self.antigravityArgumentValue(metadata["RequestFeedback"]) as? Bool) == true
             {
-                if let summary = (metadata["Summary"] as? String).flatMap(self.replySummary) {
+                if let summary = (self.antigravityArgumentValue(metadata["Summary"]) as? String)
+                    .flatMap(self.replySummary)
+                {
                     texts.append(summary)
-                } else if let path = (args["Path"] as? String) ?? (args["TargetFile"] as? String) {
+                } else if let path = self.antigravityArgumentString(args, "Path")
+                    ?? self.antigravityArgumentString(args, "TargetFile")
+                {
                     texts.append("Review \(URL(fileURLWithPath: path).lastPathComponent)")
                 } else {
                     texts.append("Waiting for review")
                 }
             } else if name == "notify_user",
-                      let message = (args["Message"] as? String).flatMap(self.replySummary)
+                      let message = self.antigravityArgumentString(args, "Message").flatMap(self.replySummary)
             {
                 texts.append(message)
             }

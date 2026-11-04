@@ -1638,9 +1638,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
 
     private func openSessionInApp(_ session: SessionSummary) {
         do {
-            try self.sessionLauncher.open(session)
-            if session.platformID == .antigravity || session.platformID == .codex {
-                self.unreadTasks.markOpened(platform: session.platformID, id: session.id)
+            try self.sessionLauncher.open(session) { [weak self] unreadTaskID in
+                self?.unreadTasks.markOpened(platform: session.platformID, id: unreadTaskID)
             }
         } catch {
             self.showOpenSessionError(error)
@@ -1651,8 +1650,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
     /// Antigravity.
     func openUnreadTask(platform: TokenPlatform, id: String) {
         do {
-            try self.sessionLauncher.openUnreadTask(platform: platform, id: id)
-            self.unreadTasks.markOpened(platform: platform, id: id)
+            try self.sessionLauncher.openUnreadTask(platform: platform, id: id) { [weak self] openedID in
+                self?.unreadTasks.markOpened(platform: platform, id: openedID)
+            }
         } catch {
             self.showOpenSessionError(error)
         }

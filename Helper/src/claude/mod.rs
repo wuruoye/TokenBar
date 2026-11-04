@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::pricing::AnthropicPricing;
 use crate::usage::{
-    content_preview_from_str, normalize_workspace_key, workspace_label_from_key,
-    CacheWriteBreakdown, CostSource, TokenBreakdown, UnifiedMessage,
+    content_preview_from_str, normalize_reasoning_effort, normalize_workspace_key,
+    workspace_label_from_key, CacheWriteBreakdown, CostSource, TokenBreakdown, UnifiedMessage,
 };
 use crate::RequestDetail;
 
@@ -44,7 +44,7 @@ pub fn parse_local_claude_messages(
     pricing: &AnthropicPricing,
 ) -> Result<Vec<UnifiedMessage>, String> {
     let paths = discover_claude_files(&options)?;
-    let session_aliases = desktop_session_aliases(&options);
+    let (session_aliases, session_efforts) = desktop_session_metadata(&options);
     let parsed = paths
         .par_iter()
         .map(|path| parse_claude_file(path))
@@ -58,6 +58,11 @@ pub fn parse_local_claude_messages(
             message.session_path = Some(path_text.clone());
             if let Some(current_id) = session_aliases.get(&message.session_id) {
                 message.session_id.clone_from(current_id);
+            }
+            if message.reasoning_effort.is_none() {
+                if let Some(effort) = session_efforts.get(&message.session_id) {
+                    message.reasoning_effort = Some(effort.clone());
+                }
             }
             if message
                 .dedup_key
@@ -92,19 +97,30 @@ pub fn parse_local_claude_messages(
 // Desktop can replace its CLI session ID while retaining the same conversation.
 // Only its explicit prior-ID mapping joins transcripts; shared titles or replayed
 // messages also occur in independent forks and cannot establish this relation.
-fn desktop_session_aliases(options: &LocalParseOptions) -> HashMap<String, String> {
+fn desktop_session_metadata(
+    options: &LocalParseOptions,
+) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut efforts: HashMap<String, String> = HashMap::new();
     for record in desktop_session_records(options.home_dir.as_deref()) {
         let Some(current) = record.get("cliSessionId").and_then(Value::as_str)
             .filter(|id| !id.is_empty()) else { continue };
+        if let Some(effort) = record
+            .get("effort")
+            .and_then(Value::as_str)
+            .and_then(normalize_reasoning_effort)
+        {
+            efforts.insert(current.to_string(), effort);
+        }
         let Some(prior_ids) = record.get("priorCliSessionIds").and_then(Value::as_array) else { continue };
         for prior in prior_ids.iter().filter_map(Value::as_str).filter(|id| !id.is_empty() && *id != current) {
             candidates.entry(prior.to_string()).or_default().insert(current.to_string());
         }
     }
-    candidates.into_iter().filter_map(|(prior, targets)| {
+    let aliases = candidates.into_iter().filter_map(|(prior, targets)| {
         (targets.len() == 1).then(|| (prior, targets.into_iter().next().unwrap()))
-    }).collect()
+    }).collect();
+    (aliases, efforts)
 }
 
 /// Maps each Desktop session's current CLI session ID to its sidebar title.
@@ -290,8 +306,10 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut pending_turn_start = false;
     let mut request_started_at = None;
     let mut api_request_started_at = HashMap::new();
+    let mut api_request_effort = HashMap::new();
     let mut last_model = None;
     let mut last_provider = None;
+    let mut last_effort = None;
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let mut dedup_indices = HashMap::new();
 
@@ -305,11 +323,13 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         // tag these entries with the parent session and no `isSidechain`, so
         // record them before the session filter below.
         if entry.get("type").and_then(Value::as_str) == Some("api-request") {
-            if let (Some(id), Some(timestamp)) = (
-                entry.get("id").and_then(Value::as_str),
-                entry_timestamp_ms(&entry),
-            ) {
-                api_request_started_at.insert(id.to_string(), timestamp);
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                if let Some(timestamp) = entry_timestamp_ms(&entry) {
+                    api_request_started_at.insert(id.to_string(), timestamp);
+                }
+                if let Some(effort) = extract_api_request_effort(&entry) {
+                    api_request_effort.insert(id.to_string(), effort);
+                }
             }
             continue;
         }
@@ -388,6 +408,17 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         }
         let provider = canonical_provider(explicit_provider.as_deref(), &raw_model);
         let model = canonical_model(&raw_model);
+        let reasoning_effort = extract_entry_effort(&entry, message)
+            .or_else(|| {
+                entry
+                    .get("requestRef")
+                    .and_then(Value::as_str)
+                    .and_then(|id| api_request_effort.get(id).cloned())
+            })
+            .or_else(|| last_effort.clone());
+        if reasoning_effort.is_some() {
+            last_effort.clone_from(&reasoning_effort);
+        }
         let timestamp = entry_timestamp_ms(&entry).unwrap_or(fallback_timestamp);
         let request_id = entry.get("requestId").and_then(Value::as_str);
         let message_id = message.get("id").and_then(Value::as_str);
@@ -437,6 +468,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
                 &mut messages[index],
                 &tokens,
                 cache_write_breakdown.as_ref(),
+                reasoning_effort.as_deref(),
                 timestamp,
                 request_started_at,
                 generation_started_at,
@@ -457,6 +489,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         );
         unified.physical_session_id = Some(physical_session_id.clone());
         unified.cache_write_breakdown = cache_write_breakdown;
+        unified.reasoning_effort = reasoning_effort;
         unified.is_subagent = is_subagent;
         unified.dedup_key.clone_from(&dedup_key);
         unified.duration_ms = request_started_at
@@ -487,6 +520,7 @@ fn merge_streaming_duplicate(
     existing: &mut UnifiedMessage,
     tokens: &TokenBreakdown,
     cache_write_breakdown: Option<&CacheWriteBreakdown>,
+    reasoning_effort: Option<&str>,
     timestamp: i64,
     request_started_at: Option<i64>,
     generation_started_at: Option<i64>,
@@ -497,6 +531,9 @@ fn merge_streaming_duplicate(
     existing.tokens.cache_read = existing.tokens.cache_read.max(tokens.cache_read);
     existing.tokens.cache_write = existing.tokens.cache_write.max(tokens.cache_write);
     existing.tokens.reasoning = existing.tokens.reasoning.max(tokens.reasoning);
+    if existing.reasoning_effort.is_none() {
+        existing.reasoning_effort = reasoning_effort.map(str::to_string);
+    }
     if let Some(incoming) = cache_write_breakdown {
         let existing = existing
             .cache_write_breakdown
@@ -537,6 +574,46 @@ fn thinking_tokens(usage: &Value) -> i64 {
             .and_then(|details| details.get("thinking_tokens")),
     )
     .max(0)
+}
+
+fn extract_entry_effort(entry: &Value, message: &Value) -> Option<String> {
+    for candidate in [
+        entry.get("perTurnEffort"),
+        entry.get("effort"),
+        entry.get("reasoningEffort"),
+        message.get("perTurnEffort"),
+        message.get("effort"),
+        message.get("reasoningEffort"),
+    ] {
+        if let Some(normalized) = candidate
+            .and_then(Value::as_str)
+            .and_then(normalize_reasoning_effort)
+        {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn extract_api_request_effort(entry: &Value) -> Option<String> {
+    let params = entry.get("params")?;
+    for candidate in [
+        params
+            .get("output_config")
+            .and_then(|config| config.get("effort")),
+        params.get("effort"),
+        params
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort")),
+    ] {
+        if let Some(normalized) = candidate
+            .and_then(Value::as_str)
+            .and_then(normalize_reasoning_effort)
+        {
+            return Some(normalized);
+        }
+    }
+    None
 }
 
 /// Moves Claude's thinking tokens out of the raw output total.

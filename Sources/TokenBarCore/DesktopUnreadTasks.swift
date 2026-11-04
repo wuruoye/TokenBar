@@ -724,7 +724,7 @@ struct DesktopUnreadTaskReader: Sendable {
         unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     }
 
-    private func codexStateDatabaseURL() -> URL? {
+    func codexStateDatabaseURL() -> URL? {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: self.codexHome.path) else {
             return nil
         }
@@ -738,6 +738,34 @@ struct DesktopUnreadTaskReader: Sendable {
             return (version, name)
         }.max { $0.version < $1.version }
         return newest.map { self.codexHome.appendingPathComponent($0.name, isDirectory: false) }
+    }
+
+    func visibleCodexThreadIDs() -> Set<String>? {
+        guard let databaseURL = self.codexStateDatabaseURL() else { return nil }
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            return nil
+        }
+        sqlite3_busy_timeout(database, 1000)
+        let sql = """
+            SELECT id
+            FROM threads
+            WHERE archived = 0
+              AND COALESCE(source, '') NOT LIKE '{"subagent"%'
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return nil
+        }
+        var ids = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let id = Self.text(statement, 0) {
+                ids.insert(id)
+            }
+        }
+        return ids
     }
 
     // MARK: Claude
@@ -1101,6 +1129,7 @@ struct DesktopUnreadTaskReader: Sendable {
         var foregroundSubagents = Set<String>()
         var backgroundSubagents = Set<String>()
         var subagentActivities: [String: [String]] = [:]
+        var subagentStartedAt: [String: Date] = [:]
         for row in rows.values where row.parentID != nil && !row.isKilled {
             guard row.hasActiveRunStatus || row.notFullyIdle else { continue }
             var current = row.id
@@ -1114,6 +1143,13 @@ struct DesktopUnreadTaskReader: Sendable {
                 foregroundSubagents.insert(current)
             } else {
                 backgroundSubagents.insert(current)
+            }
+            if let startedAt = row.lastUserInputAt ?? row.lastModifiedAt {
+                if let existing = subagentStartedAt[current] {
+                    subagentStartedAt[current] = min(existing, startedAt)
+                } else {
+                    subagentStartedAt[current] = startedAt
+                }
             }
             if let label = row.agentName ?? row.title {
                 let text = "Subagent · \(label)"
@@ -1151,7 +1187,8 @@ struct DesktopUnreadTaskReader: Sendable {
                 notFullyIdle: row.notFullyIdle,
                 hasForegroundSubagents: foregroundSubagents.contains(row.id),
                 hasBackgroundSubagents: backgroundSubagents.contains(row.id),
-                subagentActivity: subagentActivities[row.id].map { $0.joined(separator: " · ") })
+                subagentActivity: subagentActivities[row.id].map { $0.joined(separator: " · ") },
+                subagentStartedAt: subagentStartedAt[row.id])
         }
         return (sessions, annotations, false)
     }
@@ -1417,6 +1454,7 @@ struct AntigravitySessionSnapshot: Equatable, Sendable {
     let hasForegroundSubagents: Bool
     let hasBackgroundSubagents: Bool
     let subagentActivity: String?
+    var subagentStartedAt: Date? = nil
 
     func focusAt(includingInput: Bool) -> Date? {
         let viewAt = self.lastUserViewAt ?? .distantPast
@@ -1460,6 +1498,7 @@ struct AntigravityUnreadTracker {
         /// Antigravity rewrites the outgoing conversation's annotation while
         /// TokenBar switches the window to another conversation.
         var unseenViewMillis: [String: Int64] = [:]
+        var waitingUnreadIDs: Set<String> = []
         var shownSessionID: String? = nil
         var focusChanges: [ClaudeFocusChange] = []
 
@@ -1467,12 +1506,14 @@ struct AntigravityUnreadTracker {
             progress: [String: Progress] = [:],
             viewedSeconds: [String: Int64] = [:],
             unseenViewMillis: [String: Int64] = [:],
+            waitingUnreadIDs: Set<String> = [],
             shownSessionID: String? = nil,
             focusChanges: [ClaudeFocusChange] = [])
         {
             self.progress = progress
             self.viewedSeconds = viewedSeconds
             self.unseenViewMillis = unseenViewMillis
+            self.waitingUnreadIDs = waitingUnreadIDs
             self.shownSessionID = shownSessionID
             self.focusChanges = focusChanges
         }
@@ -1482,6 +1523,7 @@ struct AntigravityUnreadTracker {
             self.progress = try container.decodeIfPresent([String: Progress].self, forKey: .progress) ?? [:]
             self.viewedSeconds = try container.decodeIfPresent([String: Int64].self, forKey: .viewedSeconds) ?? [:]
             self.unseenViewMillis = try container.decodeIfPresent([String: Int64].self, forKey: .unseenViewMillis) ?? [:]
+            self.waitingUnreadIDs = try container.decodeIfPresent(Set<String>.self, forKey: .waitingUnreadIDs) ?? []
             self.shownSessionID = try container.decodeIfPresent(String.self, forKey: .shownSessionID)
             self.focusChanges = try container.decodeIfPresent([ClaudeFocusChange].self, forKey: .focusChanges) ?? []
         }
@@ -1499,6 +1541,7 @@ struct AntigravityUnreadTracker {
     private(set) var state: State
     private var hasBaseline: Bool
     private var pendingOpen: PendingOpen?
+    private var waiting: Set<String> = []
 
     init(restoring state: State? = nil) {
         self.state = state ?? State()
@@ -1508,6 +1551,7 @@ struct AntigravityUnreadTracker {
     mutating func update(
         sessions: [String: AntigravitySessionSnapshot],
         foregroundRunningIDs: Set<String>,
+        waiting: Set<String> = [],
         isAntigravityActive: Bool,
         now: Date) -> Set<String>
     {
@@ -1617,9 +1661,20 @@ struct AntigravityUnreadTracker {
             }
         }
 
+        let activeShownID = isAntigravityActive
+            ? (self.state.shownSessionID ?? Self.initialShownSession(in: sessions)?.id)
+            : nil
+        for id in waiting.subtracting(self.waiting) where id != activeShownID {
+            self.state.waitingUnreadIDs.insert(id)
+        }
+        self.state.waitingUnreadIDs.formIntersection(waiting)
+        if let activeShownID {
+            self.state.waitingUnreadIDs.remove(activeShownID)
+        }
+
         if self.hasBaseline,
            isAntigravityActive,
-           let shownID = self.state.shownSessionID ?? Self.initialShownSession(in: sessions)?.id,
+           let shownID = activeShownID,
            let shown = sessions[shownID]
         {
             let isWorking = foregroundRunningIDs.contains(shownID)
@@ -1636,6 +1691,7 @@ struct AntigravityUnreadTracker {
         }
 
         self.sessions = sessions
+        self.waiting = waiting
         self.state.progress = Dictionary(uniqueKeysWithValues: sessions.map { id, session in
             (
                 id,
@@ -1665,7 +1721,7 @@ struct AntigravityUnreadTracker {
 
         return Set(sessions.compactMap { id, session -> String? in
             guard !session.isArchived else { return nil }
-            if session.markedAsUnread {
+            if session.markedAsUnread || self.state.waitingUnreadIDs.contains(id) {
                 return id
             }
             guard !foregroundRunningIDs.contains(id) else { return nil }
@@ -1691,6 +1747,7 @@ struct AntigravityUnreadTracker {
             self.state.viewedSeconds[id] ?? 0,
             max(sessionModified, effectiveSeconds))
         self.state.unseenViewMillis.removeValue(forKey: id)
+        self.state.waitingUnreadIDs.remove(id)
         let nowMillis = Int64((now.timeIntervalSince1970 * 1_000).rounded())
         let baselineViewMillis = self.sessions[id]?.focusMillis(includingInput: false) ?? 0
         self.pendingOpen = PendingOpen(
@@ -1940,6 +1997,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private let claudeActivities = ClaudeActivityReader()
     private let antigravityActivities = AntigravityActivityReader()
     private var stream: FSEventStreamRef?
+    private var codexRootPrefix: String?
     private var codexPaths: Set<String> = []
     private var codexSessionsPrefix: String?
     private var backgroundTasksPrefix: String?
@@ -1956,6 +2014,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var antigravityAnnotations: [String: AntigravityAnnotation] = [:]
     private var claudeRecountScheduledAt: Date?
     private var claudeRereadScheduled = false
+    private var codexStateRecountScheduled = false
     private var antigravityStateRecountScheduled = false
     private var antigravityRetryScheduled = false
     private var codexRunningIDs: Set<String> = []
@@ -1970,6 +2029,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var antigravityLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private lazy var codexRollouts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .codex)
+    }
+    private lazy var codexStateFiles = AppendedFileWatcher(queue: self.queue) { [weak self] in
+        self?.scheduleCodexStateRecount()
     }
     private lazy var claudeTranscripts = AppendedFileWatcher(queue: self.queue) { [weak self] in
         self?.scheduleAppendRecount(of: .claude)
@@ -2012,6 +2074,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.queue.sync {
             self.isStopped = true
             self.codexRollouts.watch([])
+            self.codexStateFiles.watch([])
             self.claudeTranscripts.watch([])
             self.antigravityTranscripts.watch([])
             self.antigravityStateFiles.watch([])
@@ -2075,6 +2138,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
         if let codexRoot = Self.canonicalPath(self.reader.codexHome) {
             roots.append(codexRoot)
+            self.codexRootPrefix = codexRoot + "/"
             self.codexPaths = [
                 codexRoot + "/.codex-global-state.json",
                 codexRoot + "/auth.json",
@@ -2155,6 +2219,13 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             }
             if self.codexPaths.contains(path) {
                 changed.insert(.codex)
+            } else if let codexRoot = self.codexRootPrefix,
+                      path.hasPrefix(codexRoot),
+                      let name = path.dropFirst(codexRoot.count).split(separator: "/").first,
+                      name.hasPrefix("state_"),
+                      name.hasSuffix(".sqlite") || name.hasSuffix(".sqlite-wal")
+            {
+                changed.insert(.codex)
             } else if let prefix = self.codexSessionsPrefix, path.hasPrefix(prefix) {
                 codexRolloutChanged = true
             } else if let prefix = self.backgroundTasksPrefix,
@@ -2212,6 +2283,15 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         }
     }
 
+    private func scheduleCodexStateRecount() {
+        guard !self.codexStateRecountScheduled else { return }
+        self.codexStateRecountScheduled = true
+        self.queue.asyncAfter(deadline: .now() + 0.25) {
+            self.codexStateRecountScheduled = false
+            self.recount([.codex])
+        }
+    }
+
     private func scheduleAntigravityStateRecount() {
         guard !self.antigravityStateRecountScheduled else { return }
         self.antigravityStateRecountScheduled = true
@@ -2228,6 +2308,15 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.antigravityRetryScheduled = false
             self.recount([.antigravity])
         }
+    }
+
+    private func watchCodexStateFiles() {
+        guard let dbURL = self.reader.codexStateDatabaseURL() else {
+            self.codexStateFiles.watch([])
+            return
+        }
+        let candidates = [dbURL.path, dbURL.path + "-wal"]
+        self.codexStateFiles.watch(Set(candidates.filter { FileManager.default.fileExists(atPath: $0) }))
     }
 
     private func watchAntigravityStateFiles() {
@@ -2261,7 +2350,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         for platform in platforms {
             switch platform {
             case .codex:
-                self.publish(.codex, self.reader.codexUnreadTasks(turns: self.turns), nil, nil)
+                self.watchCodexStateFiles()
+                self.publish(
+                    .codex,
+                    self.reader.codexUnreadTasks(turns: self.turns),
+                    self.reader.visibleCodexThreadIDs(),
+                    nil)
             case .claude:
                 self.recountClaude(sessions: self.reader.claudeSessions(reusing: self.claudeTracker.sessions))
             case .antigravity:
@@ -2371,6 +2465,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         let unreadIDs = self.antigravityTracker.update(
             sessions: sessions,
             foregroundRunningIDs: foregroundIDs,
+            waiting: waiting,
             isAntigravityActive: self.isAntigravityActive,
             now: now)
         let watchedPaths = Set(transcripts.values.map(\.path))
@@ -2400,7 +2495,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         let externalBackground = CodexBackgroundTaskReader(directory: self.reader.backgroundTasksDirectory)
             .tasks(platform: TokenPlatform.antigravity.rawValue, now: now)
         self.antigravityLaunch = self.reader.antigravityLaunch(reusing: self.antigravityLaunch)
-        let isAppRunning = self.antigravityLaunch != nil
+        let antigravityLaunchedAt = self.antigravityLaunch?.startedAt
+        let isAppRunning = antigravityLaunchedAt != nil
 
         let tasks = sessions.compactMap { id, session -> DesktopRunningTask? in
             guard !session.isArchived else { return nil }
@@ -2428,6 +2524,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             }
 
             var transcriptActivity: String?
+            var backgroundTask: (startedAt: Date, activity: String?)?
             var transcriptModifiedAt: Date?
             if let transcript = self.reader.antigravityTranscriptURL(conversationID: id),
                let attributes = try? FileManager.default.attributesOfItem(atPath: transcript.path),
@@ -2454,6 +2551,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 {
                     transcriptActivity = self.antigravityActivities.activity(in: transcript, size: size)
                 }
+                if session.notFullyIdle, let antigravityLaunchedAt {
+                    backgroundTask = self.antigravityActivities.runningBackgroundTasks(
+                        in: transcript,
+                        size: size,
+                        after: antigravityLaunchedAt)
+                }
             }
 
             let latestActivityAt = max(
@@ -2471,12 +2574,19 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             }
 
             if session.notFullyIdle || session.hasBackgroundSubagents {
+                let backgroundActivities = [
+                    session.subagentActivity,
+                    backgroundTask?.activity ?? (session.subagentActivity == nil ? transcriptActivity : nil),
+                ].compactMap { $0 }
                 return DesktopRunningTask(
                     platform: .antigravity,
                     id: id,
                     title: session.title,
-                    startedAt: session.lastModifiedAt,
-                    activity: session.subagentActivity ?? transcriptActivity,
+                    startedAt: backgroundTask?.startedAt
+                        ?? session.subagentStartedAt
+                        ?? session.lastUserInputAt
+                        ?? session.lastModifiedAt,
+                    activity: backgroundActivities.isEmpty ? nil : backgroundActivities.joined(separator: " · "),
                     isInBackground: true)
             }
 

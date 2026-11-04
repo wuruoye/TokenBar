@@ -134,6 +134,12 @@ final class UnreadWidgetPublisher {
             self.pendingActivityRefresh = nil
             self.lastActivityRefreshAt = ContinuousClock.now
             await self.model.refreshActivity()
+            if platforms.contains(.codex) {
+                await self.model.refreshQuota(for: .codex)
+            }
+            if platforms.contains(.claude), self.settings.showsClaude {
+                await self.model.refreshQuota(for: .claude)
+            }
             if platforms.contains(.antigravity), self.settings.showsAntigravity {
                 await self.model.refreshQuota(for: .antigravity)
             }

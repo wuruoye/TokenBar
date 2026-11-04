@@ -485,12 +485,24 @@ final class ClaudeActivityReader {
 
 /// Follows what a running Antigravity turn is doing from its append-only
 /// `transcript.jsonl`: the latest tool call summary, or else the latest model
-/// progress note since the user prompt that opened the turn. Confined to the
-/// unread watcher's queue.
+/// progress note since the user prompt that opened the turn, as well as tasks
+/// still running in the background after the turn ends. Confined to the unread
+/// watcher's queue.
 final class AntigravityActivityReader {
     private struct Progress {
         var offset: UInt64
         var activity: String?
+    }
+
+    private struct BackgroundTask {
+        var startedAt: Date
+        var activity: String?
+    }
+
+    private struct BackgroundProgress {
+        var offset: UInt64
+        var pending: [String: BackgroundTask] = [:]
+        var lastCallActivity: String?
     }
 
     private enum Entry {
@@ -499,8 +511,16 @@ final class AntigravityActivityReader {
     }
 
     private static let markers = ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""].map { Data($0.utf8) }
+    private static let backgroundMarkers = [
+        "\"PLANNER_RESPONSE\"",
+        "Tool is running as a background task",
+        "\"SYSTEM_MESSAGE\"",
+        "Task id \"",
+    ].map { Data($0.utf8) }
+    private static let maximumScannedBytes: UInt64 = 32 << 20
 
     private var progress: [String: Progress] = [:]
+    private var backgroundProgress: [String: BackgroundProgress] = [:]
 
     func activity(in url: URL, size: UInt64) -> String? {
         if var known = self.progress[url.path], known.offset <= size {
@@ -532,8 +552,28 @@ final class AntigravityActivityReader {
         return activity
     }
 
+    func runningBackgroundTasks(
+        in url: URL,
+        size: UInt64,
+        after cutoff: Date) -> (startedAt: Date, activity: String?)?
+    {
+        var known = self.backgroundProgress[url.path].flatMap { $0.offset <= size ? $0 : nil }
+            ?? BackgroundProgress(offset: size > Self.maximumScannedBytes ? size - Self.maximumScannedBytes : 0)
+        if known.offset < size {
+            known = self.advanceBackground(known, in: url, to: size)
+        }
+        self.backgroundProgress[url.path] = known
+        let running = known.pending.values
+            .filter { $0.startedAt > cutoff }
+            .sorted { $0.startedAt < $1.startedAt }
+        guard let first = running.first else { return nil }
+        let activities = running.compactMap(\.activity)
+        return (first.startedAt, activities.isEmpty ? nil : activities.joined(separator: " · "))
+    }
+
     func forget(except paths: Set<String>) {
         self.progress = self.progress.filter { paths.contains($0.key) }
+        self.backgroundProgress = self.backgroundProgress.filter { paths.contains($0.key) }
     }
 
     private func advance(_ known: Progress, in url: URL, to size: UInt64) -> Progress {
@@ -560,6 +600,77 @@ final class AntigravityActivityReader {
         }
         next.offset = known.offset + UInt64(appended.distance(from: appended.startIndex, to: lastNewline)) + 1
         return next
+    }
+
+    private func advanceBackground(_ known: BackgroundProgress, in url: URL, to size: UInt64) -> BackgroundProgress {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return known }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: known.offset)) != nil,
+              let appended = try? handle.read(upToCount: Int(size - known.offset)),
+              let lastNewline = appended.lastIndex(of: 0x0A)
+        else {
+            return known
+        }
+        var next = known
+        for line in appended[..<lastNewline].split(separator: 0x0A)
+            where Self.backgroundMarkers.contains(where: { line.range(of: $0) != nil })
+        {
+            Self.applyBackground(Data(line), to: &next)
+        }
+        next.offset = known.offset + UInt64(appended.distance(from: appended.startIndex, to: lastNewline)) + 1
+        return next
+    }
+
+    private static func applyBackground(_ line: Data, to progress: inout BackgroundProgress) {
+        if let text = String(data: line, encoding: .utf8) {
+            for match in text.matches(of: #/Task id \\?"([^"\\]+)\\?" finished/#) {
+                progress.pending[String(match.output.1)] = nil
+            }
+            for match in text.matches(of: #/\bsender=([0-9a-fA-F-]{8,})\b/#) {
+                progress.pending[String(match.output.1)] = nil
+            }
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            return
+        }
+        switch object["type"] as? String {
+        case "PLANNER_RESPONSE" where object["source"] as? String == "MODEL":
+            let calls = object["tool_calls"] as? [[String: Any]] ?? []
+            for call in calls {
+                let name = call["name"] as? String ?? ""
+                let args = (call["args"] as? [String: Any])
+                    ?? (call["arguments"] as? [String: Any])
+                    ?? [:]
+                if name == "manage_task",
+                   DesktopUnreadTurnReader.antigravityArgumentString(args, "Action") == "kill",
+                   let id = DesktopUnreadTurnReader.antigravityArgumentString(args, "TaskId")
+                {
+                    progress.pending[id] = nil
+                } else if name == "run_command" || name == "schedule",
+                          let activity = DesktopUnreadTurnReader.antigravityToolActivity(call)
+                {
+                    progress.lastCallActivity = activity
+                }
+            }
+        case "GENERIC" where object["status"] as? String == "RUNNING":
+            guard let content = object["content"] as? String,
+                  let match = content.firstMatch(
+                      of: #/Tool is running as a background task with task id:\s*([^\s\n]+)/#),
+                  let startedAt = DesktopUnreadTurnReader.antigravityTimestamp(object)
+            else {
+                return
+            }
+            let id = String(match.output.1)
+            let fallback = content.firstMatch(of: #/Task Description:\s*([^\n]+)/#)
+                .flatMap { DesktopUnreadTurnReader.flattened(String($0.output.1)) }
+                .map { "Run \($0)" }
+            progress.pending[id] = BackgroundTask(
+                startedAt: startedAt,
+                activity: progress.lastCallActivity ?? fallback)
+            progress.lastCallActivity = nil
+        default:
+            break
+        }
     }
 
     private static func entry(_ line: Data) -> Entry? {

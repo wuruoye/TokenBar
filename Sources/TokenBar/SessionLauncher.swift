@@ -61,7 +61,7 @@ struct SessionLauncher {
         self.navigateAntigravityConversation = navigateAntigravityConversation
     }
 
-    func open(_ session: SessionSummary) throws {
+    func open(_ session: SessionSummary, onWillOpen: ((String) -> Void)? = nil) throws {
         if session.platformID == .grok {
             guard self.launchGrokSession(session) else {
                 throw SessionLauncherError.applicationUnavailable(.grok)
@@ -76,6 +76,7 @@ struct SessionLauncher {
             let target = self.resolveAntigravitySession(sessionID)
             let fallbackTitle = session.title?.trimmingCharacters(in: .whitespacesAndNewlines)
             let expectedTitle = target?.title ?? fallbackTitle.flatMap { $0.isEmpty ? nil : $0 }
+            onWillOpen?(sessionID)
             try self.openAntigravity(conversationID: sessionID, expectedTitle: expectedTitle)
             return
         }
@@ -85,23 +86,43 @@ struct SessionLauncher {
         let url = try Self.deepLink(
             for: session,
             claudeDesktopSessionID: claudeDesktopSessionID)
+        switch session.platformID {
+        case .codex:
+            if let threadID = Self.codexThreadID(from: session.id.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                onWillOpen?(threadID)
+            }
+        case .claude:
+            if let desktopSessionID = claudeDesktopSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !desktopSessionID.isEmpty
+            {
+                onWillOpen?(desktopSessionID)
+            }
+        default:
+            break
+        }
         guard self.openURL(url) else {
             throw SessionLauncherError.applicationUnavailable(session.platformID)
         }
     }
 
     /// Unread tasks already carry the ID each app's own deep link takes.
-    func openUnreadTask(platform: TokenPlatform, id: String) throws {
+    func openUnreadTask(
+        platform: TokenPlatform,
+        id: String,
+        onWillOpen: ((String) -> Void)? = nil) throws
+    {
         if platform == .antigravity {
             let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isSafePathIdentifier(trimmed) else {
                 throw SessionLauncherError.invalidSessionID
             }
             let target = self.resolveAntigravitySession(trimmed)
+            onWillOpen?(trimmed)
             try self.openAntigravity(conversationID: trimmed, expectedTitle: target?.title)
             return
         }
         let url = try Self.deepLink(platform: platform, id: id)
+        onWillOpen?(id)
         guard self.openURL(url) else {
             throw SessionLauncherError.applicationUnavailable(platform)
         }
