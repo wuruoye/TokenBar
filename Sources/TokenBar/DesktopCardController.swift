@@ -6,8 +6,8 @@ import TokenBarCore
 /// The four macOS desktop widget sizes the card can take, or the one that
 /// fits what it shows.
 enum DesktopCardSize: String, CaseIterable, Identifiable {
-    /// A large widget, which widens to an extra-large one while anything is
-    /// unread.
+    /// An extra-large widget's width, growing past its base height as rows need
+    /// room.
     case automatic
     case small
     case medium
@@ -29,12 +29,13 @@ enum DesktopCardSize: String, CaseIterable, Identifiable {
     }
 
     static let fixedSizes: [DesktopCardSize] = [.small, .medium, .large, .extraLarge]
+    static let resizableSizes: [DesktopCardSize] = [.small, .medium, .large, .automatic]
 
     /// The visible size of a desktop widget of this size; for `automatic`, its
-    /// size while nothing is unread.
+    /// minimum size.
     var points: CGSize {
         switch self {
-        case .automatic: CGSize(width: 344, height: 344)
+        case .automatic: CGSize(width: 704, height: 344)
         case .small: CGSize(width: 164, height: 164)
         case .medium: CGSize(width: 344, height: 164)
         case .large: CGSize(width: 344, height: 344)
@@ -276,14 +277,17 @@ final class DesktopCardController {
         case .changed:
             let start = self.resizeStart ?? (mouse, card)
             self.resizeStart = start
+            let topLeft = NSPoint(x: start.card.minX, y: start.card.maxY)
             let wanted = CGSize(
                 width: start.card.width + mouse.x - start.mouse.x,
                 height: start.card.height - (mouse.y - start.mouse.y))
-            let nearest = DesktopCardSize.fixedSizes.min { lhs, rhs in
-                Self.distance(lhs.points, wanted) < Self.distance(rhs.points, wanted)
+            let nearest = DesktopCardSize.resizableSizes.min { lhs, rhs in
+                Self.distance(self.points(for: self.state.snapshot, size: lhs, near: topLeft), wanted)
+                    < Self.distance(self.points(for: self.state.snapshot, size: rhs, near: topLeft), wanted)
             } ?? self.state.size
-            if nearest.points != self.state.points || nearest != self.state.size {
-                self.apply(nearest, topLeft: NSPoint(x: start.card.minX, y: start.card.maxY))
+            let nextPoints = self.points(for: self.state.snapshot, size: nearest, near: topLeft)
+            if nextPoints != self.state.points || nearest != self.state.size {
+                self.apply(nearest, points: nextPoints, topLeft: topLeft)
             }
         case .ended:
             self.resizeStart = nil
@@ -294,15 +298,16 @@ final class DesktopCardController {
 
     private func setSize(_ size: DesktopCardSize) {
         guard size != self.state.size else { return }
+        self.pendingShrink?.cancel()
+        self.pendingShrink = nil
         self.state.size = size
         UserDefaults.standard.set(size.rawValue, forKey: Defaults.size)
         self.resizeCard(to: self.points(for: self.state.snapshot))
     }
 
     /// Changes the size with the card's top-left corner in place.
-    private func apply(_ size: DesktopCardSize, topLeft: NSPoint) {
+    private func apply(_ size: DesktopCardSize, points: CGSize, topLeft: NSPoint) {
         guard let panel = self.panel else { return }
-        let points = size.points
         self.state.size = size
         self.state.points = points
         panel.setFrame(
@@ -315,12 +320,24 @@ final class DesktopCardController {
     }
 
     /// The size the card takes for `snapshot`: its widget size, or for
-    /// `automatic` the extra-large widget while anything is unread.
-    private func points(for snapshot: UnreadWidgetSnapshot) -> CGSize {
-        guard self.state.size == .automatic, !snapshot.tasks.isEmpty else {
-            return self.state.size.points
+    /// `automatic` the extra-large width and the height that fits its rows up
+    /// to the room available on screen.
+    private func points(
+        for snapshot: UnreadWidgetSnapshot,
+        size: DesktopCardSize? = nil,
+        near topLeft: NSPoint? = nil) -> CGSize
+    {
+        let resolvedSize = size ?? self.state.size
+        let base = resolvedSize.points
+        guard resolvedSize == .automatic else {
+            return base
         }
-        return DesktopCardSize.extraLarge.points
+        let anchor = topLeft
+            ?? self.savedTopLeft()
+            ?? self.card.map { NSPoint(x: $0.minX, y: $0.maxY) }
+        let limit = self.maximumHeight(width: base.width, minHeight: base.height, near: anchor)
+        let height = DesktopCardView.automaticHeight(for: snapshot, maxHeight: limit)
+        return CGSize(width: base.width, height: height)
     }
 
     /// Resizes the card on the grid spot nearest where the user put it. The
@@ -360,7 +377,14 @@ final class DesktopCardController {
     /// remembers it.
     private func settle(animated: Bool) {
         guard let card = self.card else { return }
-        let target = self.placed(card)
+        let topLeft = NSPoint(x: card.minX, y: card.maxY)
+        let points = self.points(for: self.state.snapshot, near: topLeft)
+        self.state.points = points
+        let target = self.placed(NSRect(
+            x: topLeft.x,
+            y: topLeft.y - points.height,
+            width: points.width,
+            height: points.height))
         self.setCard(target, animated: animated)
         self.save(target)
     }
@@ -380,38 +404,129 @@ final class DesktopCardController {
         UserDefaults.standard.set([card.minX, card.maxY], forKey: Defaults.origin)
     }
 
-    /// The grid spot nearest `card` on the screen under its center where the
-    /// card fits on screen and clears every system widget by the widget gap.
-    private func placed(_ card: NSRect) -> NSRect {
-        let center = NSPoint(x: card.midX, y: card.midY)
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(center) })
-            ?? NSScreen.screens.first
-        else {
-            return card
-        }
-        let area = screen.visibleFrame.insetBy(dx: Self.widgetGap, dy: Self.widgetGap)
-        let widgets = Self.systemWidgetFrames().filter { screen.frame.intersects($0) }
+    private struct GridContext {
+        let area: NSRect
+        let anchor: NSPoint
+        let paddedWidgets: [NSRect]
+        let columns: ClosedRange<Int>
+        let rows: ClosedRange<Int>
+    }
+
+    private static func gridContext(for screen: NSScreen) -> GridContext {
+        let area = screen.visibleFrame.insetBy(dx: self.widgetGap, dy: self.widgetGap)
+        let widgets = self.systemWidgetFrames().filter { screen.frame.intersects($0) }
+        let paddedWidgets = widgets.map { $0.insetBy(dx: -self.widgetGap / 2, dy: -self.widgetGap / 2) }
         // Share the system widgets' grid; without any, start at the top-left
         // corner of the usable area.
         let anchor = widgets.first.map { NSPoint(x: $0.minX, y: $0.maxY) } ?? NSPoint(x: area.minX, y: area.maxY)
-        let step = Self.gridStep
+        let step = self.gridStep
+        let minCol = Int(floor((area.minX - anchor.x) / step))
+        let maxCol = max(minCol, Int(ceil((area.maxX - anchor.x) / step)))
+        let minRow = Int(floor((anchor.y - area.maxY) / step))
+        let maxRow = max(minRow, Int(ceil((anchor.y - area.minY) / step)))
+        return GridContext(
+            area: area,
+            anchor: anchor,
+            paddedWidgets: paddedWidgets,
+            columns: minCol...maxCol,
+            rows: minRow...maxRow)
+    }
+
+    private static func spotCapacity(
+        column: Int,
+        row: Int,
+        width: CGFloat,
+        minHeight: CGFloat,
+        in grid: GridContext) -> (topLeft: NSPoint, maxHeight: CGFloat)?
+    {
+        let x = grid.anchor.x + CGFloat(column) * self.gridStep
+        let topY = grid.anchor.y - CGFloat(row) * self.gridStep
+        let minSpot = NSRect(x: x, y: topY - minHeight, width: width, height: minHeight)
+        guard grid.area.contains(minSpot),
+              !grid.paddedWidgets.contains(where: { $0.intersects(minSpot) })
+        else {
+            return nil
+        }
+        var lowerBound = grid.area.minY
+        for widget in grid.paddedWidgets {
+            guard widget.maxX > x, widget.minX < x + width, widget.maxY <= topY - minHeight else { continue }
+            lowerBound = max(lowerBound, widget.maxY)
+        }
+        return (NSPoint(x: x, y: topY), topY - lowerBound)
+    }
+
+    private func screen(near topLeft: NSPoint?, fallbackRect: NSRect? = nil) -> NSScreen? {
+        if let topLeft {
+            let probe = NSPoint(x: topLeft.x + 1, y: topLeft.y - 1)
+            if let match = NSScreen.screens.first(where: { $0.frame.contains(probe) }) {
+                return match
+            }
+        }
+        if let rect = fallbackRect ?? self.card {
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            if let match = NSScreen.screens.first(where: { $0.frame.contains(center) }) {
+                return match
+            }
+        }
+        return NSScreen.screens.first ?? NSScreen.main
+    }
+
+    private func maximumHeight(width: CGFloat, minHeight: CGFloat, near topLeft: NSPoint?) -> CGFloat {
+        guard let screen = self.screen(near: topLeft) else {
+            return .greatestFiniteMagnitude
+        }
+        let grid = Self.gridContext(for: screen)
+        var spots: [(column: Int, topLeft: NSPoint, maxHeight: CGFloat)] = []
+        for column in grid.columns {
+            for row in grid.rows {
+                if let spot = Self.spotCapacity(
+                    column: column,
+                    row: row,
+                    width: width,
+                    minHeight: minHeight,
+                    in: grid)
+                {
+                    spots.append((column, spot.topLeft, spot.maxHeight))
+                }
+            }
+        }
+        guard !spots.isEmpty else {
+            return max(minHeight, grid.area.height)
+        }
+        let targetX = topLeft?.x ?? self.defaultCard(size: CGSize(width: width, height: minHeight)).minX
+        if let nearestColumn = spots.min(by: { abs($0.topLeft.x - targetX) < abs($1.topLeft.x - targetX) })?.column {
+            let columnMax = spots
+                .filter { $0.column == nearestColumn }
+                .map(\.maxHeight)
+                .max() ?? minHeight
+            if columnMax >= minHeight + Self.gridStep {
+                return columnMax
+            }
+        }
+        return spots.map(\.maxHeight).max() ?? max(minHeight, grid.area.height)
+    }
+
+    /// The grid spot nearest `card` on its screen where the card fits on screen
+    /// and clears every system widget by the widget gap.
+    private func placed(_ card: NSRect) -> NSRect {
+        let topLeft = NSPoint(x: card.minX, y: card.maxY)
+        guard let screen = self.screen(near: topLeft, fallbackRect: card) else {
+            return card
+        }
+        let grid = Self.gridContext(for: screen)
         let size = card.size
-        let columns = Int(floor((area.minX - anchor.x) / step))...Int(ceil((area.maxX - anchor.x) / step))
-        let rows = Int(floor((anchor.y - area.maxY) / step))...Int(ceil((anchor.y - area.minY) / step))
 
         var best: NSRect?
         var bestDistance = CGFloat.greatestFiniteMagnitude
-        for column in columns {
-            for row in rows {
+        for column in grid.columns {
+            for row in grid.rows {
                 let spot = NSRect(
-                    x: anchor.x + CGFloat(column) * step,
-                    y: anchor.y - CGFloat(row) * step - size.height,
+                    x: grid.anchor.x + CGFloat(column) * Self.gridStep,
+                    y: grid.anchor.y - CGFloat(row) * Self.gridStep - size.height,
                     width: size.width,
                     height: size.height)
-                guard area.contains(spot),
-                      !widgets.contains(where: {
-                          $0.insetBy(dx: -Self.widgetGap / 2, dy: -Self.widgetGap / 2).intersects(spot)
-                      })
+                guard grid.area.contains(spot),
+                      !grid.paddedWidgets.contains(where: { $0.intersects(spot) })
                 else {
                     continue
                 }
@@ -422,7 +537,12 @@ final class DesktopCardController {
                 }
             }
         }
-        return best ?? card
+        if let best {
+            return best
+        }
+        let clampedX = min(max(card.minX, grid.area.minX), max(grid.area.minX, grid.area.maxX - size.width))
+        let clampedY = min(max(card.minY, grid.area.minY), max(grid.area.minY, grid.area.maxY - size.height))
+        return NSRect(x: clampedX, y: clampedY, width: size.width, height: size.height)
     }
 
     /// The top-right corner of the screen with the menu bar.

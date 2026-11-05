@@ -34,6 +34,19 @@ struct DesktopCardView: View {
     let hide: () -> Void
     @State private var isHovered = false
 
+    /// The height that shows every row of `snapshot` in the two-column layout,
+    /// from the minimum height of `automatic` up to `maxHeight`.
+    static func automaticHeight(
+        for snapshot: UnreadWidgetSnapshot,
+        maxHeight: CGFloat = .greatestFiniteMagnitude) -> CGFloat
+    {
+        let minHeight = DesktopCardSize.automatic.points.height
+        let overhead = Self.padding * 2 + CardMetrics.headerHeight + CardMetrics.headerSpacing
+        let available = max(0, maxHeight - overhead)
+        let needed = overhead + CardMetrics.columnHeight(for: snapshot, maxHeight: available)
+        return maxHeight >= minHeight ? min(maxHeight, max(minHeight, needed)) : maxHeight
+    }
+
     var body: some View {
         let snapshot = self.state.snapshot
         let size = self.state.points
@@ -343,11 +356,36 @@ private enum CardMetrics {
     static let columnGap: CGFloat = 28
 
     static func rows(fitting height: CGFloat, rowHeight: CGFloat) -> Int {
-        max(0, Int(height / rowHeight))
+        guard height > 0, rowHeight > 0 else { return 0 }
+        let raw = floor((height + 0.001) / rowHeight)
+        return raw >= CGFloat(Int.max) ? Int.max : Int(raw)
     }
 
     static func sectionHeight(rows: Int, rowHeight: CGFloat) -> CGFloat {
         self.sectionLabelHeight + CGFloat(rows) * rowHeight
+    }
+
+    /// The content height the two-column layout uses within `maxHeight`.
+    static func columnHeight(for snapshot: UnreadWidgetSnapshot, maxHeight: CGFloat) -> CGFloat {
+        let unreadRows = min(
+            snapshot.tasks.count,
+            self.rows(fitting: maxHeight, rowHeight: self.unreadRowHeight))
+        let moreCount = snapshot.tasks.count - unreadRows
+        let leftSections: [(count: Int, rowHeight: CGFloat)] = [
+            (snapshot.running.count, self.runningRowHeight),
+            (snapshot.background.count, self.runningRowHeight),
+            (moreCount, self.compactRowHeight),
+            (snapshot.recent.count, self.compactRowHeight),
+        ]
+        let fit = self.sections(leftSections, height: maxHeight)
+        let parts = zip(fit, leftSections).compactMap { rows, section in
+            rows > 0 ? self.sectionHeight(rows: rows, rowHeight: section.rowHeight) : nil
+        }
+        let leftHeight = parts.isEmpty
+            ? self.caughtUpHeight
+            : parts.reduce(0, +) + CGFloat(parts.count - 1) * self.sectionGap
+        let rightHeight = CGFloat(unreadRows) * self.unreadRowHeight
+        return max(leftHeight, rightHeight)
     }
 
     /// Splits the height between unread rows, the running and background
@@ -589,6 +627,7 @@ private struct CardHeader: View {
                 self.usage(figures: 1, spacing: 6)
             }
         }
+        .frame(height: CardMetrics.headerHeight)
     }
 
     /// Every piece of text shares one size and baseline; each icon sits on

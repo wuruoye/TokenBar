@@ -1168,9 +1168,11 @@ enum DemoPreviewRenderer {
                 background: state.snapshot.background,
                 recent: state.snapshot.recent)
         }
-        // `automatic` widens while anything is unread.
-        state.points = state.size == .automatic && !state.snapshot.tasks.isEmpty
-            ? DesktopCardSize.extraLarge.points
+        // `automatic` keeps the two-column width and grows taller with its rows.
+        state.points = state.size == .automatic
+            ? CGSize(
+                width: DesktopCardSize.automatic.points.width,
+                height: DesktopCardView.automaticHeight(for: state.snapshot))
             : state.size.points
         let content = DesktopCardView(
             state: state,
