@@ -14,18 +14,28 @@ export interface Day extends Totals {
   date: string;
   models: Array<{ platform: string; model: string; provider?:string; tokens: Tokens; costUsd: number; sessionCount?:number;requestCount?:number }>;
 }
+export interface ContextOccupancy {
+  promptTokens: number;
+  contextWindow?: number;
+  percent?: number;
+  systemTokens?: number;
+  messageTokens?: number;
+}
 export interface Request {
   id: string; platform: string; sessionId: string; physicalSessionId: string;
   isSubagent: boolean; agent?: string; model: string; startedAtMs: number; endedAtMs: number;
   reasoningEffort?: string | null;
   generationMetrics?: GenerationMetrics | null;
-  modelDurationMs?: number; timeToFirstTokenMs?: number | null; tokens: Tokens; costUsd: number; costSource: string; serviceTier: string;
-  sessionPath?: string; promptPreview?: string; outputPreview?: string; contributions?: Request[];
+  durationMs?: number; modelDurationMs?: number; timeToFirstTokenMs?: number;
+  tokens: Tokens; costUsd: number; costSource: string; serviceTier: string;
+  sessionPath?: string; promptPreview?: string; outputPreview?: string; context?: ContextOccupancy;
+  contributions?: Request[];
 }
 export interface Session {
   deviceId?: string; deviceName?: string;
   id: string; platform: string; title?: string; workspaceLabel?: string;
   startedAtMs: number; endedAtMs: number; tokens: Tokens; costUsd: number; models: string[]; requests: Request[];
+  context?: ContextOccupancy;
 }
 export interface Source { platform: string; today: Totals; rangeTotals?: Totals; days: Day[]; weeklySinceReset?: { startedAtMs: number; totals: Totals } }
 export interface MemoryPhase { total: number; input: number; cachedInput: number; cacheWriteInput: number; output: number; reasoningOutput: number }
@@ -37,7 +47,8 @@ export interface Snapshot {
   pricingCatalog?: {source:string;updatedAtMs?:number;modelCount:number;status:string};
 }
 export interface QuotaWindow { usedPercent: number; windowMinutes?: number; resetsAtMs?: number }
-export interface Quota { session?: QuotaWindow; weekly?: QuotaWindow; updatedAtMs: number; error?: string; availableResetCredits?: number }
+export interface QuotaGroup { label: string; session?: QuotaWindow; weekly?: QuotaWindow }
+export interface Quota { session?: QuotaWindow; weekly?: QuotaWindow; updatedAtMs: number; error?: string; availableResetCredits?: number; secondaryGroup?: QuotaGroup }
 export interface Settings {
   refreshSeconds: number; recentLimit: number; theme: string; showClaude: boolean; showGrok: boolean; showAntigravity: boolean;
   autostart: boolean; codexHome: string; claudeHome: string; grokHome: string; antigravityHome: string; codexBinary: string; memoryEnabled: boolean;
@@ -45,6 +56,7 @@ export interface Settings {
   syncAllDevices: boolean;
   taskbarEnabled: boolean; taskbarPlatform: string; taskbarPosition: string;
   usesWeekdayWeeklyPacing: boolean;
+  showCompanion?: boolean;
 }
 export interface Dashboard {
   settings: Settings; snapshot?: Snapshot; quotas: Partial<Record<Platform, Quota>>;
@@ -62,6 +74,90 @@ export function compact(value: number): string {
   if (value >= 1e6) return (value / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
   if (value >= 1e3) return (value / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
   return Math.round(value).toLocaleString();
+}
+export function occupancyPercent(context?: ContextOccupancy): number | undefined {
+  if (context?.percent == null || !Number.isFinite(context.percent)) return undefined;
+  return Math.max(0, Math.min(100, context.percent));
+}
+export function occupancyLabel(context?: ContextOccupancy): string | undefined {
+  if (!context || !(context.promptTokens > 0)) return undefined;
+  const used = compact(context.promptTokens);
+  const window = context.contextWindow && context.contextWindow > 0 ? compact(context.contextWindow) : undefined;
+  const percent = occupancyPercent(context);
+  if (window && percent != null) return used + " / " + window + " · " + Math.round(percent) + "%";
+  if (window) return used + " / " + window;
+  return used;
+}
+export function occupancyParts(context?: ContextOccupancy): Array<{ id: string; label: string; value: number }> {
+  if (!context || context.systemTokens == null || context.messageTokens == null) return [];
+  return [
+    { id: "system", label: "系统提示词", value: context.systemTokens },
+    { id: "messages", label: "对话", value: context.messageTokens }
+  ].filter(part => part.value > 0);
+}
+export function occupancyWindowParts(context?: ContextOccupancy): Array<{ id: string; label: string; value: number }> {
+  if (!context || !(context.promptTokens > 0)) return [];
+  const used = occupancyParts(context);
+  const parts = used.length ? used : [{ id: "used", label: "已用", value: context.promptTokens }];
+  const window = context.contextWindow;
+  if (window && window > context.promptTokens) parts.push({ id: "free", label: "剩余窗口", value: window - context.promptTokens });
+  return parts;
+}
+export function durationLabel(ms?: number): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  if (ms < 60_000) return (ms / 1000).toFixed(ms < 10_000 ? 1 : 0) + "s";
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return seconds ? minutes + "m" + seconds + "s" : minutes + "m";
+}
+export function chronologicalTurns(session: Session): Request[] {
+  return [...session.requests].sort((a, b) => a.endedAtMs - b.endedAtMs || a.startedAtMs - b.startedAtMs);
+}
+export function contextStats(session: Session) {
+  return {
+    turns: session.requests.length,
+    cacheHit: cachePercentage(session.tokens),
+    costUsd: session.costUsd,
+    durationMs: Math.max(0, session.endedAtMs - session.startedAtMs)
+  };
+}
+export function timingStats(session: Session) {
+  let wait = 0, gen = 0, other = 0;
+  for (const request of session.requests) {
+    const total = request.durationMs ?? Math.max(0, request.endedAtMs - request.startedAtMs);
+    const model = request.modelDurationMs ?? 0;
+    const ttft = request.timeToFirstTokenMs ?? 0;
+    wait += ttft;
+    gen += Math.max(0, model - ttft);
+    other += Math.max(0, total - model);
+  }
+  return { wait, gen, other, total: wait + gen + other };
+}
+export function occupancyTrend(session: Session) {
+  return chronologicalTurns(session).map((request, index) => ({
+    turn: index + 1,
+    context: request.context,
+    prompt: request.promptPreview || request.model,
+    tokens: tokenTotal(request.tokens),
+    cost: request.costUsd
+  }));
+}
+export function agentNetwork(session: Session) {
+  const groups = new Map<string, { name: string; role: "main" | "subagent"; tokens: number; requests: number }>();
+  for (const turn of session.requests) {
+    const rows = turn.contributions?.length ? turn.contributions : [turn];
+    for (const row of rows) {
+      const role = row.isSubagent ? "subagent" as const : "main" as const;
+      const name = role === "subagent" ? (row.agent?.trim() || "Subagent") : "Main";
+      const key = role + ":" + name;
+      const entry = groups.get(key) ?? { name, role, tokens: 0, requests: 0 };
+      entry.tokens += tokenTotal(row.tokens);
+      entry.requests += 1;
+      groups.set(key, entry);
+    }
+  }
+  return [...groups.values()].sort((a, b) => Number(a.role === "subagent") - Number(b.role === "subagent") || b.tokens - a.tokens);
 }
 export function remainingPercent(window: QuotaWindow): number { return Math.max(0, Math.min(100, 100 - window.usedPercent)); }
 export function weeklyPacing(window: QuotaWindow, measuredAt: number, weekdaysOnly = false) {

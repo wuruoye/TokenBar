@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
   "description": "Local TokenBar panel",
-  "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-start-dragging", "core:window:allow-hide"]
+  "windows": ["main", "workbench", "companion"],
+  "permissions": ["core:default", "core:window:allow-start-dragging", "core:window:allow-hide", "core:window:allow-show", "core:window:allow-set-focus", "core:window:allow-set-size"]
 }

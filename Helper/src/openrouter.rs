@@ -73,6 +73,56 @@ struct ModelPrice {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     models: HashMap<String, ModelPrice>,
+    /// Model-id to context-window size, taken from the catalog's public
+    /// `context_length` field. Kept beside the prices so one download serves
+    /// both, and so a model whose local log records no window still gets one.
+    #[serde(default)]
+    context_windows: HashMap<String, i64>,
+}
+
+/// Context windows are token counts; reject anything outside a plausible range
+/// so a malformed catalog cannot produce a nonsensical occupancy reading.
+const MAX_CONTEXT_WINDOW: i64 = 100_000_000;
+
+/// Normalizes a locally recorded model id for a catalog context-window lookup.
+///
+/// Local logs spell the same model in several ways (`gpt-5.4(high)`,
+/// `anthropic/claude-sonnet-4-5`, `models/gemini-2.5-pro`), while the catalog
+/// uses one `author/slug` row per model. This strips the provider prefix, the
+/// reasoning tier, and the vendor-specific decorations that never appear in a
+/// catalog id, so the lookup keys stay comparable.
+fn normalize_context_model_id(model: &str) -> String {
+    let mut name = model.trim().to_ascii_lowercase();
+    if let Some(index) = name.find('(') {
+        name.truncate(index);
+    }
+    for prefix in [
+        "models/",
+        "openai/",
+        "openai_codex/",
+        "anthropic/",
+        "google/",
+        "gemini/",
+        "xai/",
+        "vertex_ai/",
+        "vertex/",
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            name = rest.to_string();
+            break;
+        }
+    }
+    if let Some(index) = name.find("-preview") {
+        name.truncate(index);
+    }
+    for suffix in ["-latest", "-thinking", "-exp"] {
+        if let Some(rest) = name.strip_suffix(suffix) {
+            name = rest.to_string();
+        }
+    }
+    // Claude Code writes `claude-sonnet-4-5` while the catalog lists
+    // `anthropic/claude-sonnet-4.5`; compare on the dotted spelling.
+    name.trim().to_string()
 }
 
 fn key(author: &str, model: &str) -> String {
@@ -138,6 +188,7 @@ impl Catalog {
             return Err("too many catalog models".into());
         }
         let mut models = HashMap::new();
+        let mut context_windows = HashMap::new();
         for row in rows {
             let Some(id) = row.get("id").and_then(Value::as_str) else {
                 continue;
@@ -145,6 +196,14 @@ impl Catalog {
             let Some((author, slug)) = id.split_once('/') else {
                 continue;
             };
+            // Context windows cover every listed author, because Claude Code and
+            // Antigravity logs record no window of their own. Prices stay
+            // limited to the authors TokenBar actually prices locally.
+            if let Some(window) = row.get("context_length").and_then(Value::as_i64) {
+                if window > 0 && window <= MAX_CONTEXT_WINDOW && !slug.contains(':') {
+                    context_windows.insert(id.to_string(), window);
+                }
+            }
             if !["openai", "anthropic"].contains(&author)
                 || slug.contains(':')
                 || slug.contains('/')
@@ -212,10 +271,44 @@ impl Catalog {
         if models.is_empty() {
             return Err("catalog contains no supported model quotes".into());
         }
-        Ok(Self { models })
+        Ok(Self {
+            models,
+            context_windows,
+        })
     }
     pub fn model_count(&self) -> usize {
         self.models.len()
+    }
+    /// Resolves a model's context window from the catalog.
+    ///
+    /// Local logs and the catalog disagree on spelling (`claude-sonnet-4-5`
+    /// versus `anthropic/claude-sonnet-4.5`, `gpt-5.4(high)` versus
+    /// `openai/gpt-5.4`), so the lookup compares provider-stripped slugs with
+    /// dots and dashes treated alike. This is only a fallback for models whose
+    /// own log records no window, so a rare slug collision is preferable to
+    /// showing no occupancy at all.
+    pub fn context_window(&self, model: &str) -> Option<i64> {
+        let normalized = normalize_context_model_id(model);
+        if normalized.is_empty() {
+            return None;
+        }
+        if let Some(window) = self.context_windows.get(&normalized) {
+            return Some(*window);
+        }
+        let dashed = normalized.replace('.', "-");
+        // Catalog keys keep their `author/` prefix while local model ids usually
+        // drop it, so compare on the author-stripped slug with dots and dashes
+        // treated alike.
+        self.context_windows
+            .iter()
+            .find(|(id, _)| {
+                let slug = id.rsplit('/').next().unwrap_or(id);
+                slug.replace('.', "-") == dashed
+            })
+            .map(|(_, window)| *window)
+    }
+    pub fn context_window_count(&self) -> usize {
+        self.context_windows.len()
     }
     pub fn costs(
         &self,
@@ -274,6 +367,11 @@ impl Catalog {
     fn valid(&self) -> bool {
         !self.models.is_empty()
             && self.models.len() <= 10000
+            && self.context_windows.len() <= 10000
+            && self
+                .context_windows
+                .iter()
+                .all(|(id, window)| id.len() <= 200 && *window > 0 && *window <= MAX_CONTEXT_WINDOW)
             && self.models.iter().all(|(id, price)| {
                 id.len() <= 200
                     && (id.starts_with("openai/") || id.starts_with("anthropic/"))
@@ -305,13 +403,18 @@ struct Cache {
     fetched_at_ms: i64,
     catalog: Catalog,
 }
+
+/// Bumped to 2 when the catalog began retaining `context_length`, so a cached
+/// version-1 file (prices only, no windows) is discarded and refetched rather
+/// than silently reporting every context window as unknown.
+const CACHE_VERSION: u32 = 2;
 fn load_cache(dir: &Path, now: i64) -> Option<Cache> {
     let path = dir.join("openrouter-pricing.json");
     if fs::metadata(&path).ok()?.len() > MAX_BYTES as u64 {
         return None;
     }
     let cache: Cache = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (cache.version == 1
+    (cache.version == CACHE_VERSION
         && cache.fetched_at_ms > 0
         && cache.fetched_at_ms <= now + 300000
         && cache.catalog.valid())
@@ -442,7 +545,7 @@ fn refresh_with(
         .and_then(|bytes| Catalog::from_json(&bytes))
         .and_then(|catalog| {
             let cache = Cache {
-                version: 1,
+                version: CACHE_VERSION,
                 fetched_at_ms: now,
                 catalog,
             };

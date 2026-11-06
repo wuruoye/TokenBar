@@ -15,6 +15,11 @@
       "minWidth": 360, "minHeight": 520, "decorations": false,
       "resizable": true, "skipTaskbar": true, "visible": true,
       "center": true, "backgroundColor": "#101512"
+    }, {
+      "label": "workbench", "title": "上下文工作台", "url": "workbench.html",
+      "width": 1280, "height": 860, "minWidth": 880, "minHeight": 640,
+      "decorations": true, "resizable": true, "skipTaskbar": false, "visible": false,
+      "center": true, "backgroundColor": "#12141a"
     }],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost"

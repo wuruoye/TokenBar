@@ -40,6 +40,8 @@ struct SessionMetadata {
     workspace_key: Option<String>,
     workspace_label: Option<String>,
     fallback_model: String,
+    /// Grok Build publishes its own live context meter in `signals.json`.
+    session_context: Option<crate::ContextOccupancy>,
 }
 
 #[derive(Debug, Default)]
@@ -350,6 +352,10 @@ fn append_completed_turn(
         message.duration_ms = (emitted == 0).then_some(duration_ms).flatten();
         message.time_to_first_token_ms = time_to_first_token_ms;
         message.is_turn_start = emitted == 0;
+        // Deliberately no `prompt_tokens`: Grok's `inputTokens` sums every model
+        // call in the turn, so it is not a prompt size. The live context
+        // reading travels on `session_context` instead.
+        message.session_context = metadata.session_context.clone();
         if emitted == 0 {
             message.set_content_preview(prompt_preview.clone());
             message.set_output_preview(output_preview.clone());
@@ -413,7 +419,25 @@ fn session_metadata(path: &Path, summary: &Value) -> SessionMetadata {
         workspace_key,
         workspace_label,
         fallback_model,
+        session_context: read_session_context(path),
     }
+}
+
+/// Reads Grok Build's own context meter from the session's `signals.json`,
+/// which sits beside the `updates.jsonl` being parsed.
+///
+/// Grok's per-turn `inputTokens` totals every model call in the turn, so it
+/// cannot be read as a prompt size — a long turn would always look full. The
+/// CLI already computes the live reading, so TokenBar reuses it rather than
+/// inventing one. `signals.json` is absent in some sessions, which leaves the
+/// occupancy unknown instead of wrong.
+fn read_session_context(updates_path: &Path) -> Option<crate::ContextOccupancy> {
+    let signals = read_summary(&updates_path.with_file_name("signals.json"))?;
+    let used = integer_field(&signals, "contextTokensUsed", "context_tokens_used")
+        .filter(|used| *used > 0)?;
+    let window = integer_field(&signals, "contextWindowTokens", "context_window_tokens")
+        .filter(|window| *window > 0);
+    Some(crate::ContextOccupancy::new(used, window, None))
 }
 
 fn capture_user_chunk(pending: &mut PendingTurn, update: &Value, timestamp: i64) {

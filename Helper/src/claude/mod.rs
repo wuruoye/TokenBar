@@ -477,6 +477,14 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
+        // Claude bills the prompt across three disjoint buckets and records no
+        // context window, so the prompt total is their sum and capacity is
+        // resolved later from the pricing catalog.
+        let prompt_tokens = tokens
+            .input
+            .max(0)
+            .saturating_add(tokens.cache_read.max(0))
+            .saturating_add(tokens.cache_write.max(0));
         let mut unified = UnifiedMessage::new_with_agent(
             "claude",
             model,
@@ -487,6 +495,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             0.0,
             agent.clone(),
         );
+        unified.prompt_tokens = Some(prompt_tokens);
         unified.physical_session_id = Some(physical_session_id.clone());
         unified.cache_write_breakdown = cache_write_breakdown;
         unified.reasoning_effort = reasoning_effort;

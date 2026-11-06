@@ -869,6 +869,13 @@ fn build_messages(
             continue;
         };
         let descriptor = resolve_model(step, models);
+        // Antigravity stores no context window, so only the prompt total is
+        // known here; capacity is resolved from the pricing catalog.
+        let prompt_tokens = tokens
+            .input
+            .max(0)
+            .saturating_add(tokens.cache_read.max(0))
+            .saturating_add(tokens.cache_write.max(0));
         let mut message = UnifiedMessage::new_with_agent(
             "antigravity",
             descriptor.model_id.clone(),
@@ -880,6 +887,7 @@ fn build_messages(
             metadata.agent_name.clone(),
         );
         message.reasoning_effort = descriptor.reasoning_effort;
+        message.prompt_tokens = Some(prompt_tokens);
         message.physical_session_id = Some(metadata.conversation_id.clone());
         message.is_subagent = metadata.is_subagent;
         message.set_workspace(

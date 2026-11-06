@@ -18,11 +18,76 @@ pub mod memory;
 pub mod pricing;
 pub mod openrouter;
 pub mod usage;
+pub mod desktop_tasks;
+pub mod workbench;
 
 pub use usage::StatisticsTimeZone;
 use codex::{human_message_text, message_content_text};
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
+
+/// Approximate characters per token for the local prompt-composition estimate.
+/// Codex logs the text of its system prompt, so its share of the prompt can be
+/// approximated; no adapter logs tool schemas, so those are never invented.
+const CHARS_PER_TOKEN: i64 = 4;
+
+/// How full one model request's prompt was, against the model's context window.
+///
+/// This mirrors the harness "context meter": `prompt_tokens` is what the last
+/// request actually sent, `context_window` is the model's capacity, and the
+/// optional split names how much of the prompt was the system prompt. Every
+/// figure is a local observation — nothing here triggers a model call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextOccupancy {
+    /// Prompt tokens the provider saw on the measured request.
+    pub prompt_tokens: i64,
+    /// Model capacity, absent when neither the log nor the catalog knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    /// `prompt_tokens / context_window`, already clamped to 0–100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    /// Estimated system-prompt share, present only when the local log recorded
+    /// the system prompt text. Codex does; the other adapters do not, and an
+    /// absent field means "not observed", never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_tokens: Option<i64>,
+    /// The remainder of the prompt: conversation, tool results, and anything
+    /// else the adapter did not attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_tokens: Option<i64>,
+}
+
+impl ContextOccupancy {
+    /// Builds an occupancy reading, deriving `percent` and the message share.
+    ///
+    /// The system estimate is clamped to the measured prompt so a long system
+    /// prompt can never push the composition past the provider-reported total.
+    fn new(prompt_tokens: i64, context_window: Option<i64>, system_tokens: Option<i64>) -> Self {
+        let prompt_tokens = prompt_tokens.max(0);
+        let context_window = context_window.filter(|window| *window > 0);
+        let percent = context_window.map(|window| {
+            (prompt_tokens as f64 / window as f64 * 100.0).clamp(0.0, 100.0)
+        });
+        let system_tokens = system_tokens
+            .map(|tokens| tokens.max(0).min(prompt_tokens))
+            .filter(|_| prompt_tokens > 0);
+        Self {
+            prompt_tokens,
+            context_window,
+            percent,
+            system_tokens,
+            message_tokens: system_tokens.map(|system| prompt_tokens.saturating_sub(system)),
+        }
+    }
+}
+
+/// Estimates a token count from raw prompt text.
+pub(crate) fn estimate_tokens(text: &str) -> i64 {
+    let characters = text.chars().count() as i64;
+    characters.saturating_add(CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+}
 
 pub type SessionTitleMap = HashMap<(String, String), String>;
 
@@ -156,6 +221,9 @@ pub struct RequestSummary {
     pub session_path: Option<String>,
     pub prompt_preview: Option<String>,
     pub output_preview: Option<String>,
+    /// Prompt size against the model's context window for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextOccupancy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contributions: Vec<RequestSummary>,
 }
@@ -176,6 +244,11 @@ pub struct SessionSummary {
     pub cost_usd: f64,
     pub models: Vec<String>,
     pub requests: Vec<RequestSummary>,
+    /// Occupancy of this session's most recent main-thread request: how full the
+    /// context was when the session last ran. Subagent requests are excluded, so
+    /// the reading always describes the session's own conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextOccupancy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -310,6 +383,15 @@ struct RequestRow {
     request_start_timestamp: Option<i64>,
     request_end_timestamp: i64,
     is_turn_start: bool,
+    /// Prompt tokens this request sent, resolved by the adapter.
+    prompt_tokens: i64,
+    /// Context window recorded by the log for this request, when present.
+    context_window: Option<i64>,
+    /// Estimated system-prompt tokens, when the adapter could measure the text.
+    system_tokens: Option<i64>,
+    /// A session-scoped occupancy reading the agent published itself, used when
+    /// per-request usage cannot describe the live context (Grok Build).
+    session_context: Option<ContextOccupancy>,
 }
 
 #[derive(Debug, Clone)]
@@ -772,6 +854,41 @@ pub fn build_snapshot_with_platform_resets(
     session_titles: &SessionTitleMap,
     weekly_reset_at_ms: &HashMap<String, i64>,
 ) -> Result<ActivitySnapshot, String> {
+    build_snapshot_with_context_windows(
+        messages,
+        today,
+        generated_at_ms,
+        timezone,
+        day_count,
+        session_titles,
+        weekly_reset_at_ms,
+        None,
+    )
+}
+
+/// Builds the snapshot, resolving missing context windows from a catalog.
+///
+/// Codex and Grok record the window in their own logs. Claude Code and
+/// Antigravity never do, so their occupancy stays unknown unless the caller
+/// supplies a model-to-window lookup such as the OpenRouter catalog.
+#[allow(clippy::too_many_arguments)]
+pub fn build_snapshot_with_context_windows(
+    mut messages: Vec<UnifiedMessage>,
+    today: NaiveDate,
+    generated_at_ms: i64,
+    timezone: String,
+    day_count: usize,
+    session_titles: &SessionTitleMap,
+    weekly_reset_at_ms: &HashMap<String, i64>,
+    windows: Option<&openrouter::Catalog>,
+) -> Result<ActivitySnapshot, String> {
+    if let Some(windows) = windows {
+        for message in &mut messages {
+            if message.context_window.is_none() {
+                message.context_window = windows.context_window(&message.model_id);
+            }
+        }
+    }
     let discovered_platforms = messages
         .iter()
         .map(|message| message.client.clone())
@@ -1079,6 +1196,11 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
     } else {
         Some(0)
     };
+    // Read the occupancy fields before the struct literal moves `message`.
+    let prompt_tokens = message.resolved_prompt_tokens();
+    let context_window = message.context_window.filter(|window| *window > 0);
+    let system_tokens = message.system_tokens.filter(|tokens| *tokens >= 0);
+    let session_context = message.session_context.clone();
 
     let generation_metrics = model_duration_ms.filter(|duration| *duration > 0)
         .map(|duration_ms| GenerationMetrics {
@@ -1115,6 +1237,10 @@ fn request_row(message: UnifiedMessage) -> Option<RequestRow> {
         request_start_timestamp,
         request_end_timestamp: message.timestamp,
         is_turn_start: message.is_turn_start,
+        prompt_tokens,
+        context_window,
+        system_tokens,
+        session_context,
     })
 }
 
@@ -1240,6 +1366,18 @@ fn merge_request(target: &mut RequestRow, row: RequestRow) {
         .saturating_add(row.generation_metrics.generated_tokens);
     target.generation_metrics.duration_ms = target.generation_metrics.duration_ms
         .saturating_add(row.generation_metrics.duration_ms);
+    // Occupancy describes one request, not a sum: a turn keeps whichever
+    // contributing request ran last, so its reading matches the context the
+    // model actually saw at the end of the turn. Decide ownership before the
+    // end-timestamp merge below overwrites the target's value.
+    let row_is_latest = row.request_end_timestamp >= target.request_end_timestamp;
+    if row_is_latest {
+        target.prompt_tokens = row.prompt_tokens;
+        target.context_window = row.context_window.or(target.context_window);
+        target.system_tokens = row.system_tokens;
+    } else if target.context_window.is_none() {
+        target.context_window = row.context_window;
+    }
     if target.reasoning_effort != row.reasoning_effort {
         target.reasoning_effort = None;
     }
@@ -1363,6 +1501,23 @@ fn build_today_sessions(
         }
 
         let mut occurrences: HashMap<String, usize> = HashMap::new();
+        // The session's own context is the last main-thread request's: a
+        // subagent has its own separate context, so it never speaks for the
+        // session. `rows` is unordered, so pick by end timestamp. Computed
+        // before `session_turns` is consumed below.
+        //
+        // An agent that publishes its own session meter (Grok Build) wins over
+        // the per-request reading, because its per-turn usage cannot be read as
+        // a prompt size.
+        let context = rows
+            .iter()
+            .filter(|row| !row.is_subagent)
+            .max_by_key(|row| row.request_end_timestamp)
+            .and_then(|row| {
+                row.session_context
+                    .clone()
+                    .or_else(|| occupancy_for(row))
+            });
         let mut request_summaries = session_turns
             .into_iter()
             .map(|turn| turn_summary(turn, &mut occurrences))
@@ -1388,6 +1543,7 @@ fn build_today_sessions(
             cost_usd,
             models: models.into_iter().collect(),
             requests: request_summaries,
+            context,
         });
     }
 
@@ -1497,6 +1653,8 @@ fn request_summary_with_id(
     contributions: Vec<RequestSummary>,
 ) -> RequestSummary {
     let started_at_ms = row.started_at_ms();
+    // Computed before the struct literal, which moves `row`'s owned fields.
+    let context = occupancy_for(&row);
     RequestSummary {
         id,
         platform: row.source,
@@ -1520,8 +1678,19 @@ fn request_summary_with_id(
         session_path: row.session_path,
         prompt_preview: row.prompt_preview,
         output_preview: row.output_preview,
+        context,
         contributions,
     }
+}
+
+/// Builds the occupancy reading for one aggregated request row.
+///
+/// `context_window` is resolved by the caller when the log recorded none, so a
+/// row with no window simply has no capacity to divide by.
+fn occupancy_for(row: &RequestRow) -> Option<ContextOccupancy> {
+    (row.prompt_tokens > 0).then(|| {
+        ContextOccupancy::new(row.prompt_tokens, row.context_window, row.system_tokens)
+    })
 }
 
 fn request_base_id(row: &RequestRow) -> String {

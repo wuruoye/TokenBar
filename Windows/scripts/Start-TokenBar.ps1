@@ -11,4 +11,11 @@ if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
 # Stop any running TokenBar instances to prevent single-instance collisions.
 Get-Process -Name tokenbar-windows -ErrorAction SilentlyContinue |
     Stop-Process -Force
-Start-Process -FilePath $application -WorkingDirectory (Split-Path -Parent $application) -WindowStyle Hidden
+$workDir = Split-Path -Parent $application
+$cim = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine      = "`"$application`""
+    CurrentDirectory = $workDir
+} -ErrorAction SilentlyContinue
+if ($null -eq $cim -or $cim.ReturnValue -ne 0) {
+    Start-Process -FilePath $application -WorkingDirectory $workDir -WindowStyle Hidden
+}

@@ -27,13 +27,13 @@ use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverC
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, GooglePricing};
 use tokenbar_helper::usage::BillingBasis;
 use tokenbar_helper::{
-    build_snapshot_with_platform_resets, extract_request_detail as extract_codex_request_detail,
+    build_snapshot_with_context_windows, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
     StatisticsTimeZone,
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper context-workbench list\n       tokenbar-helper context-workbench show --platform dsh|grok --session-id ID\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -86,6 +86,8 @@ struct RequestDetailConfig {
 enum Command {
     Snapshot(SnapshotConfig),
     RequestDetail(RequestDetailConfig),
+    WorkbenchList,
+    WorkbenchShow { platform: String, session_id: String },
     MemoryReceiver(MemoryReceiverConfig),
 }
 
@@ -127,6 +129,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             .map_err(io::Error::other)?;
             write_json(&detail)
+        }
+        Command::WorkbenchList => write_json(&tokenbar_helper::workbench::list_sessions().map_err(io::Error::other)?),
+        Command::WorkbenchShow { platform, session_id } => {
+            write_json(&tokenbar_helper::workbench::show_session(&platform, &session_id).map_err(io::Error::other)?)
         }
         Command::MemoryReceiver(config) => run_receiver(config).map_err(io::Error::other).map_err(Into::into),
     }
@@ -213,7 +219,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .and_then(|path| AnthropicPricing::from_official_markdown_file(path, today).ok())
         .unwrap_or_else(|| AnthropicPricing::bundled_for_date(today))
-        .with_openrouter_catalog(catalog);
+        .with_openrouter_catalog(catalog.clone());
     let claude_messages = parse_local_claude_messages(
         ClaudeParseOptions {
             home_dir: home_dir.clone(),
@@ -279,7 +285,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     if let Some(timestamp) = config.antigravity_weekly_reset_ms {
         weekly_resets.insert("antigravity".to_string(), timestamp);
     }
-    let mut snapshot = build_snapshot_with_platform_resets(
+    let mut snapshot = build_snapshot_with_context_windows(
         messages,
         today,
         generated_at_ms,
@@ -287,6 +293,7 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         config.days,
         &session_titles,
         &weekly_resets,
+        catalog.as_deref(),
     )
     .map_err(io::Error::other)?;
     if let Some(database_path) = config.memory_database.as_deref() {
@@ -384,6 +391,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
     }
     if first.to_str() == Some("memory-receiver") {
         return parse_memory_receiver_args(args).map(Command::MemoryReceiver);
+    }
+    if first.to_str() == Some("context-workbench") {
+        return parse_workbench_args(args);
     }
 
     parse_snapshot_args(std::iter::once(first).chain(args)).map(Command::Snapshot)
@@ -516,6 +526,48 @@ fn parse_snapshot_args(args: impl IntoIterator<Item = OsString>) -> Result<Snaps
     }
 
     Ok(config)
+}
+
+fn parse_workbench_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    let action = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or("context-workbench requires list or show")?;
+    match action.as_str() {
+        "list" => Ok(Command::WorkbenchList),
+        "show" => {
+            let mut platform = None;
+            let mut session_id = None;
+            while let Some(argument) = args.next() {
+                match argument.to_str() {
+                    Some("--platform") => {
+                        platform = Some(
+                            args.next()
+                                .and_then(|value| value.into_string().ok())
+                                .ok_or("--platform requires a value")?,
+                        );
+                    }
+                    Some("--session-id") => {
+                        session_id = Some(
+                            args.next()
+                                .and_then(|value| value.into_string().ok())
+                                .ok_or("--session-id requires a value")?,
+                        );
+                    }
+                    Some(other) => return Err(format!("unknown context-workbench show flag {other}")),
+                    None => return Err("arguments must be valid UTF-8".to_string()),
+                }
+            }
+            Ok(Command::WorkbenchShow {
+                platform: platform.ok_or("context-workbench show requires --platform")?,
+                session_id: session_id.ok_or("context-workbench show requires --session-id")?,
+            })
+        }
+        other => Err(format!("unknown context-workbench action {other}")),
+    }
 }
 
 fn parse_memory_receiver_args(

@@ -1,7 +1,12 @@
 use crate::{process, settings::Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime},
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -10,6 +15,13 @@ pub struct Window {
     pub used_percent: f64,
     pub window_minutes: Option<i64>,
     pub resets_at_ms: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaGroup {
+    pub label: String,
+    pub session: Option<Window>,
+    pub weekly: Option<Window>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +32,8 @@ pub struct Quota {
     pub error: Option<String>,
     #[serde(default)]
     pub available_reset_credits: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_group: Option<QuotaGroup>,
 }
 pub type Quotas = BTreeMap<String, Quota>;
 
@@ -208,6 +222,7 @@ fn parse_claude(payload: &Value) -> Result<Quota, String> {
         updated_at_ms: chrono::Utc::now().timestamp_millis(),
         error: None,
         available_reset_credits: None,
+        secondary_group: None,
     };
     if quota.session.is_none() && quota.weekly.is_none() {
         return Err("Claude 未返回额度窗口。".into());
@@ -269,6 +284,7 @@ fn parse_grok(record: &Value) -> Result<Quota, String> {
         updated_at_ms: date(&record["ts"]).unwrap_or(0),
         error: None,
         available_reset_credits: None,
+        secondary_group: None,
     })
 }
 
@@ -308,6 +324,18 @@ fn extract_http_port(content: &str) -> Option<u16> {
     last
 }
 
+fn compact_group_label(display_name: Option<&str>) -> String {
+    let Some(trimmed) = display_name.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "Claude & GPT".into();
+    };
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("claude") && lower.contains("gpt") {
+        "Claude & GPT".into()
+    } else {
+        trimmed.into()
+    }
+}
+
 fn parse_antigravity(payload: &Value) -> Result<Quota, String> {
     let groups = payload
         .get("response")
@@ -315,35 +343,48 @@ fn parse_antigravity(payload: &Value) -> Result<Quota, String> {
         .and_then(|g| g.as_array())
         .ok_or("Antigravity 返回了无法解析的额度数据。")?;
 
-    let lowest_fraction = |group: &Value| -> f64 {
-        group
-            .get("buckets")
-            .and_then(|b| b.as_array())
-            .map(|buckets| {
-                buckets
-                    .iter()
-                    .filter_map(|b| number(&b["remainingFraction"]))
-                    .fold(1.0, f64::min)
-            })
-            .unwrap_or(1.0)
-    };
-
-    let most_constrained = groups
+    let non_empty: Vec<&Value> = groups
         .iter()
         .filter(|g| {
             g.get("buckets")
                 .and_then(|b| b.as_array())
                 .is_some_and(|b| !b.is_empty())
         })
-        .min_by(|a, b| {
-            lowest_fraction(a)
-                .partial_cmp(&lowest_fraction(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .ok_or("Antigravity 未提供额度资源池。")?;
+        .collect();
+    if non_empty.is_empty() {
+        return Err("Antigravity 未提供额度资源池。".into());
+    }
 
-    let window = |window_name: &str, minutes: i64| -> Option<Window> {
-        let bucket = most_constrained
+    let primary_index = non_empty
+        .iter()
+        .position(|group| {
+            let has_gemini_bucket = group
+                .get("buckets")
+                .and_then(|b| b.as_array())
+                .is_some_and(|buckets| {
+                    buckets.iter().any(|b| {
+                        b.get("bucketId")
+                            .and_then(|id| id.as_str())
+                            .is_some_and(|id| id.to_ascii_lowercase().starts_with("gemini"))
+                    })
+                });
+            let has_gemini_name = group
+                .get("displayName")
+                .and_then(|name| name.as_str())
+                .is_some_and(|name| name.to_ascii_lowercase().contains("gemini"));
+            has_gemini_bucket || has_gemini_name
+        })
+        .unwrap_or(0);
+
+    let primary = non_empty[primary_index];
+    let secondary = non_empty
+        .iter()
+        .enumerate()
+        .find(|(idx, _)| *idx != primary_index)
+        .map(|(_, g)| *g);
+
+    let window_in_group = |group: &Value, window_name: &str, minutes: i64| -> Option<Window> {
+        let bucket = group
             .get("buckets")?
             .as_array()?
             .iter()
@@ -356,12 +397,26 @@ fn parse_antigravity(payload: &Value) -> Result<Quota, String> {
         })
     };
 
+    let secondary_group = secondary.and_then(|group| {
+        let session = window_in_group(group, "5h", 300);
+        let weekly = window_in_group(group, "weekly", 10080);
+        if session.is_none() && weekly.is_none() {
+            return None;
+        }
+        Some(QuotaGroup {
+            label: compact_group_label(group.get("displayName").and_then(|n| n.as_str())),
+            session,
+            weekly,
+        })
+    });
+
     let quota = Quota {
-        session: window("5h", 300),
-        weekly: window("weekly", 10080),
+        session: window_in_group(primary, "5h", 300),
+        weekly: window_in_group(primary, "weekly", 10080),
         updated_at_ms: chrono::Utc::now().timestamp_millis(),
         error: None,
         available_reset_credits: None,
+        secondary_group,
     };
     if quota.session.is_none() && quota.weekly.is_none() {
         return Err("Antigravity 未返回额度窗口。".into());
@@ -369,7 +424,124 @@ fn parse_antigravity(payload: &Value) -> Result<Quota, String> {
     Ok(quota)
 }
 
-async fn antigravity(_settings: &Settings) -> Result<Quota, String> {
+fn daemon_endpoints(dir: &Path) -> Vec<(u16, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(PathBuf, SystemTime, bool)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() || meta.len() > 64 * 1024 {
+                return None;
+            }
+            let is_hub = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("hub_"));
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((path, modified, is_hub))
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        if a.2 != b.2 {
+            b.2.cmp(&a.2)
+        } else {
+            b.1.cmp(&a.1)
+        }
+    });
+
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::new();
+    for (path, _, _) in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(port) = record["httpPort"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p > 0)
+        else {
+            continue;
+        };
+        let Some(token) = record["csrfToken"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if seen.insert(port) {
+            endpoints.push((port, token));
+        }
+    }
+    endpoints
+}
+
+enum AntigravityAttemptError {
+    ServerUnavailable,
+    RequestFailed(String),
+}
+
+async fn fetch_antigravity_endpoint(
+    client: &reqwest::Client,
+    port: u16,
+    token: &str,
+) -> Result<Quota, AntigravityAttemptError> {
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-codeium-csrf-token", token)
+        .body("{}")
+        .send()
+        .await
+        .map_err(|_| AntigravityAttemptError::ServerUnavailable)?;
+
+    if !response.status().is_success() {
+        return Err(AntigravityAttemptError::RequestFailed(format!(
+            "Antigravity 额度查询失败（HTTP {}）。",
+            response.status().as_u16()
+        )));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|_| AntigravityAttemptError::RequestFailed("Antigravity 额度响应无效。".into()))?;
+    parse_antigravity(&payload).map_err(AntigravityAttemptError::RequestFailed)
+}
+
+async fn antigravity(settings: &Settings) -> Result<Quota, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "无法初始化额度请求。")?;
+
+    let daemon_dir = settings.root("antigravity").join("daemon");
+    let mut daemon_error: Option<String> = None;
+    for (port, token) in daemon_endpoints(&daemon_dir) {
+        match fetch_antigravity_endpoint(&client, port, &token).await {
+            Ok(quota) => return Ok(quota),
+            Err(AntigravityAttemptError::ServerUnavailable) => continue,
+            Err(AntigravityAttemptError::RequestFailed(err)) => {
+                if daemon_error.is_none() {
+                    daemon_error = Some(err);
+                }
+            }
+        }
+    }
+
     let log_dir = std::env::var_os("ANTIGRAVITY_LOG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -386,44 +558,36 @@ async fn antigravity(_settings: &Settings) -> Result<Quota, String> {
                 .join("logs")
         });
 
-    let main_log_bytes = tokio::fs::read(log_dir.join("main.log"))
-        .await
-        .map_err(|_| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。")?;
-    let server_log_bytes = tokio::fs::read(log_dir.join("language_server.log"))
-        .await
-        .map_err(|_| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。")?;
+    let Ok(main_log_bytes) = tokio::fs::read(log_dir.join("main.log")).await else {
+        return Err(daemon_error
+            .unwrap_or_else(|| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。".into()));
+    };
+    let Ok(server_log_bytes) = tokio::fs::read(log_dir.join("language_server.log")).await else {
+        return Err(daemon_error
+            .unwrap_or_else(|| "未找到 Antigravity 本地日志，请先启动一次 Antigravity。".into()));
+    };
 
     let main_log = String::from_utf8_lossy(&main_log_bytes);
     let server_log = String::from_utf8_lossy(&server_log_bytes);
 
-    let token = extract_csrf_token(&main_log)
-        .ok_or("Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
-    let port = extract_http_port(&server_log)
-        .ok_or("Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
+    let Some(token) = extract_csrf_token(&main_log) else {
+        return Err(daemon_error.unwrap_or_else(|| {
+            "Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。".into()
+        }));
+    };
+    let Some(port) = extract_http_port(&server_log) else {
+        return Err(daemon_error.unwrap_or_else(|| {
+            "Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。".into()
+        }));
+    };
 
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "无法初始化额度请求。")?
-        .post(format!(
-            "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-        ))
-        .header("Content-Type", "application/json")
-        .header("x-codeium-csrf-token", token)
-        .body("{}")
-        .send()
-        .await
-        .map_err(|_| "Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。")?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "Antigravity 额度查询失败（HTTP {}）。",
-            response.status().as_u16()
-        ));
+    match fetch_antigravity_endpoint(&client, port, &token).await {
+        Ok(quota) => Ok(quota),
+        Err(AntigravityAttemptError::ServerUnavailable) => Err(daemon_error.unwrap_or_else(|| {
+            "Antigravity 本地服务未运行，请打开 Antigravity 以刷新额度。".into()
+        })),
+        Err(AntigravityAttemptError::RequestFailed(err)) => Err(daemon_error.unwrap_or(err)),
     }
-    let payload: Value = response.json().await.map_err(|_| "Antigravity 额度响应无效。")?;
-    parse_antigravity(&payload)
 }
 
 pub async fn fetch(settings: &Settings, previous: &Quotas) -> Quotas {

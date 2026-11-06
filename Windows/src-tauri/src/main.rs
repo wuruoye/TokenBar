@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod companion;
 mod process;
 mod diagnostics;
 mod lifecycle;
@@ -28,7 +29,11 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
-use tokenbar_helper::{ActivitySnapshot, RequestDetail, RequestSummary};
+use tokenbar_helper::{
+    desktop_tasks::{DesktopTaskMonitor, DesktopTaskSnapshot},
+    workbench::{WorkbenchDocument, WorkbenchIndex},
+    ActivitySnapshot, RequestDetail, RequestSummary,
+};
 use tokio::sync::{Mutex, Notify};
 
 #[derive(Clone, Serialize)]
@@ -42,6 +47,7 @@ struct Dashboard {
     memory_status: String,
     remote_snapshots: Vec<sync::Remote>,
     sync_status: String,
+    desktop_tasks: DesktopTaskSnapshot,
 }
 struct AppState {
     dashboard: Mutex<Dashboard>,
@@ -53,6 +59,7 @@ struct AppState {
     panel_creation: Mutex<()>,
     taskbar: taskbar::Controller,
     panel_platform: std::sync::Mutex<String>,
+    task_monitor: std::sync::Mutex<DesktopTaskMonitor>,
     dir: PathBuf,
     helper: PathBuf,
 }
@@ -138,10 +145,11 @@ fn toggle_existing_panel(app: &tauri::AppHandle, window: &tauri::WebviewWindow, 
 
 #[tauri::command]
 fn get_taskbar_status(app: tauri::AppHandle) -> taskbar::Status {
-    state(&app).taskbar.status()
+    app.try_state::<Arc<AppState>>().map(|s| s.taskbar.status()).unwrap_or_default()
 }
 #[tauri::command]
 fn get_active_platform(app: tauri::AppHandle) -> String {
+    if app.try_state::<Arc<AppState>>().is_none() { return "codex".into(); }
     state(&app)
         .panel_platform
         .lock()
@@ -297,6 +305,9 @@ async fn refresh(app: tauri::AppHandle) {
 
 #[tauri::command]
 async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
+    while app.try_state::<Arc<AppState>>().is_none() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     state(&app).dashboard.lock().await.clone()
 }
 #[tauri::command]
@@ -369,6 +380,12 @@ async fn save_settings(
         dashboard.settings = settings;
     }
     drop(_guard);
+    {
+        let show_comp = state.dashboard.lock().await.settings.show_companion;
+        if show_comp != old.show_companion {
+            let _ = companion::ensure_companion_window(&app, show_comp, false).await;
+        }
+    }
     state.timer_changed.notify_one();
     publish(&app, &state).await;
     tauri::async_runtime::spawn(refresh(app));
@@ -523,6 +540,234 @@ async fn open_session(
     }
 }
 
+#[tauri::command]
+fn open_workbench(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("workbench") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    Err("上下文工作台窗口不可用。".into())
+}
+
+#[tauri::command]
+async fn workbench_list(app: tauri::AppHandle) -> Result<WorkbenchIndex, String> {
+    let state = state(&app);
+    let settings = state.dashboard.lock().await.settings.clone();
+    let mut command = process::command(&state.helper, &settings);
+    command.args(["context-workbench", "list"]);
+    let bytes = process::capture(command, 60).await?;
+    serde_json::from_slice(&bytes).map_err(|_| "工作台会话列表格式无效。".into())
+}
+
+#[tauri::command]
+async fn workbench_show(
+    app: tauri::AppHandle,
+    platform: String,
+    session_id: String,
+) -> Result<WorkbenchDocument, String> {
+    let state = state(&app);
+    let settings = state.dashboard.lock().await.settings.clone();
+    let mut command = process::command(&state.helper, &settings);
+    command.args([
+        "context-workbench",
+        "show",
+        "--platform",
+        &platform,
+        "--session-id",
+        &session_id,
+    ]);
+    let bytes = process::capture(command, 60).await?;
+    serde_json::from_slice(&bytes).map_err(|_| "工作台会话详情格式无效。".into())
+}
+
+async fn poll_desktop_tasks_now(app: &tauri::AppHandle) -> DesktopTaskSnapshot {
+    while app.try_state::<Arc<AppState>>().is_none() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let state = state(app);
+    let settings = state.dashboard.lock().await.settings.clone();
+    let codex_root = settings.root("codex");
+    let antigravity_root = settings.root("antigravity");
+    let worker = state.clone();
+    let polled = tauri::async_runtime::spawn_blocking(move || {
+        let events = companion::drain_foreground_events();
+        let fg = companion::foreground_platform();
+        let (agy_running, agy_launched) = companion::app_process_state("Antigravity.exe");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut monitor = worker
+            .task_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (platform, at) in events {
+            monitor.record_foreground(platform, at);
+        }
+        // Sampling keeps the visit state right even if the hook missed a switch.
+        monitor.record_foreground(fg, now_ms);
+        monitor.set_app_state("antigravity", agy_running, agy_launched);
+        monitor.poll(&codex_root, &antigravity_root, now_ms)
+    })
+    .await;
+    let Ok(snapshot) = polled else {
+        return state.dashboard.lock().await.desktop_tasks.clone();
+    };
+    let changed = {
+        let mut dashboard = state.dashboard.lock().await;
+        let changed = dashboard.desktop_tasks.running != snapshot.running
+            || dashboard.desktop_tasks.background != snapshot.background
+            || dashboard.desktop_tasks.unread != snapshot.unread
+            || dashboard.desktop_tasks.recent != snapshot.recent;
+        dashboard.desktop_tasks = snapshot.clone();
+        changed
+    };
+    if changed {
+        let _ = app.emit("desktop-tasks-updated", &snapshot);
+    }
+    snapshot
+}
+
+#[tauri::command]
+async fn get_desktop_tasks(app: tauri::AppHandle) -> DesktopTaskSnapshot {
+    poll_desktop_tasks_now(&app).await
+}
+
+#[tauri::command]
+async fn open_desktop_task(
+    app: tauri::AppHandle,
+    platform: String,
+    task_id: String,
+    workspace_path: Option<String>,
+    title: Option<String>,
+) -> Result<(), String> {
+    let state = state(&app);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    {
+        let mut monitor = state
+            .task_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        monitor.mark_opened(&platform, &task_id, now_ms);
+    }
+    let antigravity_root = state.dashboard.lock().await.settings.root("antigravity");
+    let opened = companion::open_task_session(
+        &app,
+        &platform,
+        &task_id,
+        workspace_path.as_deref(),
+        title.as_deref(),
+        &antigravity_root,
+    );
+    let _ = poll_desktop_tasks_now(&app).await;
+    opened
+}
+
+#[tauri::command]
+async fn mark_task_read(
+    app: tauri::AppHandle,
+    platform: String,
+    task_id: String,
+) -> DesktopTaskSnapshot {
+    let state = state(&app);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    {
+        let mut monitor = state
+            .task_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        monitor.dismiss(&platform, &task_id, now_ms);
+    }
+    if platform == "antigravity" {
+        let agy_root = state.dashboard.lock().await.settings.root("antigravity");
+        let cid = task_id.clone();
+        std::thread::spawn(move || {
+            companion::sync_antigravity_read_annotation(&agy_root, &cid);
+        });
+    }
+    poll_desktop_tasks_now(&app).await
+}
+
+#[tauri::command]
+async fn mark_all_tasks_read(app: tauri::AppHandle) -> DesktopTaskSnapshot {
+    let state = state(&app);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let unread_agy_ids: Vec<String> = {
+        let dashboard = state.dashboard.lock().await;
+        dashboard
+            .desktop_tasks
+            .unread
+            .iter()
+            .filter(|t| t.platform == "antigravity")
+            .map(|t| t.id.clone())
+            .collect()
+    };
+    {
+        let mut monitor = state
+            .task_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        monitor.dismiss_all(now_ms);
+    }
+    if !unread_agy_ids.is_empty() {
+        let agy_root = state.dashboard.lock().await.settings.root("antigravity");
+        std::thread::spawn(move || {
+            for cid in unread_agy_ids {
+                companion::sync_antigravity_read_annotation(&agy_root, &cid);
+            }
+        });
+    }
+    poll_desktop_tasks_now(&app).await
+}
+
+#[tauri::command]
+async fn toggle_companion(app: tauri::AppHandle) -> Result<bool, String> {
+    let visible = app
+        .get_webview_window("companion")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let next = !visible;
+    companion::ensure_companion_window(&app, next, true).await?;
+    let state = state(&app);
+    let mut dashboard = state.dashboard.lock().await;
+    dashboard.settings.show_companion = next;
+    let _ = settings::save(&state.dir, &dashboard.settings);
+    Ok(next)
+}
+
+/// Resizes the companion window while keeping its bottom-right corner in place.
+#[tauri::command]
+fn companion_resize(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
+    let window = app.get_webview_window("companion").ok_or("悬浮窗不可用。")?;
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let new_width = (width.clamp(40.0, 640.0) * scale).round() as u32;
+    let new_height = (height.clamp(40.0, 900.0) * scale).round() as u32;
+    if new_width == size.width && new_height == size.height {
+        return Ok(());
+    }
+    let right = position.x + size.width as i32;
+    let bottom = position.y + size.height as i32;
+    window
+        .set_size(tauri::PhysicalSize::new(new_width, new_height))
+        .map_err(|e| e.to_string())?;
+    window
+        .set_position(tauri::PhysicalPosition::new(
+            right - new_width as i32,
+            bottom - new_height as i32,
+        ))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_companion_visible(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
+    companion::ensure_companion_window(&app, visible, false).await?;
+    let state = state(&app);
+    let mut dashboard = state.dashboard.lock().await;
+    dashboard.settings.show_companion = visible;
+    let _ = settings::save(&state.dir, &dashboard.settings);
+    Ok(())
+}
+
 fn find_antigravity_binary() -> Option<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let candidate = PathBuf::from(local).join("Programs/antigravity/Antigravity.exe");
@@ -554,8 +799,10 @@ fn main() {
         ($($extra:path),*) => {
             tauri::generate_handler![
                 get_dashboard, refresh_dashboard, save_settings, set_pinned,
-                request_detail, copy_text, open_session,
-                get_taskbar_status, get_active_platform, set_active_platform, set_sync_scope
+                request_detail, copy_text, open_session, open_workbench, workbench_list, workbench_show,
+                get_taskbar_status, get_active_platform, set_active_platform, set_sync_scope,
+                get_desktop_tasks, open_desktop_task, mark_task_read, mark_all_tasks_read,
+                toggle_companion, set_companion_visible, companion_resize
                 $(,$extra)*
             ]
         };
@@ -606,6 +853,9 @@ fn main() {
                 .unwrap_or_default();
             let cached_remotes = sync_state::cached_remotes(&dir, &settings);
             let sync_status = if !settings.sync_enabled { "未启用" } else if cached_remotes.is_empty() { "等待同步" } else { "已载入上次同步记录" }.to_string();
+            let show_companion_initial = settings.show_companion;
+            let initial_monitor = DesktopTaskMonitor::new(Some(dir.join("desktop-task-tracker.json")));
+            let initial_tasks = DesktopTaskSnapshot::default();
             app.manage(Arc::new(AppState {
                 dashboard: Mutex::new(Dashboard {
                     settings,
@@ -615,6 +865,7 @@ fn main() {
                     error,
                     memory_status: "未启用".into(),
                     remote_snapshots: cached_remotes,
+                    desktop_tasks: initial_tasks,
                     sync_status,
                 }),
                 refresh_lock: Mutex::new(()),
@@ -625,15 +876,17 @@ fn main() {
                 panel_creation: Mutex::new(()),
                 taskbar: taskbar::Controller::new(),
                 panel_platform: std::sync::Mutex::new("codex".into()),
+                task_monitor: std::sync::Mutex::new(initial_monitor),
                 dir,
                 helper,
             }));
             state(app.handle()).taskbar.start(app.handle().clone());
             let open = MenuItem::with_id(app, "open", "打开 TokenBar", true, None::<&str>)?;
+            let companion_item = MenuItem::with_id(app, "companion", "切换任务悬浮窗", true, None::<&str>)?;
             let refresh_item = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
             let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出 TokenBar", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &refresh_item, &settings_item, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &companion_item, &refresh_item, &settings_item, &quit])?;
             TrayIconBuilder::with_id("tokenbar")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("TokenBar")
@@ -641,6 +894,12 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show(app),
+                    "companion" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = toggle_companion(handle).await;
+                        });
+                    }
                     "refresh" => {
                         tauri::async_runtime::spawn(refresh(app.clone()));
                     }
@@ -674,12 +933,39 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            if show_companion_initial {
+                let comp_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = companion::ensure_companion_window(&comp_app, true, false).await;
+                });
+            }
+            if let Some(window) = app.get_webview_window("workbench") {
+                let hide = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = hide.hide();
+                    }
+                });
+            }
             if std::env::args().any(|a| a == "--background") {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
             }
             let handle = app.handle().clone();
+            let tasks_app = handle.clone();
+            companion::start_foreground_hook();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let state = state(&tasks_app);
+                    if state.exiting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = poll_desktop_tasks_now(&tasks_app).await;
+                }
+            });
             diagnostics::record("primary-ready", serde_json::json!({}));
             let health_app = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -721,15 +1007,18 @@ fn main() {
                 let _ = window.hide();
                 diagnostics::record("panel-close-hidden", serde_json::json!({}));
             }
-            tauri::WindowEvent::Destroyed => {
+            tauri::WindowEvent::Destroyed if window.label() == "main" => {
                 diagnostics::record("panel-destroyed", serde_json::json!({"label":window.label()}));
-                state(window.app_handle()).pinned.store(false, Ordering::Relaxed);
+                if let Some(s) = window.app_handle().try_state::<Arc<AppState>>() {
+                    s.pinned.store(false, Ordering::Relaxed);
+                }
             }
-            tauri::WindowEvent::Focused(false)
-                if !state(window.app_handle()).pinned.load(Ordering::Relaxed)
-                    && !state(window.app_handle()).taskbar.pointer_pressed() =>
-            {
-                let _ = window.hide();
+            tauri::WindowEvent::Focused(false) if window.label() == "main" => {
+                if let Some(s) = window.app_handle().try_state::<Arc<AppState>>() {
+                    if !s.pinned.load(Ordering::Relaxed) && !s.taskbar.pointer_pressed() {
+                        let _ = window.hide();
+                    }
+                }
             }
             _ => {}
         })

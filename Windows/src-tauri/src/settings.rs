@@ -26,6 +26,7 @@ pub struct Settings {
     pub taskbar_platform: String,
     pub taskbar_position: String,
     pub uses_weekday_weekly_pacing: bool,
+    pub show_companion: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +53,7 @@ impl Default for Settings {
             taskbar_platform: "all".into(),
             taskbar_position: "right".into(),
             uses_weekday_weekly_pacing: false,
+            show_companion: true,
         }
     }
 }

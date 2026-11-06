@@ -235,6 +235,41 @@ pub struct UnifiedMessage {
     pub output_preview: Option<String>,
     #[serde(default)]
     pub is_turn_start: bool,
+    /// Prompt tokens the provider saw on this request, before the reply. Codex
+    /// reports it directly; the other adapters sum their disjoint input
+    /// buckets. This is the numerator of context occupancy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i64>,
+    /// The model's context window at the time of this request, when the local
+    /// log records one. Only Codex and Grok do; elsewhere it is resolved from
+    /// the pricing catalog. Read per event, never cached per session, because
+    /// Codex switches windows mid-session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    /// Estimated system-prompt tokens, recorded only where the adapter can read
+    /// the system prompt text locally (Codex). Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_tokens: Option<i64>,
+    /// A session-scoped occupancy reading the agent published itself, when its
+    /// per-request usage cannot be read as a prompt size. Grok Build is the
+    /// case: its `inputTokens` totals every model call in a turn, so only the
+    /// context meter it writes to `signals.json` describes the live context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_context: Option<crate::ContextOccupancy>,
+}
+
+impl UnifiedMessage {
+    /// The request's prompt size: the explicit provider figure when the adapter
+    /// recorded one, otherwise every disjoint input bucket summed.
+    pub fn resolved_prompt_tokens(&self) -> i64 {
+        self.prompt_tokens.unwrap_or_else(|| {
+            self.tokens
+                .input
+                .max(0)
+                .saturating_add(self.tokens.cache_read.max(0))
+                .saturating_add(self.tokens.cache_write.max(0))
+        })
+    }
 }
 
 const fn default_message_count() -> i32 {
@@ -283,6 +318,10 @@ impl UnifiedMessage {
             content_preview: None,
             output_preview: None,
             is_turn_start: false,
+            prompt_tokens: None,
+            context_window: None,
+            system_tokens: None,
+            session_context: None,
         }
     }
 
@@ -475,7 +514,7 @@ fn strip_reasoning_tier(model_id: &str) -> Option<&str> {
     .then_some(base_model)
 }
 
-fn strip_date_snapshot(model_id: &str) -> Option<&str> {
+pub(crate) fn strip_date_snapshot(model_id: &str) -> Option<&str> {
     if let Some((base, compact_date)) = model_id.rsplit_once('-') {
         if compact_date.len() == 8 && compact_date.bytes().all(|byte| byte.is_ascii_digit()) {
             return Some(base);

@@ -53,6 +53,18 @@ struct CodexPayload {
     message: Option<String>,
     role: Option<String>,
     thread_settings: Option<CodexThreadSettings>,
+    /// `task_started` also carries the window, giving a per-turn reading even
+    /// when a usage sample omits it.
+    model_context_window: Option<i64>,
+    /// The session's base instructions, logged once in `session_meta`. Codex is
+    /// the only adapter that records system-prompt text locally, so it is the
+    /// only platform whose composition can be split.
+    base_instructions: Option<CodexBaseInstructions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexBaseInstructions {
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +89,10 @@ struct CodexInfo {
     model_name: Option<String>,
     last_token_usage: Option<CodexTokenUsage>,
     total_token_usage: Option<CodexTokenUsage>,
+    /// Codex records the active model's context window alongside each usage
+    /// sample. It changes mid-session when the model or tier changes, so it is
+    /// read per event rather than cached on the session.
+    model_context_window: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -222,6 +238,11 @@ struct CodexParseState {
     pending_output_preview: Option<String>,
     forked_child_task_started_turn_ids: HashSet<String>,
     forked_child_is_user_fork: bool,
+    /// Latest window seen on a usage or task-start event. A sample without its
+    /// own window reuses this so the reading stays continuous.
+    current_context_window: Option<i64>,
+    /// Estimated system-prompt tokens from the logged base instructions.
+    system_tokens: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -386,6 +407,9 @@ fn parse_codex_reader<R: BufRead>(
                 if entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("task_started")
                 {
+                    if let Some(window) = payload.model_context_window.filter(|window| *window > 0) {
+                        state.current_context_window = Some(window);
+                    }
                     state.current_source_turn_id.clone_from(&payload.turn_id);
                     state.pending_turn_start = true;
                     state.accepts_response_item_user_messages = false;
@@ -564,6 +588,11 @@ fn parse_codex_reader<R: BufRead>(
 
                     let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
                     let last_usage = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
+                    // A usage sample normally carries the window; when it does
+                    // not, the last one seen still describes this session.
+                    if let Some(window) = info.model_context_window.filter(|window| *window > 0) {
+                        state.current_context_window = Some(window);
+                    }
                     if forked_child_should_skip_inherited_snapshot(
                         &state,
                         info.total_token_usage.as_ref(),
@@ -643,6 +672,24 @@ fn parse_codex_reader<R: BufRead>(
                     message.model_duration_ms = model_duration_ms;
                     message.time_to_first_token_ms = time_to_first_token_ms;
                     message.source_turn_id = state.current_source_turn_id.clone();
+                    // Codex reports this request's prompt directly in
+                    // `last_token_usage`; prefer it over summing the buckets.
+                    message.prompt_tokens = Some(
+                        info.last_token_usage
+                            .as_ref()
+                            .and_then(|usage| usage.input_tokens)
+                            .map(|input| input.max(0))
+                            .unwrap_or_else(|| {
+                                message
+                                    .tokens
+                                    .input
+                                    .max(0)
+                                    .saturating_add(message.tokens.cache_read.max(0))
+                                    .saturating_add(message.tokens.cache_write.max(0))
+                            }),
+                    );
+                    message.context_window = state.current_context_window;
+                    message.system_tokens = state.system_tokens;
                     if state.pending_turn_start {
                         message.is_turn_start = true;
                         state.pending_turn_start = false;
@@ -780,6 +827,13 @@ fn apply_session_meta(state: &mut CodexParseState, payload: &CodexPayload) {
         let (key, label) = codex_workspace_from_cwd(cwd);
         state.session_workspace_key = key;
         state.session_workspace_label = label;
+    }
+    if let Some(text) = payload
+        .base_instructions
+        .as_ref()
+        .and_then(|instructions| instructions.text.as_deref())
+    {
+        state.system_tokens = Some(crate::estimate_tokens(text));
     }
 }
 

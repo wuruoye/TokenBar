@@ -3,7 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { compact, cost, locator, sessionsFor, sourceFor, throughput, tokenTotal, mergedSnapshot, sessionKey, sessionCost, requestCost, todayCost,
   remainingPercent, weeklyPacing, quotaPaceComparison, cachePercentage, displayedBuckets, sessionModelDetails, requestModelDetails, currentRemotes, formatTPS, firstTokenTime, formatFirstTokenTime,
-  type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
+  occupancyLabel, occupancyParts, occupancyPercent, occupancyWindowParts, durationLabel, contextStats, timingStats, occupancyTrend, agentNetwork,
+  type ContextOccupancy, type Dashboard, type Day, type Platform, type QuotaWindow, type Request, type Session, type Settings, type Tokens, type Totals } from "./model";
 import "./style.css";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -80,11 +81,15 @@ function header(): HTMLElement {
   }, pinned ? "icon active" : "icon");
   pin.title = pinned ? "取消固定窗口" : "固定窗口";
   pin.setAttribute("aria-label", pin.title);
+  const companionBtn = button("◈", () => invoke("toggle_companion"), "icon");
+  companionBtn.title = "桌面任务悬浮窗"; companionBtn.setAttribute("aria-label", "桌面任务悬浮窗");
+  const workbench = button("▣", () => invoke("open_workbench"), "icon");
+  workbench.title = "上下文工作台"; workbench.setAttribute("aria-label", "上下文工作台");
   const settings = button("⚙", () => { view = "settings"; settingsDirty = false; render(); }, "icon");
   settings.title = "设置"; settings.setAttribute("aria-label", "设置");
   const close = button("×", () => getCurrentWindow().hide(), "icon");
   close.title = "收起到托盘"; close.setAttribute("aria-label", close.title);
-  actions.append(pin, settings, close);
+  actions.append(companionBtn, workbench, pin, settings, close);
   node.append(brand, actions);
   return node;
 }
@@ -137,6 +142,183 @@ function totalLabel(tokens: Tokens): HTMLElement {
   const label = el("div", "total-label");
   label.append(el("strong", "", compact(tokenTotal(tokens))), el("span", "muted", " tokens"));
   return label;
+}
+function occupancyRing(context: ContextOccupancy, size: number): HTMLElement {
+  const wrap = el("span", "occupancy-ring");
+  wrap.style.width = size + "px";
+  wrap.style.height = size + "px";
+  const percent = occupancyPercent(context) ?? 0;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 36 36");
+  svg.setAttribute("aria-hidden", "true");
+  const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  track.setAttribute("cx", "18"); track.setAttribute("cy", "18"); track.setAttribute("r", "15.5");
+  track.setAttribute("fill", "none"); track.setAttribute("pathLength", "100"); track.classList.add("occupancy-track");
+  const fill = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  fill.setAttribute("cx", "18"); fill.setAttribute("cy", "18"); fill.setAttribute("r", "15.5");
+  fill.setAttribute("fill", "none"); fill.setAttribute("pathLength", "100"); fill.classList.add("occupancy-fill");
+  fill.setAttribute("stroke-dasharray", percent + " " + (100 - percent));
+  svg.append(track, fill); wrap.append(svg); return wrap;
+}
+function occupancyMeter(context: ContextOccupancy | undefined, compactRow = false): HTMLElement | undefined {
+  const label = occupancyLabel(context);
+  if (!context || !label) return undefined;
+  const node = el("div", compactRow ? "occupancy occupancy-compact" : "occupancy occupancy-detail");
+  node.append(occupancyRing(context, compactRow ? 16 : 56));
+  const percent = occupancyPercent(context);
+  if (compactRow) {
+    node.append(el("span", "", percent != null ? Math.round(percent) + "%" : compact(context.promptTokens)));
+    node.title = label;
+    return node;
+  }
+  const copy = el("div", "occupancy-copy");
+  copy.append(el("strong", "", percent != null ? Math.round(percent) + "%" : compact(context.promptTokens)));
+  copy.append(el("span", "muted small", percent != null ? label.replace(/ · \d+%$/, "") : "已用 prompt"));
+  node.append(copy);
+  const parts = occupancyParts(context);
+  if (!compactRow && parts.length) {
+    const bar = el("div", "occupancy-stack");
+    const total = Math.max(1, parts.reduce((sum, part) => sum + part.value, 0));
+    for (const part of parts) {
+      const slice = el("span", "occupancy-" + part.id);
+      slice.style.width = part.value / total * 100 + "%";
+      slice.title = part.label + " " + compact(part.value);
+      bar.append(slice);
+    }
+    const legend = el("div", "occupancy-legend muted small");
+    for (const part of parts) legend.append(el("span", "", part.label + " " + compact(part.value)));
+    node.append(bar, legend);
+  }
+  return node;
+}
+function contextCard(title: string, body: HTMLElement): HTMLElement {
+  const card = el("section", "card context-card");
+  card.append(sectionTitle(title), body);
+  return card;
+}
+function statGrid(items: Array<[string, string, string?]>): HTMLElement {
+  const grid = el("div", "context-stats");
+  for (const [label, value, title] of items) {
+    const cell = el("div", "context-stat");
+    if (title) cell.title = title;
+    cell.append(el("span", "muted", label), el("strong", "", value));
+    grid.append(cell);
+  }
+  return grid;
+}
+function shareBar(parts: Array<{ id: string; label: string; value: number }>, className: string): HTMLElement {
+  const wrap = el("div", className);
+  const total = Math.max(1, parts.reduce((sum, part) => sum + part.value, 0));
+  const bar = el("div", "occupancy-stack");
+  const legend = el("div", "occupancy-legend muted small");
+  for (const part of parts) {
+    if (!part.value) continue;
+    const slice = el("span", "occupancy-" + part.id);
+    slice.style.width = part.value / total * 100 + "%";
+    slice.title = part.label + " " + compact(part.value);
+    bar.append(slice);
+    legend.append(el("span", "", part.label + "  " + compact(part.value)));
+  }
+  wrap.append(bar, legend);
+  return wrap;
+}
+function contextBoard(session: Session): HTMLElement {
+  const board = el("div", "context-board");
+  const current = el("div", "occupancy occupancy-detail");
+  if (session.context) {
+    current.append(occupancyRing(session.context, 64));
+    const copy = el("div", "occupancy-copy");
+    const percent = occupancyPercent(session.context);
+    copy.append(el("strong", "", percent != null ? Math.round(percent) + "%" : compact(session.context.promptTokens)));
+    copy.append(el("span", "muted small", occupancyLabel(session.context)?.replace(/ · \d+%$/, "") || "已用 prompt"));
+    copy.append(el("span", "muted small", percent != null ? "上下文已用" : "窗口未知，只显示已用 prompt"));
+    current.append(copy);
+    const windowParts = occupancyWindowParts(session.context);
+    if (windowParts.length) current.append(shareBar(windowParts, "occupancy-window"));
+  } else {
+    current.append(el("p", "muted small", "这条会话的日志没有留下上下文窗口读数。"));
+  }
+  board.append(contextCard("当前上下文", current));
+
+  const stats = contextStats(session);
+  board.append(contextCard("上下文统计", statGrid([
+    ["轮次", String(stats.turns)],
+    ["缓存命中", stats.cacheHit],
+    ["预估费用", sessionCost(session)],
+    ["活跃时长", durationLabel(stats.durationMs)]
+  ])));
+
+  const billed = el("div");
+  billed.append(stackedBar(session.tokens));
+  const legend = el("div", "occupancy-legend muted small");
+  for (const bucket of displayedBuckets(session.tokens)) {
+    if (!bucket.value) continue;
+    legend.append(el("span", "", bucket.label + "  " + compact(bucket.value)));
+  }
+  billed.append(legend, el("p", "muted small", "总用量 " + compact(tokenTotal(session.tokens)) + " · 输出含思考"));
+  board.append(contextCard("Token 统计", billed));
+
+  const timing = timingStats(session);
+  const timingBody = el("div");
+  if (timing.total > 0) {
+    timingBody.append(shareBar([
+      { id: "wait", label: "模型等待", value: timing.wait },
+      { id: "gen", label: "模型生成", value: timing.gen },
+      { id: "other", label: "其他开销", value: timing.other }
+    ], "timing-share"));
+    timingBody.append(statGrid([
+      ["模型等待", durationLabel(timing.wait), "TTFT 合计"],
+      ["模型生成", durationLabel(timing.gen)],
+      ["其他开销", durationLabel(timing.other), "工具执行与空隙"],
+      ["活跃时长", durationLabel(timing.total)]
+    ]));
+  } else timingBody.append(el("p", "muted small", "暂无耗时数据"));
+  board.append(contextCard("耗时统计", timingBody));
+
+  const trend = occupancyTrend(session);
+  const trendBody = el("div");
+  if (trend.length) {
+    const max = Math.max(1, ...trend.map(point => occupancyPercent(point.context) ?? (point.context?.promptTokens ? 1 : 0)));
+    const chart = el("div", "context-trend");
+    const detail = el("div", "chart-detail muted small", "指向每一轮，查看当时窗口占用");
+    for (const point of trend) {
+      const percent = occupancyPercent(point.context);
+      const height = percent != null ? percent : (point.context?.promptTokens ? 12 : 0);
+      const bar = button("", () => inspect(point), "chart-column");
+      bar.setAttribute("aria-label", "第 " + point.turn + " 轮，" + (occupancyLabel(point.context) || compact(point.tokens) + " tokens"));
+      const fill = el("span", "bar");
+      fill.style.height = Math.max(height ? 4 : 1, height / Math.max(100, max) * 72) + "px";
+      bar.append(fill, el("span", "chart-date muted", String(point.turn)));
+      bar.addEventListener("mouseenter", () => inspect(point));
+      bar.addEventListener("focus", () => inspect(point));
+      chart.append(bar);
+    }
+    function inspect(point: (typeof trend)[number]) {
+      detail.replaceChildren(
+        el("strong", "", "第 " + point.turn + " 轮 · " + (occupancyLabel(point.context) || compact(point.tokens) + " tokens")),
+        el("span", "", point.prompt)
+      );
+    }
+    trendBody.append(chart, detail);
+  } else trendBody.append(el("p", "muted small", "还没有请求，趋势会在对话开始后出现"));
+  board.append(contextCard("上下文趋势", trendBody));
+
+  const agents = agentNetwork(session);
+  const agentBody = el("div", "agent-network");
+  if (agents.some(agent => agent.role === "subagent")) {
+    for (const agent of agents) {
+      const row = el("div", "agent-row");
+      row.append(
+        el("span", "badge", agent.role === "main" ? "当前" : "子 Agent"),
+        el("strong", "", agent.name),
+        el("span", "muted small", compact(agent.tokens) + " · " + agent.requests + " 次请求")
+      );
+      agentBody.append(row);
+    }
+  } else agentBody.append(el("p", "muted small", "还没有子 Agent。委派任务后，协作网络会列在这里。"));
+  board.append(contextCard("Agent 网络", agentBody));
+  board.append(el("p", "muted small context-note", "本地日志能还原占用、计费、耗时和子 Agent。系统提示词 / 工具定义 / 注入内容 / 压缩剪枝 / 文件活动，只有会话自己记下这些字段时才会出现。"));
+  return board;
 }
 function stackedBar(tokens: Tokens): HTMLElement {
   const bar = el("div", "token-stack");
@@ -205,6 +387,29 @@ function dashboard(): HTMLElement {
   quotaCard.append(sectionTitle("Quota", el("span", "muted small", allDevices ? "本机账户" : "")));
   if (quota?.weekly) quotaCard.append(quotaRow("Weekly", quota.weekly, quota.updatedAtMs));
   if (quota?.session) quotaCard.append(quotaRow("5-hour", quota.session, quota.updatedAtMs));
+  if (quota?.secondaryGroup && (quota.secondaryGroup.weekly || quota.secondaryGroup.session)) {
+    const group = quota.secondaryGroup;
+    const row = el("div", "secondary-quota-group");
+    row.append(el("span", "muted", group.label));
+    const metrics = el("span", "secondary-quota-metrics");
+    const tips: string[] = [];
+    if (group.weekly) {
+      const item = el("span", "secondary-quota-item");
+      item.append(el("span", "muted", "Weekly "), el("strong", "", remainingPercent(group.weekly).toFixed(0) + "% left"));
+      metrics.append(item);
+      tips.push("Weekly: " + Math.round(group.weekly.usedPercent) + "% used (" + resetText(group.weekly.resetsAtMs) + ")");
+    }
+    if (group.weekly && group.session) metrics.append(el("span", "muted", " · "));
+    if (group.session) {
+      const item = el("span", "secondary-quota-item");
+      item.append(el("span", "muted", "5h "), el("strong", "", remainingPercent(group.session).toFixed(0) + "% left"));
+      metrics.append(item);
+      tips.push("5-hour: " + Math.round(group.session.usedPercent) + "% used (" + resetText(group.session.resetsAtMs) + ")");
+    }
+    row.title = group.label + " — " + tips.join(" · ");
+    row.append(metrics);
+    quotaCard.append(row);
+  }
   if (quota?.availableResetCredits != null) {
     const credits = el("div", "reset-credits");
     credits.append(el("strong", "", "↻  Extra resets"), el("strong", "", quota.availableResetCredits + " available"));
@@ -239,6 +444,8 @@ function dashboard(): HTMLElement {
     const title = el("div", "session-title", session.title || session.requests[0]?.promptPreview || session.id);
     const sub = el("div", "session-meta muted");
     const usage = el("span", "session-usage");
+    const meter = occupancyMeter(session.context, true);
+    if (meter) usage.append(meter);
     const price = el("span", "cost", sessionCost(session));
     price.title = price.textContent === "—" ? "费用未知" : "会话费用：" + price.textContent;
     usage.append(el("span", "", compact(tokenTotal(session.tokens))), price, el("span", "", "›"));
@@ -320,7 +527,7 @@ function sessionView(): HTMLElement {
     invoke("open_session", { platform, sessionId: session.id })));
   const costSummary = el("div", "session-cost-summary");
   costSummary.append(el("span", "muted small", "会话费用"), el("strong", "cost", sessionCost(session)));
-  main.append(actions, costSummary, tokenRows(session.tokens));
+  main.append(actions, costSummary, contextBoard(session));
   if (session.deviceId) main.append(el("p", "notice", "来自 " + session.deviceName + " · 远端会话只读，同步数据不包含提示词、输出和本地路径。"));
   if (platform === "grok") main.append(el("p", "muted small", "可在 Grok Build 中使用 --resume 和会话 ID 恢复。"));
   session.requests.forEach((request, index) => {
@@ -333,7 +540,10 @@ function sessionView(): HTMLElement {
     if (tierBadge) name.append(el("span", "badge", tierBadge));
     heading.append(name, el("strong", "cost", requestCost(request)));
     const tps = throughput(request);
-    const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens" + (tps ? " · " + (formatTPS(tps) ?? tps.toFixed(1) + " tok/s") : ""));
+    const occupancy = occupancyLabel(request.context);
+    const metrics = el("div", "turn-metrics muted small", compact(tokenTotal(request.tokens)) + " tokens"
+      + (occupancy ? " · 上下文 " + occupancy : "")
+      + (tps ? " · " + (formatTPS(tps) ?? tps.toFixed(1) + " tok/s") : ""));
     summary.append(heading, metrics, modelDetails(requestModelDetails(request)), el("p", "preview", request.promptPreview || request.model));
     turn.append(summary);
     let loaded = false;
@@ -414,6 +624,7 @@ function settingsView(): HTMLElement {
   field("autostart", "登录 Windows 后在托盘启动", "checkbox");
   form.append(el("h2", "", "任务栏常驻用量"));
   field("taskbarEnabled", "在任务栏显示用量", "checkbox");
+  field("showCompanion", "显示桌面任务悬浮窗", "checkbox");
   field("taskbarPlatform", "显示平台", "select", [["codex","Codex"],["claude","Claude"],["grok","Grok"],["antigravity","Antigravity"],["all","全部已显示的平台"]]);
   field("taskbarPosition", "优先位置", "select", [["right","靠近通知区域"],["left","任务栏左侧空位"]]);
   form.append(el("p", "muted small", "以透明背景和两行文字显示：上行是各平台的今日 Tokens，下行是周额度剩余。点击平台展开，再次点击收起。"));
