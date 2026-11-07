@@ -737,25 +737,7 @@ async fn toggle_companion(app: tauri::AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn companion_resize(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
     let window = app.get_webview_window("companion").ok_or("悬浮窗不可用。")?;
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let position = window.outer_position().map_err(|e| e.to_string())?;
-    let size = window.outer_size().map_err(|e| e.to_string())?;
-    let new_width = (width.clamp(40.0, 640.0) * scale).round() as u32;
-    let new_height = (height.clamp(40.0, 900.0) * scale).round() as u32;
-    if new_width == size.width && new_height == size.height {
-        return Ok(());
-    }
-    let right = position.x + size.width as i32;
-    let bottom = position.y + size.height as i32;
-    window
-        .set_size(tauri::PhysicalSize::new(new_width, new_height))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_position(tauri::PhysicalPosition::new(
-            right - new_width as i32,
-            bottom - new_height as i32,
-        ))
-        .map_err(|e| e.to_string())
+    companion::resize_companion_anchored(&app, &window, width, height)
 }
 
 #[tauri::command]
@@ -1049,6 +1031,11 @@ fn main() {
                     if !s.pinned.load(Ordering::Relaxed) && !s.taskbar.pointer_pressed() {
                         let _ = window.hide();
                     }
+                }
+            }
+            tauri::WindowEvent::Moved(pos) if window.label() == "companion" => {
+                if let Some(w) = window.app_handle().get_webview_window("companion") {
+                    companion::save_anchor_on_move(window.app_handle(), &w, *pos);
                 }
             }
             _ => {}
