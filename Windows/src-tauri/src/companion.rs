@@ -190,7 +190,10 @@ mod win {
         mem::{size_of, zeroed},
         path::Path,
         ptr::null_mut,
-        sync::Mutex,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        },
         time::Duration,
     };
     use windows::Win32::{
@@ -204,27 +207,31 @@ mod win {
         },
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FILETIME, HWND, LPARAM},
+        Foundation::{CloseHandle, FILETIME, HWND, LPARAM, RECT},
+        Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
             },
             Threading::{
-                GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                GetCurrentProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
         UI::{
             Accessibility::{SetWinEventHook, HWINEVENTHOOK},
             WindowsAndMessaging::{
-                DispatchMessageW, EnumWindows, GetForegroundWindow, GetMessageW, GetWindowTextW,
-                GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
-                TranslateMessage, EVENT_SYSTEM_FOREGROUND, SW_RESTORE, SW_SHOW, WINEVENT_OUTOFCONTEXT,
+                DispatchMessageW, EnumWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetMessageW,
+                GetShellWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+                IsWindowVisible, IsZoomed, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage,
+                EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SW_RESTORE, SW_SHOW, WINEVENT_OUTOFCONTEXT, WS_CAPTION, WS_EX_TRANSPARENT,
             },
         },
     };
 
     static FOREGROUND_EVENTS: Mutex<Vec<(Option<&'static str>, i64)>> = Mutex::new(Vec::new());
+    static LAST_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
     fn now_ms() -> i64 {
         chrono::Utc::now().timestamp_millis()
@@ -265,6 +272,104 @@ mod win {
 
     pub fn foreground_platform() -> Option<&'static str> {
         unsafe { platform_of_window(GetForegroundWindow()) }
+    }
+
+    /// Detects whether the current foreground window covers its entire monitor
+    /// in fullscreen mode (excluding the desktop shell, taskbar, and TokenBar itself).
+    pub fn is_foreground_fullscreen() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() {
+                return LAST_FULLSCREEN.load(Ordering::Relaxed);
+            }
+            if hwnd == GetDesktopWindow() || hwnd == GetShellWindow() {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if (ex_style & WS_EX_TRANSPARENT) != 0 {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let mut class_buf = [0u16; 128];
+            let class_len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+            if class_len > 0 {
+                let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+                if matches!(
+                    class_name.as_str(),
+                    "Progman"
+                        | "WorkerW"
+                        | "Shell_TrayWnd"
+                        | "Shell_SecondaryTrayWnd"
+                        | "XamlExplorerHostIslandWindow"
+                        | "MultitaskingViewFrame"
+                ) {
+                    LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            let mut rc: RECT = zeroed();
+            if GetWindowRect(hwnd, &mut rc) == 0 {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut mi) == 0 {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let m = mi.rcMonitor;
+            let w = mi.rcWork;
+            let covers_monitor =
+                rc.left <= m.left && rc.top <= m.top && rc.right >= m.right && rc.bottom >= m.bottom;
+            if !covers_monitor {
+                LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                return false;
+            }
+            let work_equals_monitor = (w.left - m.left).abs() <= 2
+                && (w.top - m.top).abs() <= 2
+                && (w.right - m.right).abs() <= 2
+                && (w.bottom - m.bottom).abs() <= 2;
+            if work_equals_monitor {
+                let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                if IsZoomed(hwnd) != 0 && (style & WS_CAPTION) == WS_CAPTION && rc.top < m.top {
+                    LAST_FULLSCREEN.store(false, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            LAST_FULLSCREEN.store(true, Ordering::Relaxed);
+            true
+        }
+    }
+
+    pub fn raise_window_no_activate(hwnd_raw: isize) {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd_raw as HWND,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
     }
 
     unsafe extern "system" fn on_foreground(
@@ -525,12 +630,21 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{app_process_state, drain_foreground_events, foreground_platform, start_foreground_hook};
+pub use win::{
+    app_process_state, drain_foreground_events, foreground_platform, is_foreground_fullscreen,
+    raise_window_no_activate, start_foreground_hook,
+};
 
 #[cfg(not(windows))]
 pub fn foreground_platform() -> Option<&'static str> {
     None
 }
+#[cfg(not(windows))]
+pub fn is_foreground_fullscreen() -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn raise_window_no_activate(_hwnd_raw: isize) {}
 #[cfg(not(windows))]
 pub fn app_process_state(_exe_name: &str) -> (bool, Option<i64>) {
     (true, None)

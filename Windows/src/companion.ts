@@ -47,6 +47,7 @@ const appWindow = getCurrentWindow();
 
 root.innerHTML = `
   <div class="stage">
+    <div class="toast" hidden></div>
     <div class="panel" hidden>
       <div class="panel-head">
         <div class="panel-title"></div>
@@ -66,18 +67,64 @@ root.innerHTML = `
   </div>`;
 
 const stageEl = root.querySelector<HTMLElement>(".stage")!;
+const toastEl = root.querySelector<HTMLElement>(".toast")!;
 const panelEl = root.querySelector<HTMLElement>(".panel")!;
 const panelTitleEl = root.querySelector<HTMLElement>(".panel-title")!;
 const readAllBtn = root.querySelector<HTMLButtonElement>('[data-action="read-all"]')!;
 const panelBodyEl = root.querySelector<HTMLElement>(".panel-body")!;
+const dockEl = root.querySelector<HTMLElement>(".dock")!;
 const bubbleBtn = root.querySelector<HTMLButtonElement>('[data-action="bubble"]')!;
 const orbEl = root.querySelector<HTMLElement>(".orb")!;
 const orbCountEl = root.querySelector<HTMLElement>(".orb-count")!;
 
 let snapshot: Snapshot = { running: [], background: [], unread: [], recent: [] };
 let expanded = false;
+let fullscreen = false;
 let previousUnread = 0;
 let lastBodyKey = "";
+let seenUnread: Set<string> | null = null;
+let toastTasks: UnreadTask[] = [];
+let toastFadeTimer: number | null = null;
+let toastHideTimer: number | null = null;
+let lastPassthrough: boolean | null = null;
+
+function setPassthrough(passthrough: boolean, raise = false) {
+  if (lastPassthrough === passthrough && !raise) return;
+  lastPassthrough = passthrough;
+  void invoke("companion_set_passthrough", { passthrough, raise }).catch(() => undefined);
+}
+
+function clearToastTimers() {
+  if (toastFadeTimer !== null) {
+    window.clearTimeout(toastFadeTimer);
+    toastFadeTimer = null;
+  }
+  if (toastHideTimer !== null) {
+    window.clearTimeout(toastHideTimer);
+    toastHideTimer = null;
+  }
+}
+
+function showFullscreenToast(newlyDone: UnreadTask[]) {
+  clearToastTimers();
+  const merged = [...newlyDone];
+  for (const prev of toastTasks) {
+    if (!merged.some((t) => t.platform === prev.platform && t.id === prev.id)) {
+      merged.push(prev);
+    }
+  }
+  toastTasks = merged.slice(0, 3);
+  toastEl.classList.remove("leaving");
+  setPassthrough(false, true);
+  toastFadeTimer = window.setTimeout(() => {
+    toastEl.classList.add("leaving");
+  }, 4200);
+  toastHideTimer = window.setTimeout(() => {
+    toastTasks = [];
+    toastEl.classList.remove("leaving");
+    render();
+  }, 4500);
+}
 
 function esc(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c);
@@ -177,11 +224,37 @@ function recentItem(t: RecentTask): string {
     </div>`;
 }
 
+function toastItem(t: UnreadTask): string {
+  const body = unreadBodyText(t);
+  return `
+    <div class="item toast-item" ${taskAttrs("unread", t)} title="打开并标记已读">
+      <div class="badge ${esc(t.platform)}">${badgeLetter(t.platform)}<span class="dot"></span></div>
+      <div class="item-text">
+        <div class="toast-headline"><span class="toast-name">${esc(t.title)}</span><span class="toast-suffix">任务完成了</span></div>
+        ${body ? `<div class="item-body">${esc(body)}</div>` : ""}
+      </div>
+      <div class="item-go">›</div>
+    </div>`;
+}
+
 function updateItemInPlace(el: HTMLElement, title: string, workspacePath?: string | null) {
   el.dataset.title = title;
   el.dataset.workspace = workspacePath ?? "";
   const titleEl = el.querySelector<HTMLElement>('[data-role="title"]');
   if (titleEl && titleEl.textContent !== title) titleEl.textContent = title;
+}
+
+function applySnapshot(next: Snapshot) {
+  const nextKeys = new Set(next.unread.map((t) => `${t.platform}:${t.id}:${t.completedAtMs}`));
+  if (seenUnread !== null) {
+    const newlyDone = next.unread.filter((t) => !seenUnread!.has(`${t.platform}:${t.id}:${t.completedAtMs}`));
+    if (fullscreen && newlyDone.length > 0) {
+      showFullscreenToast(newlyDone);
+    }
+  }
+  seenUnread = nextKeys;
+  snapshot = next;
+  render();
 }
 
 function render() {
@@ -192,6 +265,29 @@ function render() {
   const hasAny = unreadCount > 0 || runningCount > 0;
   const hasList = hasAny || recent.length > 0;
   if (!hasList) expanded = false;
+
+  if (fullscreen) {
+    expanded = false;
+    panelEl.hidden = true;
+    dockEl.hidden = true;
+    lastBodyKey = "";
+    if (toastTasks.length > 0) {
+      toastEl.hidden = false;
+      toastEl.innerHTML = toastTasks.map(toastItem).join("");
+      setPassthrough(false);
+    } else {
+      toastEl.hidden = true;
+      toastEl.innerHTML = "";
+      setPassthrough(true);
+    }
+    previousUnread = unreadCount;
+    requestAnimationFrame(fitWindow);
+    return;
+  }
+
+  toastEl.hidden = true;
+  dockEl.hidden = false;
+  setPassthrough(false);
 
   const total = runningCount + unreadCount;
   const orbState = runningCount > 0 ? "orb running" : total > 0 ? "orb" : "orb idle";
@@ -289,6 +385,8 @@ async function openTask(el: HTMLElement) {
   if (kind === "unread") {
     el.classList.add("leaving");
     snapshot = { ...snapshot, unread: snapshot.unread.filter((t) => !(t.platform === platform && t.id === id)) };
+    toastTasks = toastTasks.filter((t) => !(t.platform === platform && t.id === id));
+    if (toastTasks.length === 0) clearToastTimers();
   }
   try {
     await invoke("open_desktop_task", { platform, taskId: id, workspacePath: workspace || null, title: title || null });
@@ -372,16 +470,32 @@ async function init() {
       render();
     }
   });
-  await listen<Snapshot>("desktop-tasks-updated", (event) => {
-    snapshot = event.payload;
+  await listen<boolean>("companion-fullscreen-changed", (event) => {
+    fullscreen = event.payload;
+    if (!fullscreen) {
+      clearToastTimers();
+      toastTasks = [];
+      toastEl.classList.remove("leaving");
+    } else {
+      expanded = false;
+    }
     render();
   });
+  await listen<Snapshot>("desktop-tasks-updated", (event) => {
+    applySnapshot(event.payload);
+  });
   try {
-    snapshot = await invoke<Snapshot>("get_desktop_tasks");
+    fullscreen = await invoke<boolean>("get_companion_fullscreen");
   } catch (error) {
     console.error(error);
   }
-  render();
+  try {
+    const initial = await invoke<Snapshot>("get_desktop_tasks");
+    applySnapshot(initial);
+  } catch (error) {
+    console.error(error);
+    render();
+  }
 }
 
 void init();

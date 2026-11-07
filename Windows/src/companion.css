@@ -168,9 +168,55 @@ body {
 }
 
 .panel[hidden],
+.toast[hidden],
+.dock[hidden],
 .bubble[hidden],
 .link-btn[hidden] {
   display: none !important;
+}
+
+/* ---------------------------------------------------------------- fullscreen completion toast */
+
+.toast {
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid var(--peach-line);
+  box-shadow: 0 10px 28px rgba(30, 41, 59, 0.16);
+  animation: panel-in 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.toast.leaving {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+.toast-headline {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.toast-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.toast-suffix {
+  flex: none;
+  color: var(--peach);
+  font-weight: 600;
 }
 
 .panel-head {

@@ -768,6 +768,26 @@ async fn set_companion_visible(app: tauri::AppHandle, visible: bool) -> Result<(
     Ok(())
 }
 
+#[tauri::command]
+fn get_companion_fullscreen() -> bool {
+    companion::is_foreground_fullscreen()
+}
+
+#[tauri::command]
+fn companion_set_passthrough(app: tauri::AppHandle, passthrough: bool, raise: bool) -> Result<(), String> {
+    let window = app.get_webview_window("companion").ok_or("悬浮窗不可用。")?;
+    let _ = window.set_ignore_cursor_events(passthrough);
+    #[cfg(windows)]
+    if raise {
+        if let Ok(hwnd) = window.hwnd() {
+            companion::raise_window_no_activate(hwnd.0 as isize);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = raise;
+    Ok(())
+}
+
 fn find_antigravity_binary() -> Option<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let candidate = PathBuf::from(local).join("Programs/antigravity/Antigravity.exe");
@@ -802,7 +822,8 @@ fn main() {
                 request_detail, copy_text, open_session, open_workbench, workbench_list, workbench_show,
                 get_taskbar_status, get_active_platform, set_active_platform, set_sync_scope,
                 get_desktop_tasks, open_desktop_task, mark_task_read, mark_all_tasks_read,
-                toggle_companion, set_companion_visible, companion_resize
+                toggle_companion, set_companion_visible, companion_resize,
+                get_companion_fullscreen, companion_set_passthrough
                 $(,$extra)*
             ]
         };
@@ -957,13 +978,23 @@ fn main() {
             let tasks_app = handle.clone();
             companion::start_foreground_hook();
             tauri::async_runtime::spawn(async move {
+                let mut ticks: u32 = 0;
+                let mut last_fullscreen = companion::is_foreground_fullscreen();
                 loop {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     let state = state(&tasks_app);
                     if state.exiting.load(Ordering::Acquire) {
                         break;
                     }
-                    let _ = poll_desktop_tasks_now(&tasks_app).await;
+                    let fullscreen = companion::is_foreground_fullscreen();
+                    if fullscreen != last_fullscreen {
+                        last_fullscreen = fullscreen;
+                        let _ = tasks_app.emit("companion-fullscreen-changed", fullscreen);
+                    }
+                    ticks = ticks.wrapping_add(1);
+                    if ticks % 3 == 0 {
+                        let _ = poll_desktop_tasks_now(&tasks_app).await;
+                    }
                 }
             });
             diagnostics::record("primary-ready", serde_json::json!({}));
