@@ -410,7 +410,14 @@ root.addEventListener("pointermove", (e) => {
   if (!press || press.dragging || (e.buttons & 1) === 0) return;
   if (Math.hypot(e.screenX - press.x, e.screenY - press.y) > 4) {
     press.dragging = true;
-    void appWindow.startDragging();
+    void invoke("companion_begin_drag").catch(() => undefined);
+    void appWindow
+      .startDragging()
+      .then(() => invoke("companion_save_anchor"))
+      .catch(() => undefined)
+      .finally(() => {
+        press = null;
+      });
   }
 });
 

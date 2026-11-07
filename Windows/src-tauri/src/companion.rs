@@ -220,6 +220,7 @@ mod win {
         },
         UI::{
             Accessibility::{SetWinEventHook, HWINEVENTHOOK},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
             WindowsAndMessaging::{
                 DispatchMessageW, EnumWindows, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetMessageW,
                 GetShellWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
@@ -391,6 +392,10 @@ mod win {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+
+    pub fn is_left_button_down() -> bool {
+        unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0 }
     }
 
     unsafe extern "system" fn on_foreground(
@@ -653,7 +658,8 @@ mod win {
 #[cfg(windows)]
 pub use win::{
     app_process_state, drain_foreground_events, foreground_platform, is_foreground_fullscreen,
-    raise_window_no_activate, set_window_rect_no_activate, start_foreground_hook,
+    is_left_button_down, raise_window_no_activate, set_window_rect_no_activate,
+    start_foreground_hook,
 };
 
 #[cfg(not(windows))]
@@ -668,6 +674,10 @@ pub fn is_foreground_fullscreen() -> bool {
 pub fn raise_window_no_activate(_hwnd_raw: isize) {}
 #[cfg(not(windows))]
 pub fn set_window_rect_no_activate(_hwnd_raw: isize, _x: i32, _y: i32, _width: i32, _height: i32) {}
+#[cfg(not(windows))]
+pub fn is_left_button_down() -> bool {
+    false
+}
 #[cfg(not(windows))]
 pub fn app_process_state(_exe_name: &str) -> (bool, Option<i64>) {
     (true, None)
@@ -686,9 +696,9 @@ pub struct CompanionAnchor {
 }
 
 static COMPANION_ANCHOR: std::sync::Mutex<Option<CompanionAnchor>> = std::sync::Mutex::new(None);
-static COMPANION_RESIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DRAG_WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn anchor_path(app: &tauri::AppHandle) -> Option< std::path::PathBuf> {
+fn anchor_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     app.path().app_local_data_dir().ok().map(|d| d.join("companion-position.json"))
 }
 
@@ -722,6 +732,7 @@ fn persist_anchor(app: &tauri::AppHandle, anchor: CompanionAnchor) {
 }
 
 fn clamp_anchor_to_monitors(window: &tauri::WebviewWindow, anchor: CompanionAnchor) -> CompanionAnchor {
+    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
     let mut monitors = window.available_monitors().unwrap_or_default();
     if monitors.is_empty() {
         if let Ok(Some(primary)) = window.primary_monitor() {
@@ -731,8 +742,11 @@ fn clamp_anchor_to_monitors(window: &tauri::WebviewWindow, anchor: CompanionAnch
     if monitors.is_empty() {
         return anchor;
     }
-    let probe_x = anchor.right - 36;
-    let probe_y = anchor.bottom - 36;
+    let orb_w = (80.0 * scale).round() as i32;
+    let orb_h = (82.0 * scale).round() as i32;
+    let margin = (8.0 * scale).round() as i32;
+    let probe_x = anchor.right - orb_w / 2;
+    let probe_y = anchor.bottom - orb_h / 2;
     let chosen = monitors
         .iter()
         .find(|m| {
@@ -755,35 +769,72 @@ fn clamp_anchor_to_monitors(window: &tauri::WebviewWindow, anchor: CompanionAnch
         return anchor;
     };
     let area = monitor.work_area();
-    let min_right = area.position.x + 64;
-    let max_right = area.position.x + area.size.width as i32;
-    let min_bottom = area.position.y + 64;
-    let max_bottom = area.position.y + area.size.height as i32;
+    let min_right = area.position.x + orb_w;
+    let max_right = area.position.x + area.size.width as i32 - margin;
+    let min_bottom = area.position.y + orb_h;
+    let max_bottom = area.position.y + area.size.height as i32 - margin;
     CompanionAnchor {
         right: anchor.right.clamp(min_right, max_right.max(min_right)),
         bottom: anchor.bottom.clamp(min_bottom, max_bottom.max(min_bottom)),
     }
 }
 
-pub fn save_anchor_on_move(
+pub fn save_current_anchor(
     app: &tauri::AppHandle,
     window: &tauri::WebviewWindow,
-    pos: tauri::PhysicalPosition<i32>,
-) {
-    if COMPANION_RESIZING.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let Ok(size) = window.outer_size() else {
-        return;
-    };
+) -> Result<(), String> {
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
     if size.width == 0 || size.height == 0 {
+        return Ok(());
+    }
+    let raw_anchor = CompanionAnchor {
+        right: position.x + size.width as i32,
+        bottom: position.y + size.height as i32,
+    };
+    let anchor = clamp_anchor_to_monitors(window, raw_anchor);
+    persist_anchor(app, anchor);
+    if anchor != raw_anchor {
+        let target_x = anchor.right - size.width as i32;
+        let target_y = anchor.bottom - size.height as i32;
+        #[cfg(windows)]
+        if let Ok(hwnd) = window.hwnd() {
+            set_window_rect_no_activate(
+                hwnd.0 as isize,
+                target_x,
+                target_y,
+                size.width as i32,
+                size.height as i32,
+            );
+            raise_window_no_activate(hwnd.0 as isize);
+        } else {
+            let _ = window.set_position(tauri::PhysicalPosition::new(target_x, target_y));
+        }
+        #[cfg(not(windows))]
+        let _ = window.set_position(tauri::PhysicalPosition::new(target_x, target_y));
+    }
+    Ok(())
+}
+
+pub fn watch_companion_drag(app: tauri::AppHandle) {
+    if DRAG_WATCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    let anchor = CompanionAnchor {
-        right: pos.x + size.width as i32,
-        bottom: pos.y + size.height as i32,
-    };
-    persist_anchor(app, anchor);
+    tauri::async_runtime::spawn(async move {
+        // Wait briefly for the drag loop to begin, then poll until left mouse button is released.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        for _ in 0..750 {
+            if !is_left_button_down() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(window) = app.get_webview_window("companion") {
+            let _ = save_current_anchor(&app, &window);
+        }
+        DRAG_WATCHING.store(false, std::sync::atomic::Ordering::Release);
+    });
 }
 
 pub fn resize_companion_anchored(
@@ -797,16 +848,19 @@ pub fn resize_companion_anchored(
     let size = window.outer_size().map_err(|e| e.to_string())?;
     let new_width = (width.clamp(40.0, 640.0) * scale).round() as u32;
     let new_height = (height.clamp(40.0, 900.0) * scale).round() as u32;
-    let anchor = load_or_cached_anchor(app).unwrap_or(CompanionAnchor {
+    let raw_anchor = load_or_cached_anchor(app).unwrap_or(CompanionAnchor {
         right: position.x + size.width as i32,
         bottom: position.y + size.height as i32,
     });
+    let anchor = clamp_anchor_to_monitors(window, raw_anchor);
+    if anchor != raw_anchor {
+        persist_anchor(app, anchor);
+    }
     let target_x = anchor.right - new_width as i32;
     let target_y = anchor.bottom - new_height as i32;
     if new_width == size.width && new_height == size.height && position.x == target_x && position.y == target_y {
         return Ok(());
     }
-    COMPANION_RESIZING.store(true, std::sync::atomic::Ordering::Release);
     #[cfg(windows)]
     if let Ok(hwnd) = window.hwnd() {
         set_window_rect_no_activate(hwnd.0 as isize, target_x, target_y, new_width as i32, new_height as i32);
@@ -819,7 +873,6 @@ pub fn resize_companion_anchored(
         let _ = window.set_size(tauri::PhysicalSize::new(new_width, new_height));
         let _ = window.set_position(tauri::PhysicalPosition::new(target_x, target_y));
     }
-    COMPANION_RESIZING.store(false, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -834,7 +887,23 @@ pub async fn ensure_companion_window(
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("companion") {
         if visible {
+            if let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) {
+                let raw_anchor = load_or_cached_anchor(app).unwrap_or(CompanionAnchor {
+                    right: pos.x + size.width as i32,
+                    bottom: pos.y + size.height as i32,
+                });
+                let anchor = clamp_anchor_to_monitors(&window, raw_anchor);
+                persist_anchor(app, anchor);
+                let _ = window.set_position(tauri::PhysicalPosition::new(
+                    anchor.right - size.width as i32,
+                    anchor.bottom - size.height as i32,
+                ));
+            }
             let _ = window.show();
+            #[cfg(windows)]
+            if let Ok(hwnd) = window.hwnd() {
+                raise_window_no_activate(hwnd.0 as isize);
+            }
             if focus {
                 let _ = window.set_focus();
             }
@@ -874,27 +943,30 @@ pub async fn ensure_companion_window(
             clamp_anchor_to_monitors(&window, saved)
         } else if let Ok(Some(monitor)) = window.primary_monitor() {
             let area = monitor.work_area();
-            CompanionAnchor {
-                right: area.position.x + area.size.width as i32 - 12,
-                bottom: area.position.y + area.size.height as i32 - 96,
-            }
+            clamp_anchor_to_monitors(
+                &window,
+                CompanionAnchor {
+                    right: area.position.x + area.size.width as i32 - 24,
+                    bottom: area.position.y + area.size.height as i32 - 24,
+                },
+            )
         } else {
             CompanionAnchor {
                 right: 1200,
                 bottom: 800,
             }
         };
-        if let Ok(mut guard) = COMPANION_ANCHOR.lock() {
-            *guard = Some(anchor);
-        }
-        COMPANION_RESIZING.store(true, std::sync::atomic::Ordering::Release);
+        persist_anchor(app, anchor);
         let _ = window.set_position(tauri::PhysicalPosition::new(
             anchor.right - size.width as i32,
             anchor.bottom - size.height as i32,
         ));
-        COMPANION_RESIZING.store(false, std::sync::atomic::Ordering::Release);
     }
     let _ = window.show();
+    #[cfg(windows)]
+    if let Ok(hwnd) = window.hwnd() {
+        raise_window_no_activate(hwnd.0 as isize);
+    }
     if focus {
         let _ = window.set_focus();
     }

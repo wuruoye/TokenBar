@@ -741,6 +741,17 @@ fn companion_resize(app: tauri::AppHandle, width: f64, height: f64) -> Result<()
 }
 
 #[tauri::command]
+fn companion_begin_drag(app: tauri::AppHandle) {
+    companion::watch_companion_drag(app);
+}
+
+#[tauri::command]
+fn companion_save_anchor(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app.get_webview_window("companion").ok_or("悬浮窗不可用。")?;
+    companion::save_current_anchor(&app, &window)
+}
+
+#[tauri::command]
 async fn set_companion_visible(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
     companion::ensure_companion_window(&app, visible, false).await?;
     let state = state(&app);
@@ -805,6 +816,7 @@ fn main() {
                 get_taskbar_status, get_active_platform, set_active_platform, set_sync_scope,
                 get_desktop_tasks, open_desktop_task, mark_task_read, mark_all_tasks_read,
                 toggle_companion, set_companion_visible, companion_resize,
+                companion_begin_drag, companion_save_anchor,
                 get_companion_fullscreen, companion_set_passthrough
                 $(,$extra)*
             ]
@@ -1031,11 +1043,6 @@ fn main() {
                     if !s.pinned.load(Ordering::Relaxed) && !s.taskbar.pointer_pressed() {
                         let _ = window.hide();
                     }
-                }
-            }
-            tauri::WindowEvent::Moved(pos) if window.label() == "companion" => {
-                if let Some(w) = window.app_handle().get_webview_window("companion") {
-                    companion::save_anchor_on_move(window.app_handle(), &w, *pos);
                 }
             }
             _ => {}
