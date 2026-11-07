@@ -237,7 +237,7 @@ mod win {
         chrono::Utc::now().timestamp_millis()
     }
 
-    unsafe fn process_stem(pid: u32) -> Option<String> {
+    unsafe fn process_path_lower(pid: u32) -> Option<String> {
         if pid == 0 {
             return None;
         }
@@ -252,8 +252,7 @@ mod win {
         if ok == 0 {
             return None;
         }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase())
+        Some(String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase())
     }
 
     unsafe fn platform_of_window(hwnd: HWND) -> Option<&'static str> {
@@ -262,11 +261,19 @@ mod win {
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        match process_stem(pid)?.as_str() {
-            "antigravity" => Some("antigravity"),
-            "codex" => Some("codex"),
-            "claude" => Some("claude"),
-            _ => None,
+        let path = process_path_lower(pid)?;
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if stem == "antigravity" {
+            Some("antigravity")
+        } else if stem == "codex" || stem == "chatgpt" || path.contains("openai.codex") {
+            Some("codex")
+        } else if stem == "claude" || path.contains("anthropic.claude") {
+            Some("claude")
+        } else {
+            None
         }
     }
 

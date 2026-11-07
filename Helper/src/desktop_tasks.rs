@@ -241,8 +241,13 @@ impl AgyTracker {
 
     fn record_focus_change(&mut self, id: &str, at_ms: i64, now_ms: i64, force: bool) {
         let changed = self.state.shown_session_id.as_deref() != Some(id);
+        let newer_than_last = self
+            .state
+            .focus_changes
+            .last()
+            .is_none_or(|c| c.session_id.as_deref() != Some(id) || at_ms > c.at_ms);
         self.state.shown_session_id = Some(id.to_string());
-        if !(changed || force || self.state.focus_changes.is_empty()) {
+        if !(changed || force || newer_than_last || self.state.focus_changes.is_empty()) {
             return;
         }
         self.state.focus_changes.retain(|c| now_ms - c.at_ms < VISIT_HISTORY_MS);
@@ -250,6 +255,20 @@ impl AgyTracker {
             session_id: Some(id.to_string()),
             at_ms,
         });
+    }
+
+    fn is_explicitly_read(&self, id: &str) -> bool {
+        let Some(session) = self.sessions.get(id).filter(|s| !s.archived) else {
+            return false;
+        };
+        if session.marked_as_unread || self.state.waiting_unread_ids.contains(id) {
+            return false;
+        }
+        let annotation_s = Self::effective_annotation_view_s(
+            session,
+            self.state.unseen_view_millis.get(id).copied(),
+        );
+        annotation_s > 0 && annotation_s >= session.last_modified_s
     }
 
     fn update(
@@ -304,7 +323,7 @@ impl AgyTracker {
                 let had_unread_turn =
                     session.marked_as_unread || session.last_modified_s > previous_viewed;
                 let current_view = session.focus_ms(false);
-                if had_unread_turn && current_view > previous_focus {
+                if current_view > previous_focus {
                     let is_working = foreground_running.contains(id);
                     let advanced_in_background = !antigravity_active
                         && self.state.progress.get(id).is_some_and(|p| {
@@ -312,15 +331,26 @@ impl AgyTracker {
                                 || (p.is_working && !is_working)
                         });
                     if is_open_switch_side_effect(id, current_view) || advanced_in_background {
-                        let entry = self.state.unseen_view_millis.entry(id.clone()).or_insert(0);
-                        *entry = (*entry).max(current_view);
+                        if had_unread_turn {
+                            let entry = self.state.unseen_view_millis.entry(id.clone()).or_insert(0);
+                            *entry = (*entry).max(current_view);
+                        }
+                    } else {
+                        self.state.unseen_view_millis.remove(id);
+                        if !session.marked_as_unread {
+                            self.state.waiting_unread_ids.remove(id);
+                        }
+                        if !is_working && session.last_modified_s > 0 {
+                            let viewed = self.state.viewed_seconds.entry(id.clone()).or_insert(0);
+                            *viewed = (*viewed).max(session.last_modified_s);
+                        }
                     }
                 }
             }
 
             let current_shown = self.state.shown_session_id.clone();
             let pending_id = pending.as_ref().map(|p| p.id.clone());
-            let next_shown = sessions
+            let mut advanced: Vec<((bool, i64, bool, i64), String, i64)> = sessions
                 .values()
                 .filter(|s| !s.archived)
                 .filter_map(|s| {
@@ -329,15 +359,19 @@ impl AgyTracker {
                         return None;
                     }
                     let previous = self.previous_focus(&s.id);
-                    if millis <= previous || is_open_switch_side_effect(&s.id, millis) {
+                    if millis <= previous
+                        || is_open_switch_side_effect(&s.id, millis)
+                        || self.state.unseen_view_millis.get(&s.id).is_some_and(|&u| millis <= u)
+                    {
                         return None;
                     }
                     let is_pending = pending_id.as_deref() == Some(s.id.as_str());
                     let is_switch = current_shown.as_deref() != Some(s.id.as_str());
-                    Some(((is_pending, is_switch, millis, -previous), s.id.clone(), millis))
+                    Some(((is_pending, millis, is_switch, -previous), s.id.clone(), millis))
                 })
-                .max_by(|a, b| a.0.cmp(&b.0));
-            if let Some((_, id, millis)) = next_shown {
+                .collect();
+            advanced.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, id, millis) in advanced {
                 self.record_focus_change(&id, millis, now_ms, false);
             }
         }
@@ -355,7 +389,23 @@ impl AgyTracker {
                 self.state.waiting_unread_ids.insert(id.clone());
             }
         }
-        self.state.waiting_unread_ids.retain(|id| waiting.contains(id));
+        self.state.waiting_unread_ids.retain(|id| {
+            let Some(session) = sessions.get(id) else {
+                return false;
+            };
+            if !waiting.contains(id) {
+                return false;
+            }
+            if session.marked_as_unread {
+                return true;
+            }
+            let annotation_s = Self::effective_annotation_view_s(
+                session,
+                self.state.unseen_view_millis.get(id).copied(),
+            );
+            let viewed = annotation_s.max(self.state.viewed_seconds.get(id).copied().unwrap_or(0));
+            viewed < session.last_modified_s
+        });
         if let Some(shown) = &active_shown {
             self.state.waiting_unread_ids.remove(shown);
         }
@@ -544,6 +594,7 @@ pub struct DesktopTaskMonitor {
     codex_turns: HashMap<PathBuf, CodexTurnProgress>,
     codex_previews: HashMap<PathBuf, (FileStamp, CodexPreview)>,
     codex_unread_cache: Option<(PathBuf, FileStamp, HashSet<String>)>,
+    codex_activity_ms: HashMap<String, i64>,
     codex_identity_cache: Option<(PathBuf, Option<FileStamp>, Option<String>)>,
 }
 
@@ -587,6 +638,7 @@ impl DesktopTaskMonitor {
             codex_turns: HashMap::new(),
             codex_previews: HashMap::new(),
             codex_unread_cache: None,
+            codex_activity_ms: HashMap::new(),
             codex_identity_cache: None,
         }
     }
@@ -804,6 +856,17 @@ impl DesktopTaskMonitor {
     /// Whether a visit that ended after the task finished read it. Without
     /// focus history, a visit reads every task once it lasts `READ_DWELL_MS`.
     fn seen(&self, task: &DesktopUnreadTask, platform: &str, focus: Option<&[FocusChange]>, now_ms: i64) -> bool {
+        if platform == "antigravity" && self.agy.is_explicitly_read(&task.id) {
+            return true;
+        }
+        if platform == "codex"
+            && self
+                .codex_activity_ms
+                .get(&task.id)
+                .is_some_and(|&at| at >= task.completed_at_ms)
+        {
+            return true;
+        }
         let finished = task.completed_at_ms;
         self.visits.get(platform).into_iter().flatten().any(|visit| {
             let end = visit.end_ms.unwrap_or(now_ms);
@@ -815,6 +878,17 @@ impl DesktopTaskMonitor {
                 Some(focus) => self.visit_read(&task.id, platform, visit, focus, now_ms),
             }
         })
+    }
+
+    fn was_active_since(&self, platform: &str, since_ms: i64) -> bool {
+        self.foreground_platform.as_deref() == Some(platform)
+            || (since_ms > 0
+                && self
+                    .visits
+                    .get(platform)
+                    .into_iter()
+                    .flatten()
+                    .any(|v| v.end_ms.unwrap_or(i64::MAX) >= since_ms))
     }
 
     /// The visit read the session if it showed the session for `READ_DWELL_MS`,
@@ -1072,7 +1146,7 @@ impl DesktopTaskMonitor {
             }
         }
 
-        let active = self.foreground_platform.as_deref() == Some("antigravity");
+        let active = self.was_active_since("antigravity", self.previous.generated_at_ms);
         let unread_ids = self.agy.update(&sessions, &foreground_ids, &waiting, active, now_ms);
         let mut unread = Vec::new();
         for id in unread_ids {
@@ -1447,9 +1521,13 @@ impl DesktopTaskMonitor {
                 return ids.clone();
             }
         }
-        let ids = fs::read(&path)
+        let parsed = fs::read(&path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(json) = &parsed {
+            self.codex_activity_ms = codex_activity_times(json);
+        }
+        let ids = parsed
             .map(|json| codex_unread_ids(&json, identity.as_deref()))
             .unwrap_or_default();
         self.codex_unread_cache = Some((path, stamp, ids.clone()));
@@ -2078,6 +2156,30 @@ fn codex_human_text(text: Option<&str>) -> Option<String> {
         return None;
     }
     flattened(trimmed)
+}
+
+/// Extracts per-thread user activity timestamps (`["local","<id>"]` -> epoch ms)
+/// from `electron-persisted-atom-state.thread-user-activity-times-v1`.
+fn codex_activity_times(json: &Value) -> HashMap<String, i64> {
+    let mut times = HashMap::new();
+    let Some(map) = json
+        .get("electron-persisted-atom-state")
+        .and_then(|v| v.get("thread-user-activity-times-v1"))
+        .and_then(Value::as_object)
+    else {
+        return times;
+    };
+    for (raw_key, val) in map {
+        let Some(at_ms) = val.as_i64() else {
+            continue;
+        };
+        if let Ok(pair) = serde_json::from_str::<Vec<String>>(raw_key) {
+            if pair.len() == 2 && pair[0].starts_with("local") {
+                times.insert(pair[1].clone(), at_ms);
+            }
+        }
+    }
+    times
 }
 
 /// Thread IDs Codex Desktop lists as unread for local hosts. With a known
@@ -2750,5 +2852,45 @@ mod tests {
         assert!(progress.pending.get("conv/task-8").is_some_and(|t| t.is_timer));
         progress.apply(r#"{"type":"SYSTEM_MESSAGE","content":"[Message] sender=conv/task-7 content=Task id \"conv/task-7\" finished with result"}"#);
         assert!(progress.pending.is_empty());
+    }
+
+    #[test]
+    fn clearing_unread_in_agent_releases_held_task_immediately() {
+        let mut monitor = DesktopTaskMonitor::new(None);
+        let none = HashSet::new();
+        let existing = Some(HashSet::from(["a".to_string(), "b".to_string()]));
+        let mut sessions = HashMap::from([
+            ("a".to_string(), session("a", 1_000, Some(1_010))),
+            ("b".to_string(), session("b", 1_000, Some(1_005))),
+        ]);
+        assert!(monitor.agy.update(&sessions, &none, &none, false, 1_020_000).is_empty());
+
+        // Turn finishes on `a` (which was already `shown_session_id`) while in background.
+        sessions.insert("a".into(), session("a", 1_100, Some(1_010)));
+        let unread_ids = monitor.agy.update(&sessions, &none, &none, false, 1_110_000);
+        assert!(unread_ids.contains("a"));
+        monitor.accept("antigravity", vec![unread("antigravity", "a", 1_100_000)], existing.clone(), 1_110_000);
+        assert_eq!(monitor.publish("antigravity", 1_110_000).len(), 1);
+
+        // User clears unread on `a` inside Antigravity (even while `b` also updates in the same poll).
+        sessions.insert("a".into(), session("a", 1_100, Some(1_120)));
+        sessions.insert("b".into(), session("b", 1_000, Some(1_120)));
+        let unread_ids = monitor.agy.update(&sessions, &none, &none, true, 1_121_000);
+        assert!(unread_ids.is_empty());
+        monitor.accept("antigravity", vec![], existing, 1_121_000);
+        assert!(monitor.publish("antigravity", 1_121_000).is_empty());
+
+        // Codex activity timestamp in `.codex-global-state.json` also releases held task immediately.
+        monitor.accept("codex", vec![unread("codex", "t1", 2_000)], None, 2_100);
+        let state_json = serde_json::json!({
+            "electron-persisted-atom-state": {
+                "thread-user-activity-times-v1": {
+                    "[\"local\",\"t1\"]": 2_500
+                }
+            }
+        });
+        monitor.codex_activity_ms = codex_activity_times(&state_json);
+        monitor.accept("codex", vec![], None, 2_600);
+        assert!(monitor.publish("codex", 2_600).is_empty());
     }
 }
