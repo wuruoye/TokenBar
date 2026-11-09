@@ -324,42 +324,27 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         self.statusLabelLayout = layout
         button.image = layout.image
 
-        let codexUnreadText = Self.unreadStatusText(codexUnread)
-        var toolTips = [
-            "Codex · Today: \(codex.today) tokens · Weekly: \(codex.weekly) left\(codexUnreadText.toolTip)",
-        ]
         var accessibilityLabels = [
-            "Codex. Today, \(codex.today) tokens. Weekly quota, \(codex.weekly) remaining.\(codexUnreadText.accessibility)",
+            "Codex. Today, \(codex.today) tokens. Weekly quota, \(codex.weekly) remaining.\(Self.unreadAccessibilityText(codexUnread))",
         ]
         if let claude {
-            let claudeUnreadText = Self.unreadStatusText(claudeUnread)
-            toolTips.append(
-                "Claude Code · Today: \(claude.today) tokens · Weekly: \(claude.weekly) left\(claudeUnreadText.toolTip)")
             accessibilityLabels.append(
-                "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.\(claudeUnreadText.accessibility)")
+                "Claude Code. Today, \(claude.today) tokens. Weekly quota, \(claude.weekly) remaining.\(Self.unreadAccessibilityText(claudeUnread))")
         }
         if let grok {
-            toolTips.append(
-                "Grok Build · Today: \(grok.today) tokens · Weekly: \(grok.weekly) left")
             accessibilityLabels.append(
                 "Grok Build. Today, \(grok.today) tokens. Weekly quota, \(grok.weekly) remaining.")
         }
         if let antigravity {
-            let antigravityUnreadText = Self.unreadStatusText(antigravityUnread)
-            toolTips.append(
-                "Antigravity · Today: \(antigravity.today) tokens · Weekly: \(antigravity.weekly) left\(antigravityUnreadText.toolTip)")
             accessibilityLabels.append(
-                "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.\(antigravityUnreadText.accessibility)")
+                "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.\(Self.unreadAccessibilityText(antigravityUnread))")
         }
-        button.toolTip = toolTips.joined(separator: "\n")
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
     }
 
-    private static func unreadStatusText(_ count: Int) -> (toolTip: String, accessibility: String) {
-        guard count > 0 else { return ("", "") }
-        return (
-            " · Unread: \(count)",
-            " \(count) unread completed \(count == 1 ? "task" : "tasks").")
+    private static func unreadAccessibilityText(_ count: Int) -> String {
+        guard count > 0 else { return "" }
+        return " \(count) unread completed \(count == 1 ? "task" : "tasks")."
     }
 
     private func statusValues(for platform: TokenPlatform) -> (today: String, weekly: String) {
