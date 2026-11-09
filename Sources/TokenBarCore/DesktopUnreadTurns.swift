@@ -12,7 +12,7 @@ struct DesktopUnreadTurn: Equatable, Sendable {
 enum ClaudeTurnState: Equatable, Sendable {
     case running
     /// The turn is paused on a question or a plan the user has to answer.
-    case waitingForUser
+    case waitingForUser(String)
     case ended
 }
 
@@ -56,7 +56,7 @@ final class DesktopUnreadTurnReader {
 
     private var cache: [String: CachedTurn] = [:]
     private var turnStates: [String: CachedTurnState] = [:]
-    private var antigravityWaitingStates: [String: (size: UInt64, modifiedAt: Date, waiting: Bool)] = [:]
+    private var antigravityWaitingStates: [String: (size: UInt64, modifiedAt: Date, question: String?, stepIndex: Int?)] = [:]
     private var claudeTranscripts: [String: FoundTranscript] = [:]
 
     func codexTurn(rolloutURL: URL) -> DesktopUnreadTurn {
@@ -157,32 +157,48 @@ final class DesktopUnreadTurnReader {
         return turn
     }
 
-    func antigravityWaitingForUser(transcript: URL, size: UInt64, modifiedAt: Date) -> Bool {
+    func antigravityWaitingQuestion(
+        transcript: URL,
+        size: UInt64,
+        modifiedAt: Date) -> (question: String, stepIndex: Int?)?
+    {
         if let cached = self.antigravityWaitingStates[transcript.path],
            cached.size == size,
            cached.modifiedAt == modifiedAt
         {
-            return cached.waiting
+            return cached.question.map { ($0, cached.stepIndex) }
         }
-        var waiting = false
-        let markers = ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""].map { Data($0.utf8) }
+        var question: String?
+        var stepIndex: Int?
+        let markers = ["\"USER_INPUT\"", "\"PLANNER_RESPONSE\"", "\"GENERIC\""].map { Data($0.utf8) }
         Self.scanBackward(in: transcript, markers: markers) { line in
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                 return false
             }
             switch object["type"] as? String {
+            case "GENERIC" where object["source"] as? String == "MODEL":
+                question = nil
+                return true
             case "PLANNER_RESPONSE" where object["source"] as? String == "MODEL":
-                waiting = Self.antigravityPausesForUser(object["tool_calls"])
+                let calls = object["tool_calls"] as? [[String: Any]] ?? []
+                let pausesForUser = calls.contains { call in
+                    let name = call["name"] as? String ?? ""
+                    return name == "ask_question" || name == "notify_user"
+                }
+                if pausesForUser {
+                    question = Self.antigravityUserInput(calls) ?? "Waiting for your answer"
+                    stepIndex = (object["step_index"] as? NSNumber)?.intValue
+                }
                 return true
             case "USER_INPUT" where object["source"] as? String == "USER_EXPLICIT":
-                waiting = false
+                question = nil
                 return true
             default:
                 return false
             }
         }
-        self.antigravityWaitingStates[transcript.path] = (size, modifiedAt, waiting)
-        return waiting
+        self.antigravityWaitingStates[transcript.path] = (size, modifiedAt, question, stepIndex)
+        return question.map { ($0, stepIndex) }
     }
 
     /// A finished Claude turn ends with an assistant message that stopped for a
@@ -216,7 +232,12 @@ final class DesktopUnreadTurnReader {
                 case nil:
                     state = .running
                 case "tool_use":
-                    state = Self.claudeUserInput(message["content"]) == nil ? .running : .waitingForUser
+                    if let rawQuestion = Self.claudeUserInput(message["content"]) {
+                        let summary = Self.replySummary(rawQuestion) ?? Self.flattened(rawQuestion) ?? rawQuestion
+                        state = .waitingForUser(summary)
+                    } else {
+                        state = .running
+                    }
                 default:
                     state = .ended
                 }
@@ -444,25 +465,6 @@ final class DesktopUnreadTurnReader {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return self.flattened(trimmed)
-    }
-
-    private static func antigravityPausesForUser(_ toolCalls: Any?) -> Bool {
-        guard let calls = toolCalls as? [[String: Any]] else { return false }
-        return calls.contains { call in
-            let name = call["name"] as? String ?? ""
-            if name == "ask_question" {
-                return true
-            }
-            let args = (call["args"] as? [String: Any])
-                ?? (call["arguments"] as? [String: Any])
-                ?? [:]
-            if let metadata = self.antigravityArgumentValue(args["ArtifactMetadata"]) as? [String: Any],
-               (self.antigravityArgumentValue(metadata["RequestFeedback"]) as? Bool) == true
-            {
-                return true
-            }
-            return false
-        }
     }
 
     private static func antigravityUserInput(_ toolCalls: Any?) -> String? {

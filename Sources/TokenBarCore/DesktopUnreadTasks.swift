@@ -4,7 +4,8 @@ import Foundation
 import Observation
 import SQLite3
 
-/// One finished task that a desktop app's sidebar still marks as unread.
+/// One finished task that a desktop app's sidebar still marks as unread, or a
+/// task waiting on a question for the user.
 public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
     public let platform: TokenPlatform
     /// The Codex thread ID, Claude Desktop session ID, or Antigravity
@@ -15,6 +16,8 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
     public let prompt: String?
     /// The opening text of the reply that finished the task, without Markdown.
     public let reply: String?
+    /// The question or review request waiting for the user's answer.
+    public let askQuestion: String?
     /// How long the task's last turn ran.
     public let turnDuration: TimeInterval?
     public let workspacePath: String?
@@ -26,6 +29,7 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
         title: String?,
         prompt: String?,
         reply: String?,
+        askQuestion: String? = nil,
         turnDuration: TimeInterval?,
         workspacePath: String?,
         updatedAt: Date?)
@@ -35,6 +39,7 @@ public struct DesktopUnreadTask: Equatable, Identifiable, Sendable {
         self.title = title
         self.prompt = prompt
         self.reply = reply
+        self.askQuestion = askQuestion
         self.turnDuration = turnDuration
         self.workspacePath = workspacePath
         self.updatedAt = updatedAt
@@ -270,7 +275,9 @@ public final class DesktopUnreadTaskMonitor {
         let ids = Set(tasks.map(\.id))
         let opened = (self.openedAt[platform] ?? [:]).filter { now.timeIntervalSince($0.value) < Self.readLag }
         self.openedAt[platform] = opened
-        for task in self.reported[platform] ?? [] where !ids.contains(task.id) && opened[task.id] == nil {
+        for task in self.reported[platform] ?? []
+            where task.askQuestion == nil && !ids.contains(task.id) && opened[task.id] == nil
+        {
             self.held[platform, default: [:]][task.id] = HeldTask(task: task, since: now)
         }
         self.reported[platform] = tasks
@@ -421,6 +428,9 @@ public final class DesktopUnreadTaskMonitor {
         }
         self.openedAt[platform] = opened
         let reported = (self.reported[platform] ?? []).filter { task in
+            if task.askQuestion != nil {
+                return true
+            }
             guard let openedAt = opened[task.id] else { return true }
             return (task.updatedAt ?? .distantPast) > openedAt
         }
@@ -503,28 +513,31 @@ struct DesktopUnreadTaskReader: Sendable {
     /// Codex Desktop stores unread thread IDs per signed-in identity and execution
     /// host in `.codex-global-state.json`. The list also keeps subagent threads the
     /// sidebar never shows, so IDs are checked against the local thread database.
-    func codexUnreadTasks(turns: DesktopUnreadTurnReader) -> [DesktopUnreadTask] {
+    /// Threads with an unanswered question (`waiting`) stay in the list even
+    /// while running or before `.codex-global-state.json` marks them unread.
+    func codexUnreadTasks(
+        turns: DesktopUnreadTurnReader,
+        waiting: [String: (question: String, askedAt: Date?)] = [:]) -> [DesktopUnreadTask]
+    {
+        var threadIDs = Set(waiting.keys)
         let stateURL = self.codexHome.appendingPathComponent(
             ".codex-global-state.json",
             isDirectory: false)
-        guard let data = try? Data(contentsOf: stateURL),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let readState = object["electron-thread-read-state-v1"] as? [String: Any],
-              let identities = readState["unreadByIdentity"] as? [String: Any]
-        else {
-            return []
-        }
-
-        let hostMaps: [Any] = if let identity = self.codexIdentityKey() {
-            identities[identity].map { [$0] } ?? []
-        } else {
-            Array(identities.values)
-        }
-        var threadIDs = Set<String>()
-        for case let hosts as [String: Any] in hostMaps {
-            for (hostKey, ids) in hosts where hostKey.hasPrefix("local:") {
-                for case let id as String in ids as? [Any] ?? [] {
-                    threadIDs.insert(id)
+        if let data = try? Data(contentsOf: stateURL),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let readState = object["electron-thread-read-state-v1"] as? [String: Any],
+           let identities = readState["unreadByIdentity"] as? [String: Any]
+        {
+            let hostMaps: [Any] = if let identity = self.codexIdentityKey() {
+                identities[identity].map { [$0] } ?? []
+            } else {
+                Array(identities.values)
+            }
+            for case let hosts as [String: Any] in hostMaps {
+                for (hostKey, ids) in hosts where hostKey.hasPrefix("local:") {
+                    for case let id as String in ids as? [Any] ?? [] {
+                        threadIDs.insert(id)
+                    }
                 }
             }
         }
@@ -533,15 +546,25 @@ struct DesktopUnreadTaskReader: Sendable {
             let turn = thread.rolloutPath.map {
                 turns.codexTurn(rolloutURL: URL(fileURLWithPath: $0))
             }
+            let pending = waiting[thread.id]
+            let updatedAt: Date? = switch (thread.updatedAt, pending?.askedAt) {
+            case let (lhs?, rhs?): max(lhs, rhs)
+            case let (lhs?, nil): lhs
+            case let (nil, rhs?): rhs
+            case (nil, nil): nil
+            }
             return DesktopUnreadTask(
                 platform: .codex,
                 id: thread.id,
                 title: thread.title,
                 prompt: turn?.prompt ?? thread.firstPrompt,
                 reply: turn?.reply,
+                askQuestion: pending?.question,
                 turnDuration: turn?.duration,
                 workspacePath: thread.workspacePath,
-                updatedAt: thread.updatedAt)
+                updatedAt: updatedAt)
+        }.sorted {
+            ($0.updatedAt ?? .distantPast, $0.id) > ($1.updatedAt ?? .distantPast, $1.id)
         }
     }
 
@@ -595,16 +618,23 @@ struct DesktopUnreadTaskReader: Sendable {
     /// thread still running one, and the rollouts their next turn writes to.
     func codexRunningTasks(
         states: CodexTurnStateReader,
-        now: Date) -> (tasks: [DesktopRunningTask], rollouts: Set<String>)
+        waitingIDs: Set<String> = [],
+        now: Date)
+        -> (
+            tasks: [DesktopRunningTask],
+            waiting: [String: (question: String, askedAt: Date?)],
+            rollouts: Set<String>
+        )
     {
         let background = CodexBackgroundTaskReader(directory: self.backgroundTasksDirectory).tasks(now: now)
         var threads = self.visibleCodexThreads(.updatedSince(now.addingTimeInterval(-24 * 60 * 60)))
-        let olderIDs = Set(background.keys).subtracting(threads.map(\.id))
+        let olderIDs = Set(background.keys).union(waitingIDs).subtracting(threads.map(\.id))
         if !olderIDs.isEmpty {
             threads += self.visibleCodexThreads(.ids(olderIDs))
         }
         let rollouts = Set(threads.compactMap(\.rolloutPath))
         states.forget(except: rollouts)
+        var waiting: [String: (question: String, askedAt: Date?)] = [:]
         let tasks = threads.compactMap { thread -> DesktopRunningTask? in
             let backgroundTask = background[thread.id].map { task in
                 DesktopRunningTask(
@@ -615,13 +645,19 @@ struct DesktopUnreadTaskReader: Sendable {
             guard let path = thread.rolloutPath,
                   let attributes = try? FileManager.default.attributesOfItem(atPath: path),
                   let size = (attributes[.size] as? NSNumber)?.uint64Value,
-                  let modifiedAt = attributes[.modificationDate] as? Date,
-                  now.timeIntervalSince(modifiedAt) < DesktopRunningTaskLiveness.quietLimit
+                  let modifiedAt = attributes[.modificationDate] as? Date
             else {
                 return backgroundTask
             }
+            let isRecent = now.timeIntervalSince(modifiedAt) < DesktopRunningTaskLiveness.quietLimit
+            guard isRecent || waitingIDs.contains(thread.id) else {
+                return backgroundTask
+            }
             let state = states.state(of: URL(fileURLWithPath: path), size: size)
-            guard state.isRunning else { return backgroundTask }
+            if let question = state.askQuestion {
+                waiting[thread.id] = (question, state.askedAt ?? modifiedAt)
+            }
+            guard isRecent, state.isRunning else { return backgroundTask }
             return DesktopRunningTask(
                 platform: .codex,
                 id: thread.id,
@@ -629,7 +665,7 @@ struct DesktopUnreadTaskReader: Sendable {
                 startedAt: state.startedAt,
                 activity: state.activity)
         }
-        return (tasks, rollouts)
+        return (tasks, waiting, rollouts)
     }
 
     private enum CodexThreadFilter {
@@ -1035,6 +1071,70 @@ struct DesktopUnreadTaskReader: Sendable {
             .appendingPathComponent("brain", isDirectory: true)
             .appendingPathComponent(conversationID, isDirectory: true)
             .appendingPathComponent(".system_generated/logs/transcript.jsonl", isDirectory: false)
+    }
+
+    func antigravityConversationDatabaseURL(conversationID: String) -> URL? {
+        guard !conversationID.isEmpty,
+              !conversationID.contains("/"),
+              !conversationID.contains("..")
+        else {
+            return nil
+        }
+        return self.antigravityHome
+            .appendingPathComponent("conversations", isDirectory: true)
+            .appendingPathComponent(conversationID + ".db", isDirectory: false)
+    }
+
+    /// Whether the step Antigravity created after `stepIndex` in `conversations/<id>.db`
+    /// is still pending (`1`), running (`2`), or waiting for the user (`9`).
+    func antigravityIsStepWaiting(conversationID: String, after stepIndex: Int?) -> Bool {
+        guard let url = self.antigravityConversationDatabaseURL(conversationID: conversationID),
+              FileManager.default.fileExists(atPath: url.path)
+        else {
+            return true
+        }
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard Self.openReadonlySQLite(at: url, probeTable: "steps", into: &database) else {
+            return true
+        }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let sql = "SELECT status FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return true
+        }
+        sqlite3_bind_int64(statement, 1, Int64(stepIndex ?? -1))
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return true
+        }
+        let status = sqlite3_column_int64(statement, 0)
+        return status == 1 || status == 2 || status == 9
+    }
+
+    /// Whether the last step recorded in `conversations/<id>.db` was cancelled (`6`)
+    /// or interrupted (`12`) by the user.
+    func antigravityIsLastStepCancelled(conversationID: String) -> Bool {
+        guard let url = self.antigravityConversationDatabaseURL(conversationID: conversationID),
+              FileManager.default.fileExists(atPath: url.path)
+        else {
+            return false
+        }
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard Self.openReadonlySQLite(at: url, probeTable: "steps", into: &database) else {
+            return false
+        }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let sql = "SELECT status FROM steps ORDER BY idx DESC LIMIT 1"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW
+        else {
+            return false
+        }
+        let status = sqlite3_column_int64(statement, 0)
+        return status == 6 || status == 12
     }
 
     /// Reads Antigravity's conversation summary database and per-conversation
@@ -1664,6 +1764,14 @@ struct AntigravityUnreadTracker {
         let activeShownID = isAntigravityActive
             ? (self.state.shownSessionID ?? Self.initialShownSession(in: sessions)?.id)
             : nil
+        for id in self.waiting.subtracting(waiting) where !foregroundRunningIDs.contains(id) {
+            if let session = sessions[id], session.lastModifiedSeconds > 0 {
+                self.state.viewedSeconds[id] = max(
+                    self.state.viewedSeconds[id] ?? 0,
+                    session.lastModifiedSeconds)
+                self.state.unseenViewMillis.removeValue(forKey: id)
+            }
+        }
         for id in waiting.subtracting(self.waiting) where id != activeShownID {
             self.state.waitingUnreadIDs.insert(id)
         }
@@ -1721,7 +1829,7 @@ struct AntigravityUnreadTracker {
 
         return Set(sessions.compactMap { id, session -> String? in
             guard !session.isArchived else { return nil }
-            if session.markedAsUnread || self.state.waitingUnreadIDs.contains(id) {
+            if waiting.contains(id) || session.markedAsUnread || self.state.waitingUnreadIDs.contains(id) {
                 return id
             }
             guard !foregroundRunningIDs.contains(id) else { return nil }
@@ -1757,6 +1865,13 @@ struct AntigravityUnreadTracker {
             baselineViewMillis: baselineViewMillis,
             switchedAtMillis: nil)
         self.recordFocusChange(to: id, at: now, now: now, forceAppend: true)
+    }
+
+    mutating func markCancelledViewed(id: String, lastModifiedSeconds: Int64) {
+        guard lastModifiedSeconds > 0 else { return }
+        self.state.viewedSeconds[id] = max(self.state.viewedSeconds[id] ?? 0, lastModifiedSeconds)
+        self.state.unseenViewMillis.removeValue(forKey: id)
+        self.state.waitingUnreadIDs.remove(id)
     }
 
     private mutating func recordFocusChange(
@@ -1884,10 +1999,9 @@ struct ClaudeUnreadTracker {
         now: Date) -> Set<String>
     {
         if self.hasBaseline {
-            // A session first found waiting, as at launch, just paused its turn.
             self.recordEvents(
                 in: sessions,
-                finishedTurns: finishedTurns.union(waiting.subtracting(self.waiting)),
+                finishedTurns: finishedTurns,
                 isClaudeActive: isClaudeActive,
                 shownSession: shownSession,
                 now: now)
@@ -1923,8 +2037,11 @@ struct ClaudeUnreadTracker {
             return storeCommittedAt <= override.since.addingTimeInterval(Self.storeCommitMargin)
         }
         self.state.overrides = overrides
-        return store.union(overrides.keys).filter { id in
+        return store.union(overrides.keys).union(waiting).filter { id in
             guard let session = sessions[id], !session.isArchived else { return false }
+            if waiting.contains(id) {
+                return true
+            }
             return overrides[id]?.isUnread ?? store.contains(id)
         }
     }
@@ -2018,11 +2135,12 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var antigravityStateRecountScheduled = false
     private var antigravityRetryScheduled = false
     private var codexRunningIDs: Set<String> = []
+    private var codexWaiting: [String: (question: String, askedAt: Date?)] = [:]
     private var claudeRunningIDs: Set<String> = []
-    private var claudeWaitingIDs: Set<String> = []
+    private var claudeWaiting: [String: String] = [:]
     private var claudeBackgroundIDs: Set<String> = []
     private var antigravityRunningIDs: Set<String> = []
-    private var antigravityWaitingIDs: Set<String> = []
+    private var antigravityWaiting: [String: String] = [:]
     private var isClaudeActive = true
     private var isAntigravityActive = true
     private var claudeLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
@@ -2064,8 +2182,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.restoreClaudeTracker()
             self.restoreAntigravityTracker()
             self.startStream()
-            self.recount(DesktopUnreadTaskReader.platforms)
             self.recountCodexRunning()
+            self.recount(DesktopUnreadTaskReader.platforms)
             self.scheduleRunningRefresh()
         }
     }
@@ -2353,7 +2471,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 self.watchCodexStateFiles()
                 self.publish(
                     .codex,
-                    self.reader.codexUnreadTasks(turns: self.turns),
+                    self.reader.codexUnreadTasks(turns: self.turns, waiting: self.codexWaiting),
                     self.reader.visibleCodexThreadIDs(),
                     nil)
             case .claude:
@@ -2378,28 +2496,43 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// the unread state is read then and once more after Codex writes it.
     private func recountCodexRunning() {
         guard !self.isStopped else { return }
-        let (running, rollouts) = self.reader.codexRunningTasks(states: self.codexTurnStates, now: Date())
+        let (running, waiting, rollouts) = self.reader.codexRunningTasks(
+            states: self.codexTurnStates,
+            waitingIDs: Set(self.codexWaiting.keys),
+            now: Date())
         self.codexRollouts.watch(rollouts)
         let runningIDs = Set(running.map(\.id))
         let finishedTurn = !self.codexRunningIDs.subtracting(runningIDs).isEmpty
+        let waitingChanged = waiting.count != self.codexWaiting.count
+            || waiting.contains { key, value in
+                guard let previous = self.codexWaiting[key] else { return true }
+                return previous.question != value.question || previous.askedAt != value.askedAt
+            }
         self.codexRunningIDs = runningIDs
+        self.codexWaiting = waiting
         self.publishRunning(.codex, running)
-        guard finishedTurn else { return }
+        guard finishedTurn || waitingChanged else { return }
         self.recount([.codex])
-        self.queue.asyncAfter(deadline: .now() + 1.5) {
-            self.recount([.codex])
+        if finishedTurn {
+            self.queue.asyncAfter(deadline: .now() + 1.5) {
+                self.recount([.codex])
+            }
         }
     }
 
     private func recountClaude(sessions: [String: ClaudeSessionSnapshot]) {
         let now = Date()
         let (running, waiting, transcripts) = self.claudeRunningTasks(sessions, now: now)
+        let waitingIDs = Set(waiting.keys)
         let ids = self.claudeTracker.update(
             store: self.reader.claudeUnreadStore(),
             storeCommittedAt: self.reader.claudeStoreCommittedAt(),
             sessions: sessions,
-            finishedTurns: self.claudeFinishedTurns(running: running, transcripts: transcripts),
-            waiting: waiting,
+            finishedTurns: self.claudeFinishedTurns(
+                running: running,
+                waiting: waitingIDs,
+                transcripts: transcripts),
+            waiting: waitingIDs,
             isClaudeActive: self.isClaudeActive,
             shownSession: self.reader.claudeShownSession,
             now: now)
@@ -2408,10 +2541,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.claudeActivities.forget(except: Set(transcripts.values.map(\.path)))
         self.claudeRunningIDs = Set(running.map(\.id))
         self.claudeBackgroundIDs = Set(running.filter(\.isInBackground).map(\.id))
-        self.claudeWaitingIDs = waiting
+        self.claudeWaiting = waiting
         self.publish(
             .claude,
-            self.claudeTasks(ids, sessions: sessions),
+            self.claudeTasks(ids, waiting: waiting, sessions: sessions),
             Set(sessions.filter { !$0.value.isArchived }.keys),
             nil)
         self.publishRunning(.claude, running)
@@ -2426,8 +2559,11 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         guard !self.isStopped else { return }
         let sessions = self.claudeTracker.sessions
         let (running, waiting, transcripts) = self.claudeRunningTasks(sessions, now: Date())
-        guard self.claudeFinishedTurns(running: running, transcripts: transcripts).isEmpty,
-              waiting == self.claudeWaitingIDs
+        guard self.claudeFinishedTurns(
+            running: running,
+            waiting: Set(waiting.keys),
+            transcripts: transcripts).isEmpty,
+            waiting == self.claudeWaiting
         else {
             self.recountClaude(sessions: sessions)
             return
@@ -2437,14 +2573,16 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         self.publishRunning(.claude, running)
     }
 
-    /// Sessions that were running and whose transcript now ends their turn or
-    /// waits for the user, unlike one that went quiet or was archived.
+    /// Sessions that were running and whose transcript now ends their turn,
+    /// unlike one that paused to wait for the user, went quiet, or was archived.
     private func claudeFinishedTurns(
         running: [DesktopRunningTask],
+        waiting: Set<String>,
         transcripts: [String: URL]) -> Set<String>
     {
         self.claudeRunningIDs
             .subtracting(running.map(\.id))
+            .subtracting(waiting)
             .filter { transcripts[$0] != nil }
     }
 
@@ -2462,20 +2600,28 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         let now = Date()
         let (running, waiting, transcripts) = self.antigravityRunningTasks(sessions, now: now)
         let foregroundIDs = Set(running.filter { !$0.isInBackground }.map(\.id))
-        let unreadIDs = self.antigravityTracker.update(
+        var unreadIDs = self.antigravityTracker.update(
             sessions: sessions,
             foregroundRunningIDs: foregroundIDs,
-            waiting: waiting,
+            waiting: Set(waiting.keys),
             isAntigravityActive: self.isAntigravityActive,
             now: now)
+        for id in Array(unreadIDs) where waiting[id] == nil && sessions[id]?.markedAsUnread != true {
+            if self.reader.antigravityIsLastStepCancelled(conversationID: id) {
+                self.antigravityTracker.markCancelledViewed(
+                    id: id,
+                    lastModifiedSeconds: sessions[id]?.lastModifiedSeconds ?? 0)
+                unreadIDs.remove(id)
+            }
+        }
         let watchedPaths = Set(transcripts.values.map(\.path))
         self.antigravityTranscripts.watch(watchedPaths)
         self.antigravityActivities.forget(except: watchedPaths)
         self.antigravityRunningIDs = Set(running.map(\.id))
-        self.antigravityWaitingIDs = waiting
+        self.antigravityWaiting = waiting
         self.publish(
             .antigravity,
-            self.antigravityTasks(unreadIDs, sessions: sessions),
+            self.antigravityTasks(unreadIDs, waiting: waiting, sessions: sessions),
             Set(sessions.filter { !$0.value.isArchived }.keys),
             self.antigravityTracker.state.focusChanges)
         self.publishRunning(.antigravity, running)
@@ -2488,9 +2634,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     private func antigravityRunningTasks(
         _ sessions: [String: AntigravitySessionSnapshot],
-        now: Date) -> (tasks: [DesktopRunningTask], waiting: Set<String>, transcripts: [String: URL])
+        now: Date) -> (tasks: [DesktopRunningTask], waiting: [String: String], transcripts: [String: URL])
     {
-        var waiting = Set<String>()
+        var waiting: [String: String] = [:]
         var transcripts: [String: URL] = [:]
         let externalBackground = CodexBackgroundTaskReader(directory: self.reader.backgroundTasksDirectory)
             .tasks(platform: TokenPlatform.antigravity.rawValue, now: now)
@@ -2517,7 +2663,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 || session.notFullyIdle
                 || session.hasForegroundSubagents
                 || session.hasBackgroundSubagents
-                || self.antigravityWaitingIDs.contains(id)
+                || self.antigravityWaiting[id] != nil
                 || session.lastModifiedAt.map({ now.timeIntervalSince($0) < 6 * 60 * 60 }) == true
             guard wantsStatusCheck else {
                 return externalTask
@@ -2538,12 +2684,16 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 {
                     transcripts[id] = transcript
                 }
-                if self.turns.antigravityWaitingForUser(
-                    transcript: transcript,
-                    size: size,
-                    modifiedAt: modifiedAt)
+                if session.hasActiveRunStatus,
+                   let candidate = self.turns.antigravityWaitingQuestion(
+                       transcript: transcript,
+                       size: size,
+                       modifiedAt: modifiedAt),
+                   self.reader.antigravityIsStepWaiting(
+                       conversationID: id,
+                       after: candidate.stepIndex)
                 {
-                    waiting.insert(id)
+                    waiting[id] = candidate.question
                     return externalTask
                 }
                 if session.hasActiveRunStatus || session.notFullyIdle
@@ -2599,6 +2749,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     private func antigravityTasks(
         _ ids: Set<String>,
+        waiting: [String: String],
         sessions: [String: AntigravitySessionSnapshot]) -> [DesktopUnreadTask]
     {
         ids.compactMap { id -> DesktopUnreadTask? in
@@ -2612,6 +2763,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 title: session.title,
                 prompt: turn?.prompt,
                 reply: turn?.reply,
+                askQuestion: waiting[id],
                 turnDuration: turn?.duration,
                 workspacePath: session.workspacePath,
                 updatedAt: session.lastModifiedAt)
@@ -2630,9 +2782,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     /// writes to.
     private func claudeRunningTasks(
         _ sessions: [String: ClaudeSessionSnapshot],
-        now: Date) -> (tasks: [DesktopRunningTask], waiting: Set<String>, transcripts: [String: URL])
+        now: Date) -> (tasks: [DesktopRunningTask], waiting: [String: String], transcripts: [String: URL])
     {
-        var waiting = Set<String>()
+        var waiting: [String: String] = [:]
         var transcripts: [String: URL] = [:]
         lazy var claudeLaunchedAt: Date? = {
             self.claudeLaunch = self.reader.claudeLaunch(reusing: self.claudeLaunch)
@@ -2667,7 +2819,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                   let size = (attributes[.size] as? NSNumber)?.uint64Value,
                   let activeAt = attributes[.modificationDate] as? Date,
                   now.timeIntervalSince(activeAt) < DesktopRunningTaskLiveness.quietLimit
-                      || self.claudeWaitingIDs.contains(id)
+                      || self.claudeWaiting[id] != nil
                       || self.claudeBackgroundIDs.contains(id)
             else {
                 return nil
@@ -2681,8 +2833,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                     title: session.title,
                     startedAt: session.lastTurnEdgeAt,
                     activity: self.claudeActivities.activity(in: transcript, size: size))
-            case .waitingForUser:
-                waiting.insert(id)
+            case let .waitingForUser(question):
+                waiting[id] = question
                 return nil
             case .ended:
                 guard let claudeLaunchedAt,
@@ -2709,6 +2861,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     private func claudeTasks(
         _ ids: Set<String>,
+        waiting: [String: String],
         sessions: [String: ClaudeSessionSnapshot]) -> [DesktopUnreadTask]
     {
         ids.compactMap { id -> DesktopUnreadTask? in
@@ -2726,6 +2879,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 title: session.title,
                 prompt: turn?.prompt,
                 reply: turn?.reply,
+                askQuestion: waiting[id],
                 turnDuration: turn?.duration,
                 workspacePath: session.workspacePath,
                 updatedAt: session.lastActivityAt ?? session.modifiedAt)

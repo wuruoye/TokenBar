@@ -727,7 +727,10 @@ private struct UnreadCardRow: View {
                         Spacer(minLength: 6)
                         CardTimeText(date: self.task.updatedAt)
                     }
-                    if let reply = self.task.backgroundActivity.map({ "Background · \($0)" }) ?? self.task.reply {
+                    if let reply = self.task.askQuestion.map({ "Ask · \($0)" })
+                        ?? self.task.backgroundActivity.map({ "Background · \($0)" })
+                        ?? self.task.reply
+                    {
                         Text(reply)
                             .font(CardFont.sans(12))
                             .foregroundStyle(.primary)

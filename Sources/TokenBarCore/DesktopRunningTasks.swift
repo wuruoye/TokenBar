@@ -45,11 +45,28 @@ enum DesktopRunningTaskLiveness {
 /// turn writes. A running rollout grows with every event, so after the first
 /// read only appended lines are scanned. Confined to the unread watcher's queue.
 final class CodexTurnStateReader {
+    struct PendingQuestion: Equatable {
+        let id: String
+        let text: String
+        let askedAt: Date?
+        let isAsync: Bool
+    }
+
     struct TurnState: Equatable {
         var isRunning = false
         var startedAt: Date?
         /// The turn's latest progress note.
         var activity: String?
+        /// Questions asked in the rollout that the user has not answered yet.
+        var pendingQuestions: [PendingQuestion] = []
+
+        var askQuestion: String? {
+            self.pendingQuestions.last?.text
+        }
+
+        var askedAt: Date? {
+            self.pendingQuestions.last?.askedAt
+        }
     }
 
     private struct Progress {
@@ -60,11 +77,25 @@ final class CodexTurnStateReader {
     private enum Event {
         case started(at: Date?)
         case ended
+        case aborted
         case note(String)
+        case question(PendingQuestion)
+        case questionToolOutput(callID: String, isAcceptedPlaceholder: Bool)
+        case questionReply(rawText: String)
+        case humanPrompt
     }
 
-    private static let markers = ["\"task_started\"", "\"task_complete\"", "\"turn_aborted\"", "\"commentary\""]
-        .map { Data($0.utf8) }
+    private static let markers = [
+        "\"task_started\"",
+        "\"task_complete\"",
+        "\"turn_aborted\"",
+        "\"commentary\"",
+        "\"request_user_input",
+        "\"function_call_output\"",
+        "<send_user_message_question_reply>",
+        "\"UserMessage\"",
+        "\"user_message\"",
+    ].map { Data($0.utf8) }
 
     private var progress: [String: Progress] = [:]
 
@@ -76,21 +107,25 @@ final class CodexTurnStateReader {
             }
             return known.state
         }
-        var state = TurnState()
-        var note: String?
+        var events: [Event] = []
+        var sawTurnBoundary = false
+        var sawHumanPrompt = false
         DesktopUnreadTurnReader.scanBackward(in: url, markers: Self.markers) { line in
-            switch Self.event(line) {
-            case let .started(startedAt):
-                state = TurnState(isRunning: true, startedAt: startedAt, activity: note)
-                return true
-            case .ended:
-                return true
-            case let .note(text):
-                note = note ?? text
-                return false
-            case nil:
-                return false
+            guard let event = Self.event(line) else { return false }
+            events.append(event)
+            switch event {
+            case .started, .ended, .aborted:
+                sawTurnBoundary = true
+            case .humanPrompt:
+                sawHumanPrompt = true
+            default:
+                break
             }
+            return sawTurnBoundary && sawHumanPrompt
+        }
+        var state = TurnState()
+        for event in events.reversed() {
+            Self.apply(event, to: &state)
         }
         self.progress[url.path] = Progress(offset: size, state: state)
         return state
@@ -113,15 +148,8 @@ final class CodexTurnStateReader {
         for line in appended[..<lastNewline].split(separator: 0x0A)
             where Self.markers.contains(where: { line.range(of: $0) != nil })
         {
-            switch Self.event(Data(line)) {
-            case let .started(startedAt):
-                next.state = TurnState(isRunning: true, startedAt: startedAt)
-            case .ended:
-                next.state = TurnState()
-            case let .note(text):
-                next.state.activity = text
-            case nil:
-                break
+            if let event = Self.event(Data(line)) {
+                Self.apply(event, to: &next.state)
             }
         }
         // A line still being written is read again once it ends.
@@ -129,37 +157,147 @@ final class CodexTurnStateReader {
         return next
     }
 
+    private static func apply(_ event: Event, to state: inout TurnState) {
+        switch event {
+        case let .started(startedAt):
+            state.isRunning = true
+            state.startedAt = startedAt
+            state.activity = nil
+        case .ended:
+            state.isRunning = false
+            state.startedAt = nil
+            state.activity = nil
+            state.pendingQuestions.removeAll { !$0.isAsync }
+        case .aborted:
+            state.isRunning = false
+            state.startedAt = nil
+            state.activity = nil
+            state.pendingQuestions.removeAll()
+        case let .note(text):
+            if state.isRunning {
+                state.activity = text
+            }
+        case let .question(question):
+            state.pendingQuestions.removeAll { $0.id == question.id }
+            state.pendingQuestions.append(question)
+        case let .questionToolOutput(callID, isAcceptedPlaceholder):
+            if !isAcceptedPlaceholder {
+                state.pendingQuestions.removeAll { $0.id == callID }
+            }
+        case let .questionReply(rawText):
+            let matched = state.pendingQuestions.contains { !$0.id.isEmpty && rawText.contains($0.id) }
+            if matched {
+                state.pendingQuestions.removeAll { !$0.id.isEmpty && rawText.contains($0.id) }
+            } else {
+                state.pendingQuestions.removeAll()
+            }
+        case .humanPrompt:
+            state.pendingQuestions.removeAll()
+        }
+    }
+
     private static func event(_ line: Data) -> Event? {
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              object["type"] as? String == "event_msg",
-              let payload = object["payload"] as? [String: Any]
-        else {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
             return nil
         }
-        switch payload["type"] as? String {
-        case "task_started":
-            let timestamp = (object["timestamp"] as? String).flatMap {
-                try? Date($0, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true))
-            }
-            return .started(at: timestamp)
-        case "task_complete", "turn_aborted":
-            return .ended
-        case "item_completed":
-            // Codex marks the messages it writes while working as commentary.
-            guard let item = payload["item"] as? [String: Any],
-                  item["type"] as? String == "AgentMessage",
-                  item["phase"] as? String == "commentary"
-            else {
+        let timestamp = (object["timestamp"] as? String).flatMap {
+            (try? Date($0, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
+                ?? (try? Date($0, strategy: Date.ISO8601FormatStyle()))
+        }
+        switch object["type"] as? String {
+        case "response_item":
+            guard let payload = object["payload"] as? [String: Any] else { return nil }
+            switch payload["type"] as? String {
+            case "function_call":
+                let name = payload["name"] as? String ?? ""
+                guard name == "request_user_input" || name == "request_user_input_async" else {
+                    return nil
+                }
+                let callID = payload["call_id"] as? String ?? ""
+                let argsText = payload["arguments"] as? String ?? ""
+                let args = (try? JSONSerialization.jsonObject(with: Data(argsText.utf8))) as? [String: Any]
+                let questions = (args?["questions"] as? [[String: Any]] ?? []).compactMap { item -> String? in
+                    (item["title"] as? String)
+                        ?? (item["question"] as? String)
+                        ?? (item["header"] as? String)
+                }
+                let raw = questions.isEmpty ? "Waiting for your answer" : questions.joined(separator: " · ")
+                guard let text = DesktopUnreadTurnReader.replySummary(raw) ?? DesktopUnreadTurnReader.flattened(raw) else {
+                    return nil
+                }
+                return .question(PendingQuestion(
+                    id: callID,
+                    text: text,
+                    askedAt: timestamp,
+                    isAsync: name == "request_user_input_async"))
+            case "function_call_output":
+                guard let callID = payload["call_id"] as? String, !callID.isEmpty else { return nil }
+                let output = (payload["output"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let isAccepted = output.contains("\"accepted\":true") || output.contains("\"accepted\": true")
+                return .questionToolOutput(callID: callID, isAcceptedPlaceholder: isAccepted)
+            default:
                 return nil
             }
-            let text = (item["content"] as? [[String: Any]] ?? [])
-                .filter { ($0["type"] as? String)?.lowercased() == "text" }
-                .compactMap { $0["text"] as? String }
-                .joined(separator: "\n")
-            return DesktopUnreadTurnReader.replySummary(text).map { .note($0) }
+        case "event_msg":
+            guard let payload = object["payload"] as? [String: Any] else { return nil }
+            switch payload["type"] as? String {
+            case "task_started":
+                return .started(at: timestamp)
+            case "task_complete":
+                return .ended
+            case "turn_aborted":
+                return .aborted
+            case "user_message":
+                guard let message = payload["message"] as? String else { return nil }
+                if message.contains("<send_user_message_question_reply>") {
+                    return .questionReply(rawText: message)
+                }
+                return Self.isCodexHumanPrompt(message) ? .humanPrompt : nil
+            case "item_completed":
+                guard let item = payload["item"] as? [String: Any] else { return nil }
+                switch item["type"] as? String {
+                case "UserMessage":
+                    let text = (item["content"] as? [[String: Any]] ?? [])
+                        .filter { ($0["type"] as? String)?.lowercased() == "text" }
+                        .compactMap { $0["text"] as? String }
+                        .joined(separator: "\n")
+                    if text.contains("<send_user_message_question_reply>") {
+                        return .questionReply(rawText: text)
+                    }
+                    return Self.isCodexHumanPrompt(text) ? .humanPrompt : nil
+                case "AgentMessage":
+                    // Codex marks the messages it writes while working as commentary.
+                    guard item["phase"] as? String == "commentary" else { return nil }
+                    let text = (item["content"] as? [[String: Any]] ?? [])
+                        .filter { ($0["type"] as? String)?.lowercased() == "text" }
+                        .compactMap { $0["text"] as? String }
+                        .joined(separator: "\n")
+                    return DesktopUnreadTurnReader.replySummary(text).map { .note($0) }
+                default:
+                    return nil
+                }
+            default:
+                return nil
+            }
         default:
             return nil
         }
+    }
+
+    private static func isCodexHumanPrompt(_ raw: String) -> Bool {
+        var text = raw
+        if let request = text.range(of: "## My request:") {
+            text = String(text[request.upperBound...])
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("<"),
+              !trimmed.hasPrefix("#"),
+              !trimmed.hasPrefix("【后台完成】")
+        else {
+            return false
+        }
+        return true
     }
 }
 

@@ -41,6 +41,8 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
         let turnDuration: TimeInterval?
         let workspaceName: String?
         let updatedAt: Date?
+        /// A question or review request waiting for the user's answer.
+        var askQuestion: String? = nil
         /// Background work is also shown on the unread card for this session.
         var backgroundActivity: String? = nil
 
@@ -56,7 +58,8 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
             reply: String?,
             turnDuration: TimeInterval?,
             workspaceName: String?,
-            updatedAt: Date?)
+            updatedAt: Date?,
+            askQuestion: String? = nil)
         {
             self.platform = platform
             self.taskID = taskID
@@ -66,6 +69,7 @@ struct UnreadWidgetSnapshot: Equatable, Sendable {
             self.turnDuration = turnDuration
             self.workspaceName = workspaceName
             self.updatedAt = updatedAt
+            self.askQuestion = askQuestion
         }
     }
 

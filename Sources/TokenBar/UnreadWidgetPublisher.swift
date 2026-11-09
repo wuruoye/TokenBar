@@ -181,8 +181,13 @@ final class UnreadWidgetPublisher {
         if !self.finishedTurns.isEmpty {
             self.scheduleSettle()
         }
-        let read = previous.tasks.filter { !current.contains($0.id) && platforms.contains($0.platform) }
-            + settled
+        let read = (previous.tasks.filter { !current.contains($0.id) && platforms.contains($0.platform) }
+            + settled).map { item in
+            var copy = item
+            copy.askQuestion = nil
+            copy.backgroundActivity = nil
+            return copy
+        }
         if !read.isEmpty {
             let readIDs = Set(read.map(\.id))
             self.readHistory = Array((read + self.readHistory.filter { !readIDs.contains($0.id) })
@@ -237,7 +242,7 @@ final class UnreadWidgetPublisher {
         }
         let runningIDs = Set(running.map { "\($0.platform.rawValue)/\($0.id)" })
         let tasks = unread
-            .filter { !runningIDs.contains("\($0.platform.rawValue)/\($0.id)") }
+            .filter { $0.askQuestion != nil || !runningIDs.contains("\($0.platform.rawValue)/\($0.id)") }
             .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
         return UnreadWidgetSnapshot(
             platforms: platforms.map { platform in
@@ -265,7 +270,8 @@ final class UnreadWidgetPublisher {
                     workspaceName: task.workspacePath.map {
                         URL(fileURLWithPath: $0).lastPathComponent
                     },
-                    updatedAt: task.updatedAt)
+                    updatedAt: task.updatedAt,
+                    askQuestion: task.askQuestion)
                 item.backgroundActivity = active.first {
                     $0.platform == task.platform && $0.id == task.id && $0.isInBackground
                 }?.activity
