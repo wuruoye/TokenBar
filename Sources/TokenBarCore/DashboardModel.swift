@@ -514,15 +514,27 @@ public final class DashboardModel {
                 ?? inferredReset
                 ?? inheritedReset
                 ?? scheduledWeeklyReset
+            let rolledOverAcrossSample: Bool = {
+                guard window.resetsAt == nil,
+                      let inheritedReset,
+                      let windowMinutes,
+                      windowMinutes > 0
+                else {
+                    return false
+                }
+                let windowStart = inheritedReset.addingTimeInterval(
+                    -TimeInterval(windowMinutes) * 60)
+                return snapshot.updatedAt < windowStart
+            }()
             let inheritedUsage = Self.inheritedUsage(
                 for: window,
                 from: previous,
                 resetsAt: resetsAt)
             return QuotaWindowSnapshot(
-                usedPercent: inheritedUsage ?? window.usedPercent,
+                usedPercent: rolledOverAcrossSample ? 0 : (inheritedUsage ?? window.usedPercent),
                 windowMinutes: windowMinutes,
                 resetsAt: resetsAt,
-                usageKnown: inheritedUsage == nil ? window.usageKnown : true)
+                usageKnown: rolledOverAcrossSample ? true : (inheritedUsage == nil ? window.usageKnown : true))
         }
         return QuotaSnapshot(
             session: merge(snapshot.session, previous: previous?.session),

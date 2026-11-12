@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper context-workbench list\n       tokenbar-helper context-workbench show --platform dsh|grok --session-id ID\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper context-workbench list\n       tokenbar-helper context-workbench show --platform dsh|grok --session-id ID\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]\n       tokenbar-helper decompress-zstd --path PATH --offset BYTES --length BYTES";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -83,12 +83,20 @@ struct RequestDetailConfig {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct DecompressZstdConfig {
+    path: PathBuf,
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
     Snapshot(SnapshotConfig),
     RequestDetail(RequestDetailConfig),
     WorkbenchList,
     WorkbenchShow { platform: String, session_id: String },
     MemoryReceiver(MemoryReceiverConfig),
+    DecompressZstd(DecompressZstdConfig),
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             write_json(&tokenbar_helper::workbench::show_session(&platform, &session_id).map_err(io::Error::other)?)
         }
         Command::MemoryReceiver(config) => run_receiver(config).map_err(io::Error::other).map_err(Into::into),
+        Command::DecompressZstd(config) => run_decompress_zstd(config),
     }
 }
 
@@ -395,6 +404,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
     }
     if first.to_str() == Some("context-workbench") {
         return parse_workbench_args(args);
+    }
+    if first.to_str() == Some("decompress-zstd") {
+        return parse_decompress_zstd_args(args).map(Command::DecompressZstd);
     }
 
     parse_snapshot_args(std::iter::once(first).chain(args)).map(Command::Snapshot)
@@ -687,4 +699,79 @@ fn parse_request_detail_args(
         return Err("request start must not be after request end".to_string());
     }
     Ok(config)
+}
+
+const MAX_ZSTD_BYTES: u64 = 4 * 1024 * 1024;
+
+fn parse_decompress_zstd_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<DecompressZstdConfig, String> {
+    let mut path = None;
+    let mut offset = None;
+    let mut length = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--path") => {
+                let value = args.next().ok_or("--path requires a path")?;
+                path = Some(PathBuf::from(value));
+            }
+            Some("--offset") => {
+                let value = args.next().ok_or("--offset requires a value")?;
+                let value = value.to_str().ok_or("--offset must be valid UTF-8")?;
+                offset = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "--offset must be a non-negative integer")?,
+                );
+            }
+            Some("--length") => {
+                let value = args.next().ok_or("--length requires a value")?;
+                let value = value.to_str().ok_or("--length must be valid UTF-8")?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| "--length must be a positive integer")?;
+                if parsed == 0 || parsed > MAX_ZSTD_BYTES {
+                    return Err(format!(
+                        "--length must be between 1 and {MAX_ZSTD_BYTES}"
+                    ));
+                }
+                length = Some(parsed);
+            }
+            Some("--help" | "-h") => return Err(USAGE.to_string()),
+            Some(value) => return Err(format!("unknown decompress-zstd argument: {value}")),
+            None => return Err("arguments must be valid UTF-8".to_string()),
+        }
+    }
+
+    Ok(DecompressZstdConfig {
+        path: path.ok_or("decompress-zstd requires --path")?,
+        offset: offset.ok_or("decompress-zstd requires --offset")?,
+        length: length.ok_or("decompress-zstd requires --length")?,
+    })
+}
+
+fn run_decompress_zstd(config: DecompressZstdConfig) -> Result<(), Box<dyn Error>> {
+    let mut file = File::open(&config.path)?;
+    file.seek(SeekFrom::Start(config.offset))?;
+    let mut compressed = Vec::with_capacity(config.length as usize);
+    file.take(config.length).read_to_end(&mut compressed)?;
+    if compressed.len() as u64 != config.length {
+        return Err("unexpected EOF while reading compressed slice".into());
+    }
+
+    let decoder = ruzstd::decoding::StreamingDecoder::new(compressed.as_slice())?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(MAX_ZSTD_BYTES + 1)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() as u64 > MAX_ZSTD_BYTES {
+        return Err("decompressed output exceeded size limit".into());
+    }
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&decoded)?;
+    stdout.flush()?;
+    Ok(())
 }
