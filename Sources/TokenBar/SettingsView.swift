@@ -72,6 +72,8 @@ struct TokenBarSettingsView: View {
                 Toggle("Show Claude Code", isOn: self.$settings.showsClaude)
                 Toggle("Show Grok Build", isOn: self.$settings.showsGrok)
                 Toggle("Show Antigravity", isOn: self.$settings.showsAntigravity)
+                Toggle("Show WorkBuddy", isOn: self.$settings.showsWorkBuddy)
+                Toggle("Show With", isOn: self.$settings.showsWith)
 
                 Text("Adds each provider's T/W section and dashboard tab. Changes take effect immediately.")
                     .font(.caption)

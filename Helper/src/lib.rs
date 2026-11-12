@@ -20,6 +20,8 @@ pub mod openrouter;
 pub mod usage;
 pub mod desktop_tasks;
 pub mod workbench;
+pub mod with;
+pub mod workbuddy;
 
 pub use usage::StatisticsTimeZone;
 use codex::{human_message_text, message_content_text};
@@ -893,7 +895,7 @@ pub fn build_snapshot_with_context_windows(
         .iter()
         .map(|message| message.client.clone())
         .collect::<BTreeSet<_>>();
-    let known_platforms = ["codex", "claude", "grok", "antigravity"];
+    let known_platforms = ["codex", "claude", "grok", "antigravity", "workbuddy", "with"];
     let mut platforms = known_platforms
         .iter()
         .map(|platform| (*platform).to_string())

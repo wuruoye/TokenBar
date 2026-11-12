@@ -62,6 +62,14 @@ struct SessionLauncher {
     }
 
     func open(_ session: SessionSummary, onWillOpen: ((String) -> Void)? = nil) throws {
+        if session.platformID == .with {
+            // With's URL scheme only handles sign-in callbacks, so a session can
+            // only be shown by bringing the app forward.
+            guard Self.openApplication(bundleIdentifier: Self.withBundleIdentifier) else {
+                throw SessionLauncherError.applicationUnavailable(.with)
+            }
+            return
+        }
         if session.platformID == .grok {
             guard self.launchGrokSession(session) else {
                 throw SessionLauncherError.applicationUnavailable(.grok)
@@ -164,6 +172,14 @@ struct SessionLauncher {
                 components.host = "claude.ai"
                 components.path = "/claude-code-desktop/\(id)"
             }
+        case .workbuddy:
+            guard Self.isSafePathIdentifier(id) else {
+                throw SessionLauncherError.invalidSessionID
+            }
+            // The same link WorkBuddy's own task notifications open.
+            components.scheme = "workbuddy"
+            components.host = "chat"
+            components.path = "/\(id)"
         default:
             throw SessionLauncherError.unsupportedPlatform(platform)
         }
@@ -201,9 +217,25 @@ struct SessionLauncher {
                 throw SessionLauncherError.invalidSessionID
             }
             return url
+        case .workbuddy:
+            return try self.deepLink(platform: .workbuddy, id: sessionID)
         default:
             throw SessionLauncherError.unsupportedPlatform(session.platformID)
         }
+    }
+
+    static let withBundleIdentifier = "com.tencent.with"
+
+    static func openApplication(bundleIdentifier: String) -> Bool {
+        guard let application = NSWorkspace.shared
+            .urlForApplication(withBundleIdentifier: bundleIdentifier)
+        else {
+            return false
+        }
+        NSWorkspace.shared.openApplication(
+            at: application,
+            configuration: NSWorkspace.OpenConfiguration())
+        return true
     }
 
     private static func codexThreadID(from sessionID: String) -> String? {

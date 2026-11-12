@@ -103,6 +103,8 @@ public final class TokenBarSettings {
     public static let defaultShowsClaude = true
     public static let defaultShowsGrok = true
     public static let defaultShowsAntigravity = true
+    public static let defaultShowsWorkBuddy = true
+    public static let defaultShowsWith = true
     public static let defaultUsesWeekdayWeeklyPacing = false
     public static let defaultShowsFullRequestContentOnHover = true
     public static let defaultShowsDesktopCard = false
@@ -156,6 +158,22 @@ public final class TokenBarSettings {
             self.defaults.set(
                 self.showsAntigravity,
                 forKey: self.keys.showsAntigravity)
+        }
+    }
+
+    public var showsWorkBuddy: Bool {
+        didSet {
+            self.defaults.set(
+                self.showsWorkBuddy,
+                forKey: self.keys.showsWorkBuddy)
+        }
+    }
+
+    public var showsWith: Bool {
+        didSet {
+            self.defaults.set(
+                self.showsWith,
+                forKey: self.keys.showsWith)
         }
     }
 
@@ -242,6 +260,12 @@ public final class TokenBarSettings {
         self.showsAntigravity = defaults.object(
             forKey: self.keys.showsAntigravity) as? Bool
             ?? Self.defaultShowsAntigravity
+        self.showsWorkBuddy = defaults.object(
+            forKey: self.keys.showsWorkBuddy) as? Bool
+            ?? Self.defaultShowsWorkBuddy
+        self.showsWith = defaults.object(
+            forKey: self.keys.showsWith) as? Bool
+            ?? Self.defaultShowsWith
         self.usesWeekdayWeeklyPacing = defaults.object(
             forKey: self.keys.usesWeekdayWeeklyPacing) as? Bool
             ?? Self.defaultUsesWeekdayWeeklyPacing
@@ -276,6 +300,8 @@ public final class TokenBarSettings {
         self.showsClaude = Self.defaultShowsClaude
         self.showsGrok = Self.defaultShowsGrok
         self.showsAntigravity = Self.defaultShowsAntigravity
+        self.showsWorkBuddy = Self.defaultShowsWorkBuddy
+        self.showsWith = Self.defaultShowsWith
         self.usesWeekdayWeeklyPacing = Self.defaultUsesWeekdayWeeklyPacing
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
         self.showsDesktopCard = Self.defaultShowsDesktopCard
@@ -294,6 +320,8 @@ public final class TokenBarSettings {
         let showsClaude: String
         let showsGrok: String
         let showsAntigravity: String
+        let showsWorkBuddy: String
+        let showsWith: String
         let usesWeekdayWeeklyPacing: String
         let showsFullRequestContentOnHover: String
         let showsDesktopCard: String
@@ -312,6 +340,8 @@ public final class TokenBarSettings {
             self.showsClaude = "\(prefix).showsClaude"
             self.showsGrok = "\(prefix).showsGrok"
             self.showsAntigravity = "\(prefix).showsAntigravity"
+            self.showsWorkBuddy = "\(prefix).showsWorkBuddy"
+            self.showsWith = "\(prefix).showsWith"
             self.usesWeekdayWeeklyPacing = "\(prefix).usesWeekdayWeeklyPacing"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
             self.showsDesktopCard = "\(prefix).showsDesktopCard"

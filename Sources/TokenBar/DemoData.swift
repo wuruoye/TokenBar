@@ -707,10 +707,16 @@ enum DemoPreviewRenderer {
         let showsGrok = ProcessInfo.processInfo.environment["TOKENBAR_DEMO_SHOWS_GROK"] != "0"
         let showsAntigravity = ProcessInfo.processInfo
             .environment["TOKENBAR_DEMO_SHOWS_ANTIGRAVITY"] != "0"
+        let showsWorkBuddy = ProcessInfo.processInfo
+            .environment["TOKENBAR_DEMO_SHOWS_WORKBUDDY"] != "0"
+        let showsWith = ProcessInfo.processInfo
+            .environment["TOKENBAR_DEMO_SHOWS_WITH"] != "0"
         let visibleScopes = DashboardScope.visibleScopes(
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity)
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith)
         if !visibleScopes.contains(model.scope) {
             model.scope = .codex
         }
@@ -719,12 +725,16 @@ enum DemoPreviewRenderer {
             providesQuota: model.providesQuota(for: model.scope.platform),
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity)
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith)
         let content = DashboardSummaryView(
             model: model,
             showsClaude: showsClaude,
             showsGrok: showsGrok,
             showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith,
             usesWeekdayWeeklyPacing: false,
             accentColor: .purple)
             .frame(width: 384, height: height, alignment: .top)
@@ -825,13 +835,17 @@ enum DemoPreviewRenderer {
         }
         let showsGrok = environment["TOKENBAR_DEMO_SHOWS_GROK"] == "1"
         let showsAntigravity = environment["TOKENBAR_DEMO_SHOWS_ANTIGRAVITY"] == "1"
+        let showsWorkBuddy = environment["TOKENBAR_DEMO_SHOWS_WORKBUDDY"] == "1"
+        let showsWith = environment["TOKENBAR_DEMO_SHOWS_WITH"] == "1"
         let isDark = environment["TOKENBAR_DEMO_APPEARANCE"] == "dark"
         let width: CGFloat = 384
         let accentColor = Color.blue
         let headerHeight = DashboardOverviewView.headerHeight(
             showsClaude: true,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity)
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith)
         let overviewHeight = DashboardOverviewView.contentHeight(
             quota: model.quotaState(for: model.scope.platform).value,
             providesQuota: model.providesQuota(for: model.scope.platform))
@@ -843,6 +857,8 @@ enum DemoPreviewRenderer {
                 showsClaude: true,
                 showsGrok: showsGrok,
                 showsAntigravity: showsAntigravity,
+                showsWorkBuddy: showsWorkBuddy,
+                showsWith: showsWith,
                 accentColor: accentColor,
                 onSelectScope: nil)
                 .frame(height: headerHeight)

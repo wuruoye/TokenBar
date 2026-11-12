@@ -22,6 +22,14 @@ use tokenbar_helper::grok::{
     extract_request_detail as extract_grok_request_detail, load_grok_session_titles,
     parse_local_grok_messages, LocalParseOptions as GrokParseOptions,
 };
+use tokenbar_helper::with::{
+    extract_request_detail as extract_with_request_detail, parse_local_with_messages,
+    LocalParseOptions as WithParseOptions,
+};
+use tokenbar_helper::workbuddy::{
+    extract_request_detail as extract_workbuddy_request_detail, load_workbuddy_session_titles,
+    parse_local_workbuddy_messages, LocalParseOptions as WorkBuddyParseOptions,
+};
 use serde::Deserialize;
 use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, GooglePricing};
@@ -33,7 +41,7 @@ use tokenbar_helper::{
 };
 
 const DEFAULT_DAYS: usize = 30;
-const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper context-workbench list\n       tokenbar-helper context-workbench show --platform dsh|grok --session-id ID\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]\n       tokenbar-helper decompress-zstd --path PATH --offset BYTES --length BYTES";
+const USAGE: &str = "usage: tokenbar-helper [--days COUNT] [--end-date YYYY-MM-DD] [--home-dir PATH] [--statistics-timezone utc|local] [--weekly-reset-ms MS] [--claude-weekly-reset-ms MS] [--grok-weekly-reset-ms MS] [--antigravity-weekly-reset-ms MS] [--openai-pricing-markdown PATH] [--codex-speed-markdown PATH] [--anthropic-pricing-markdown PATH] [--openrouter-pricing-json PATH] [--memory-database PATH] [--offline-pricing]\n       tokenbar-helper request-detail [--platform codex|claude|grok|antigravity|workbuddy|with] --session-path PATH --start-ms MS --end-ms MS\n       tokenbar-helper context-workbench list\n       tokenbar-helper context-workbench show --platform dsh|grok --session-id ID\n       tokenbar-helper memory-receiver --database PATH [--status-file PATH] [--port PORT] [--parent-pid PID]\n       tokenbar-helper decompress-zstd --path PATH --offset BYTES --length BYTES";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotConfig {
@@ -129,6 +137,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     config.end_ms,
                 ),
                 "antigravity" => extract_antigravity_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
+                "workbuddy" => extract_workbuddy_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
+                "with" => extract_with_request_detail(
                     &config.session_path,
                     config.start_ms,
                     config.end_ms,
@@ -273,10 +291,29 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_antigravity_session_titles(&antigravity_options));
+    let workbuddy_messages = parse_local_workbuddy_messages(WorkBuddyParseOptions {
+        home_dir: antigravity_options.home_dir.clone(),
+        use_env_roots,
+        since: antigravity_options.since.clone(),
+        until: antigravity_options.until.clone(),
+    })
+    .map_err(io::Error::other)?;
+    session_titles.extend(load_workbuddy_session_titles(&workbuddy_messages));
+    // With's cache can be locked or mid-migration while the app runs; a read
+    // failure only drops With from this snapshot.
+    let with_messages = parse_local_with_messages(WithParseOptions {
+        home_dir: antigravity_options.home_dir.clone(),
+        use_env_roots,
+        since: antigravity_options.since.clone(),
+        until: antigravity_options.until.clone(),
+    })
+    .unwrap_or_default();
     let mut messages = codex_messages;
     messages.extend(claude_messages);
     messages.extend(grok_messages);
     messages.extend(antigravity_messages);
+    messages.extend(workbuddy_messages);
+    messages.extend(with_messages);
     config
         .statistics_time_zone
         .normalize_message_dates(&mut messages);
@@ -654,9 +691,9 @@ fn parse_request_detail_args(
             Some("--platform") => {
                 let value = args.next().ok_or("--platform requires a value")?;
                 let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
-                if !matches!(value, "codex" | "claude" | "grok" | "antigravity") {
+                if !matches!(value, "codex" | "claude" | "grok" | "antigravity" | "workbuddy" | "with") {
                     return Err(
-                        "--platform must be codex, claude, grok, or antigravity".to_string()
+                        "--platform must be codex, claude, grok, antigravity, workbuddy, or with".to_string()
                     );
                 }
                 platform = value.to_string();

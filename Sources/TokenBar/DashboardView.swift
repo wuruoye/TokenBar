@@ -17,6 +17,8 @@ struct DashboardSummaryView: View {
     let showsClaude: Bool
     let showsGrok: Bool
     let showsAntigravity: Bool
+    let showsWorkBuddy: Bool
+    let showsWith: Bool
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
@@ -25,14 +27,18 @@ struct DashboardSummaryView: View {
         providesQuota: Bool = true,
         showsClaude: Bool,
         showsGrok: Bool,
-        showsAntigravity: Bool) -> CGFloat
+        showsAntigravity: Bool,
+        showsWorkBuddy: Bool,
+        showsWith: Bool) -> CGFloat
     {
         DashboardOverviewView.preferredHeight(
             quota: quota,
             providesQuota: providesQuota,
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity)
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith)
             + ActivitySummarySection.preferredHeight
     }
 
@@ -43,6 +49,8 @@ struct DashboardSummaryView: View {
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
                 showsAntigravity: self.showsAntigravity,
+                showsWorkBuddy: self.showsWorkBuddy,
+                showsWith: self.showsWith,
                 usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
                 accentColor: self.accentColor)
             ActivitySummarySection(
@@ -68,6 +76,8 @@ struct DashboardOverviewView: View {
     let showsClaude: Bool
     let showsGrok: Bool
     let showsAntigravity: Bool
+    let showsWorkBuddy: Bool
+    let showsWith: Bool
     let usesWeekdayWeeklyPacing: Bool
     let accentColor: Color
 
@@ -76,24 +86,32 @@ struct DashboardOverviewView: View {
         providesQuota: Bool = true,
         showsClaude: Bool,
         showsGrok: Bool,
-        showsAntigravity: Bool) -> CGFloat
+        showsAntigravity: Bool,
+        showsWorkBuddy: Bool,
+        showsWith: Bool) -> CGFloat
     {
         self.headerHeight(
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity)
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith)
             + self.contentHeight(quota: quota, providesQuota: providesQuota)
     }
 
     static func headerHeight(
         showsClaude: Bool,
         showsGrok: Bool,
-        showsAntigravity: Bool) -> CGFloat
+        showsAntigravity: Bool,
+        showsWorkBuddy: Bool,
+        showsWith: Bool) -> CGFloat
     {
         DashboardScope.visibleScopes(
             showsClaude: showsClaude,
             showsGrok: showsGrok,
-            showsAntigravity: showsAntigravity).count > 1
+            showsAntigravity: showsAntigravity,
+            showsWorkBuddy: showsWorkBuddy,
+            showsWith: showsWith).count > 1
             ? self.headerHeight
             : self.compactHeaderHeight
     }
@@ -134,12 +152,16 @@ struct DashboardOverviewView: View {
                 showsClaude: self.showsClaude,
                 showsGrok: self.showsGrok,
                 showsAntigravity: self.showsAntigravity,
+                showsWorkBuddy: self.showsWorkBuddy,
+                showsWith: self.showsWith,
                 accentColor: self.accentColor,
                 onSelectScope: nil)
                 .frame(height: Self.headerHeight(
                     showsClaude: self.showsClaude,
                     showsGrok: self.showsGrok,
-                    showsAntigravity: self.showsAntigravity))
+                    showsAntigravity: self.showsAntigravity,
+                    showsWorkBuddy: self.showsWorkBuddy,
+                    showsWith: self.showsWith))
             DashboardOverviewContentView(
                 model: self.model,
                 usesWeekdayWeeklyPacing: self.usesWeekdayWeeklyPacing,
@@ -156,6 +178,8 @@ struct DashboardHeaderView: View {
     let showsClaude: Bool
     let showsGrok: Bool
     let showsAntigravity: Bool
+    let showsWorkBuddy: Bool
+    let showsWith: Bool
     let accentColor: Color
     let onSelectScope: ((DashboardScope) -> Void)?
 
@@ -163,7 +187,9 @@ struct DashboardHeaderView: View {
         let scopes = DashboardScope.visibleScopes(
             showsClaude: self.showsClaude,
             showsGrok: self.showsGrok,
-            showsAntigravity: self.showsAntigravity)
+            showsAntigravity: self.showsAntigravity,
+            showsWorkBuddy: self.showsWorkBuddy,
+            showsWith: self.showsWith)
         HStack(spacing: 6) {
             if scopes.count > 1 {
                 ForEach(scopes) { scope in

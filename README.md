@@ -5,7 +5,7 @@
 <h1 align="center">TokenBar</h1>
 
 <p align="center">
-  Codex, Claude Code, Grok Build, and Antigravity quota and token activity, at a glance in your macOS menu bar.
+  Codex, Claude Code, Grok Build, Antigravity, WorkBuddy, and With quota and token activity, at a glance in your macOS menu bar.
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
   <img src="docs/images/dashboard.png" width="460" alt="TokenBar dashboard showing Codex quota, today's token usage, weekly-reset totals, and recent activity">
 </p>
 
-TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, Grok Build, and Antigravity. It combines each platform's quota windows with local token accounting, costs, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
+TokenBar is a native, standalone macOS menu bar app for Codex, Claude Code, Grok Build, Antigravity, WorkBuddy, and With. It combines each platform's quota windows with local token accounting, costs, session history, user turns, and main/subagent request details. It does not require CodexBar or Tokscale to build or run.
 
 > TokenBar is an independent project and is not affiliated with or endorsed by OpenAI, Anthropic, xAI, or Google.
 
@@ -27,10 +27,10 @@ The native Windows taskbar and tray client supports Codex, Claude Code, and Grok
 
 ## Highlights
 
-- See one compact menu bar item with separate Codex, Claude, Grok, and Antigravity `T/W` sections.
+- See one compact menu bar item with separate Codex, Claude, Grok, Antigravity, WorkBuddy, and With `T/W` sections. WorkBuddy and With publish no quota window, so their `W` row stays empty.
 - Click a provider section to open TokenBar directly on that platform's tab.
-- Switch between the **Codex**, **Claude**, **Grok**, and **Antigravity** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
-- Hide or restore the Claude, Grok, and Antigravity sections and tabs immediately from Settings, without restarting TokenBar.
+- Switch between the **Codex**, **Claude**, **Grok**, **Antigravity**, **WorkBuddy**, and **With** tabs; each tab uses the same TokenBar sections while optional quota rows collapse when that provider does not return them.
+- Hide or restore the Claude, Grok, Antigravity, WorkBuddy, and With sections and tabs immediately from Settings, without restarting TokenBar.
 - Track every provider's quota window independently without mixing percentages or reset cycles.
 - Track weekly and available 5-hour quota windows, their reset times, and Codex extra reset credits. A row stays hidden when its provider does not return that window.
 - Optionally celebrate confirmed 5-hour or weekly resets with click-through, full-screen confetti launched from that provider's menu bar section.
@@ -66,6 +66,8 @@ _The screenshots use generated demo data and contain no real account or session 
   - Claude Code installed, used at least once, and authenticated. TokenBar reads its local projects from `~/.claude/projects` (or `CLAUDE_CONFIG_DIR`) and its existing OAuth credential for quota.
   - [Grok Build](https://x.ai/cli) installed, used at least once, and authenticated. TokenBar reads durable local sessions and the latest CLI-written quota snapshot from `~/.grok` (or `GROK_HOME`).
   - [Antigravity](https://antigravity.google/) installed and used at least once. TokenBar reads the per-conversation SQLite databases under `~/.gemini/antigravity/conversations` (or `ANTIGRAVITY_HOME`). Quota needs Antigravity to be running, because it comes from that app's own local language server.
+  - WorkBuddy installed and used at least once. TokenBar reads the session transcripts under `~/.workbuddy/projects` (or `WORKBUDDY_HOME`), including subagent transcripts. Requests go through Tencent's internal model gateway, so their cost stays unknown.
+  - With (Knot desktop) installed and used at least once. With keeps history on its server; TokenBar can only read the message details the app has cached in `~/Library/Application Support/com.tencent.with/qa_detail.db` (or `WITH_DATA_DIR`), so older turns drop out once With evicts them. Each cached turn reports its prompt and completion totals without a cache split, so TokenBar shows the prompt total as input, estimates no cost, and leaves context occupancy unknown.
 - To build from source: Apple Swift 6.2 command-line tools and a recent stable Rust toolchain with Cargo.
 
 TokenBar is currently distributed from source. There is no prebuilt, notarized GitHub release yet.
@@ -124,7 +126,7 @@ The desktop card also accepts local background-task snapshots in `~/Library/Appl
 
 ## How counting works
 
-TokenBar normalizes Codex, Claude Code, Grok Build, and Antigravity into the same three activity levels:
+TokenBar normalizes Codex, Claude Code, Grok Build, Antigravity, WorkBuddy, and With into the same three activity levels:
 
 1. **Session** — a root conversation within one platform. TokenBar prefers the Codex-generated title when available and otherwise falls back to the first useful prompt.
 2. **Turn** — the interval beginning with a root user prompt and ending before the next root user prompt. Main-thread and subagent requests launched for that prompt are aggregated into the turn, including subagent work that finishes later.
@@ -214,7 +216,7 @@ Open **Settings** with `Command-,` to configure:
 
 ## Development
 
-No sibling repository checkout is required. The Swift package contains the menu bar UI and independent provider quota clients; `Helper` contains the Codex, Claude, Grok, and Antigravity adapters plus the shared Rust activity aggregator.
+No sibling repository checkout is required. The Swift package contains the menu bar UI and independent provider quota clients; `Helper` contains the Codex, Claude, Grok, Antigravity, WorkBuddy, and With adapters plus the shared Rust activity aggregator.
 
 ### Build and run
 
