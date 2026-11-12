@@ -508,6 +508,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               totals.requestCount >= 0,
               totals.sessionCount >= 0,
               totals.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              Self.isValidGenerationMetrics(totals.generationMetrics),
               totals.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
               totals.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
               Self.hasConsistentFirstTokenAverage(
@@ -543,6 +544,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         guard !day.date.isEmpty,
               Self.isNonnegativeFinite(day.costUsd),
               day.averageGenerationTokensPerSecond.map(Self.isNonnegativeFinite) ?? true,
+              Self.isValidGenerationMetrics(day.generationMetrics),
               day.averageTimeToFirstTokenMs.map(Self.isNonnegativeFinite) ?? true,
               day.firstTokenSampleCount.map({ $0 >= 0 }) ?? true,
               Self.hasConsistentFirstTokenAverage(
@@ -591,6 +593,7 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
               request.endedAtMs >= request.startedAtMs,
               request.durationMs.map({ $0 >= 0 }) ?? true,
               request.modelDurationMs.map({ $0 >= 0 }) ?? true,
+              Self.isValidGenerationMetrics(request.generationMetrics),
               request.timeToFirstTokenMs.map({ $0 >= 0 }) ?? true,
               Self.isNonnegativeFinite(request.costUsd),
               request.promptPreview == nil,
@@ -603,6 +606,11 @@ public struct ActivitySyncRemoteClient: ActivitySyncNetworking, Sendable {
         for contribution in request.contributions ?? [] {
             try Self.validate(request: contribution, depth: depth + 1)
         }
+    }
+
+    private static func isValidGenerationMetrics(_ metrics: GenerationMetrics?) -> Bool {
+        guard let metrics else { return true }
+        return metrics.generatedTokens >= 0 && metrics.durationMs >= 0
     }
 
     private static func validate(memory: MemoryUsageTotals) throws {
@@ -1039,6 +1047,11 @@ public enum ActivitySnapshotMerger {
                         if $0.model != $1.model { return $0.model < $1.model }
                         return $0.provider < $1.provider
                     }
+                let generation = self.mergeGenerationMetrics(
+                    values,
+                    metrics: { $0.generationMetrics },
+                    tokens: { $0.tokens },
+                    rate: { $0.averageGenerationTokensPerSecond })
                 return DailySummary(
                     date: date,
                     tokens: self.sumTokens(values.map(\.tokens)),
@@ -1049,10 +1062,8 @@ public enum ActivitySnapshotMerger {
                     sessionCount: values.reduce(0) {
                         $0.saturatingAddForSync($1.sessionCount)
                     },
-                    averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
-                        values,
-                        tokens: { $0.tokens },
-                        rate: { $0.averageGenerationTokensPerSecond }),
+                    averageGenerationTokensPerSecond: generation.rate,
+                    generationMetrics: generation.metrics,
                     averageTimeToFirstTokenMs: firstToken.average,
                     firstTokenSampleCount: firstToken.sampleCount,
                     models: models)
@@ -1077,15 +1088,18 @@ public enum ActivitySnapshotMerger {
             days,
             average: { $0.averageTimeToFirstTokenMs },
             sampleCount: { $0.firstTokenSampleCount })
+        let generation = self.mergeGenerationMetrics(
+            days,
+            metrics: { $0.generationMetrics },
+            tokens: { $0.tokens },
+            rate: { $0.averageGenerationTokensPerSecond })
         return ActivityTotals(
             tokens: self.sumTokens(days.map(\.tokens)),
             costUsd: self.sumFinite(days.map(\.costUsd)),
             requestCount: days.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
             sessionCount: days.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
-            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
-                days,
-                tokens: { $0.tokens },
-                rate: { $0.averageGenerationTokensPerSecond }),
+            averageGenerationTokensPerSecond: generation.rate,
+            generationMetrics: generation.metrics,
             averageTimeToFirstTokenMs: firstToken.average,
             firstTokenSampleCount: firstToken.sampleCount)
     }
@@ -1105,16 +1119,19 @@ public enum ActivitySnapshotMerger {
             totals,
             average: { $0.averageTimeToFirstTokenMs },
             sampleCount: { $0.firstTokenSampleCount })
+        let generation = self.mergeGenerationMetrics(
+            totals,
+            metrics: { $0.generationMetrics },
+            tokens: { $0.tokens },
+            rate: { $0.averageGenerationTokensPerSecond })
         return ActivityTotals(
             tokens: self.sumTokens(totals.map(\.tokens)),
             costUsd: self.sumFinite(totals.map(\.costUsd)),
             requestCount: totals.reduce(0) { $0.saturatingAddForSync($1.requestCount) },
             sessionCount: totals.reduce(0) { $0.saturatingAddForSync($1.sessionCount) },
             tokenCosts: tokenCosts,
-            averageGenerationTokensPerSecond: self.weightedAverageGenerationTokensPerSecond(
-                totals,
-                tokens: { $0.tokens },
-                rate: { $0.averageGenerationTokensPerSecond }),
+            averageGenerationTokensPerSecond: generation.rate,
+            generationMetrics: generation.metrics,
             averageTimeToFirstTokenMs: firstToken.average,
             firstTokenSampleCount: firstToken.sampleCount)
     }
@@ -1140,21 +1157,31 @@ public enum ActivitySnapshotMerger {
         return (totalMs / Double(totalSamples), totalSamples)
     }
 
-    private static func weightedAverageGenerationTokensPerSecond<Value>(
+    private static func mergeGenerationMetrics<Value>(
         _ values: [Value],
+        metrics: (Value) -> GenerationMetrics?,
         tokens: (Value) -> TokenBreakdown,
-        rate: (Value) -> Double?) -> Double?
+        rate: (Value) -> Double?) -> (rate: Double?, metrics: GenerationMetrics?)
     {
-        var generatedTokens = 0.0
-        var modeledSeconds = 0.0
+        var generatedTokens: Int64 = 0
+        var durationMs = 0.0
         for value in values {
-            guard let rate = rate(value), rate > 0 else { continue }
-            let tokens = tokens(value)
-            let count = Double(tokens.output.saturatingAddForSync(tokens.reasoning))
-            generatedTokens = generatedTokens.saturatingAddForSync(count)
-            modeledSeconds = modeledSeconds.saturatingAddForSync(count / rate)
+            if let sample = metrics(value), sample.generatedTokens > 0, sample.durationMs > 0 {
+                generatedTokens = generatedTokens.saturatingAddForSync(sample.generatedTokens)
+                durationMs = durationMs.saturatingAddForSync(Double(sample.durationMs))
+            } else if let rate = rate(value), rate > 0 {
+                let tokens = tokens(value)
+                let count = tokens.output.saturatingAddForSync(tokens.reasoning)
+                guard count > 0 else { continue }
+                generatedTokens = generatedTokens.saturatingAddForSync(count)
+                durationMs = durationMs.saturatingAddForSync(Double(count) * 1_000 / rate)
+            }
         }
-        return modeledSeconds > 0 ? generatedTokens / modeledSeconds : nil
+        guard generatedTokens > 0, durationMs > 0 else { return (nil, nil) }
+        let roundedDurationMs = Int64(min(Double(Int64.max), max(1.0, durationMs.rounded())))
+        return (
+            Double(generatedTokens) * 1_000 / durationMs,
+            GenerationMetrics(generatedTokens: generatedTokens, durationMs: roundedDurationMs))
     }
 
     private static func sumTokens(_ values: [TokenBreakdown]) -> TokenBreakdown {
@@ -1206,6 +1233,7 @@ public enum ActivitySnapshotMerger {
             endedAtMs: request.endedAtMs,
             durationMs: request.durationMs,
             modelDurationMs: request.modelDurationMs,
+            generationMetrics: request.generationMetrics,
             timeToFirstTokenMs: request.timeToFirstTokenMs,
             tokens: request.tokens,
             costUsd: request.costUsd,
@@ -1286,6 +1314,7 @@ public extension RequestSummary {
             endedAtMs: self.endedAtMs,
             durationMs: self.durationMs,
             modelDurationMs: self.modelDurationMs,
+            generationMetrics: self.generationMetrics,
             timeToFirstTokenMs: self.timeToFirstTokenMs,
             tokens: self.tokens,
             costUsd: self.costUsd,

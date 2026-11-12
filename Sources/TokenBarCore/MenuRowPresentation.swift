@@ -336,16 +336,21 @@ private func weightedAverageGenerationTokensPerSecond(
     var generatedTokens = 0.0
     var durationMs = 0.0
     for request in requests {
-        guard let requestDurationMs = request.modelDurationMs,
-              requestDurationMs > 0
-        else {
+        let requestGeneratedTokens: Double
+        let requestDurationMs: Double
+        if let metrics = request.generationMetrics {
+            requestGeneratedTokens = Double(metrics.generatedTokens)
+            requestDurationMs = Double(metrics.durationMs)
+        } else if let modelDurationMs = request.modelDurationMs, modelDurationMs > 0 {
+            requestGeneratedTokens = Double(max(0, request.tokens.output))
+                + Double(max(0, request.tokens.reasoning))
+            requestDurationMs = Double(modelDurationMs)
+        } else {
             continue
         }
-        let requestGeneratedTokens = Double(max(0, request.tokens.output))
-            + Double(max(0, request.tokens.reasoning))
-        guard requestGeneratedTokens > 0 else { continue }
+        guard requestGeneratedTokens > 0, requestDurationMs > 0 else { continue }
         generatedTokens += requestGeneratedTokens
-        durationMs += Double(requestDurationMs)
+        durationMs += requestDurationMs
     }
     guard generatedTokens.isFinite,
           durationMs.isFinite,

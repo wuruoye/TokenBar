@@ -552,7 +552,7 @@ fn parse_codex_reader<R: BufRead>(
                         .current_model_request_start_ms
                         .or(state.current_turn_start_ms);
                     let model_duration_ms = duration_between_ms(
-                        state.current_model_generation_start_ms.or(model_request_start_ms),
+                        model_request_start_ms.or(state.current_model_generation_start_ms),
                         state.current_model_response_end_ms,
                     );
                     let time_to_first_token_ms = nonnegative_duration_between_ms(

@@ -429,9 +429,8 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_str)
             .and_then(|id| api_request_started_at.get(id).copied())
             .or(request_started_at);
-        // The message id encodes when the server began its response. As for
-        // Codex, generation time runs from there so the first-token wait stays
-        // out of TPS; without a valid response start it runs from the call.
+        // The message id encodes when the server began its response, giving
+        // TTFT relative to the API call start while TPS spans the full call.
         let response_started_at = message_id
             .and_then(|id| prefixed_uuid_v7_timestamp_ms(id, "msg_01"))
             .filter(|started_at| {
@@ -441,7 +440,7 @@ fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
         let time_to_first_token_ms = model_started_at
             .zip(response_started_at)
             .map(|(model_started_at, response_started_at)| response_started_at - model_started_at);
-        let generation_started_at = response_started_at.or(model_started_at);
+        let generation_started_at = model_started_at.or(response_started_at);
         let tokens = TokenBreakdown {
             input: integer(usage.get("input_tokens")).max(0),
             output: integer(usage.get("output_tokens")).max(0),
@@ -558,7 +557,8 @@ fn merge_streaming_duplicate(
         let generation_start = existing
             .model_duration_ms
             .map(|duration| existing.timestamp.saturating_sub(duration))
-            .or(generation_started_at);
+            .or(generation_started_at)
+            .or(start);
         existing.timestamp = timestamp;
         existing.refresh_derived_fields();
         existing.duration_ms = start

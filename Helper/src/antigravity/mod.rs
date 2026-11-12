@@ -896,12 +896,17 @@ fn build_messages(
         );
         message.model_duration_ms = step
             .started_at_ms
-            .and_then(|started| step.finished_at_ms.map(|ended| ended - started))
+            .zip(step.finished_at_ms)
+            .map(|(started, ended)| ended - started)
             .filter(|duration| *duration > 0);
+        let first_token_at_ms = step.first_token_at_ms.filter(|first| {
+            step.started_at_ms.is_none_or(|started| *first >= started)
+                && step.finished_at_ms.is_none_or(|ended| *first <= ended)
+        });
         message.time_to_first_token_ms = step
             .started_at_ms
-            .and_then(|started| step.first_token_at_ms.map(|first| first - started))
-            .filter(|duration| *duration >= 0);
+            .zip(first_token_at_ms)
+            .map(|(started, first)| first - started);
         message.dedup_key = Some(format!(
             "antigravity:{}:{}",
             metadata.conversation_id, step.index
