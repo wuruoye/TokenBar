@@ -620,7 +620,6 @@ private struct CardHeader: View {
                 .fixedSize()
             Spacer(minLength: 8)
             ViewThatFits(in: .horizontal) {
-                self.usage(figures: 4)
                 self.usage(figures: 3)
                 self.usage(figures: 2)
                 self.usage(figures: 1)
@@ -635,7 +634,7 @@ private struct CardHeader: View {
     private func usage(figures: Int, spacing: CGFloat = 10) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: spacing) {
             ForEach(self.snapshot.platforms) { platform in
-                if let today = platform.today {
+                if let today = platform.today, !today.figures.isEmpty {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
                         CardPlatformIcon(platform: platform.id, size: 12)
                             .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1.7 }
@@ -660,10 +659,10 @@ private struct CardHeader: View {
 }
 
 extension UnreadWidgetSnapshot.Usage {
-    /// Tokens, cost, the weekly quota used today, and generation speed, with
-    /// whole dollars from $10 on.
+    /// Cost, the weekly quota used today, and generation speed, with whole
+    /// dollars from $10 on. Token totals stay in the tooltip.
     var figures: [String] {
-        var figures = [self.tokens.statusBarCompactCount]
+        var figures: [String] = []
         if self.costUsd > 0 {
             figures.append(self.costUsd < 10 ? self.costUsd.usdText : Self.wholeDollarText(self.costUsd))
         }

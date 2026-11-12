@@ -151,6 +151,8 @@ public final class DesktopUnreadTaskMonitor {
     public nonisolated static let claudeBundleIdentifier = "com.anthropic.claudefordesktop"
     public nonisolated static let codexBundleIdentifier = "com.openai.codex"
     public nonisolated static let antigravityBundleIdentifier = "com.google.antigravity"
+    public nonisolated static let workBuddyBundleIdentifier = "com.tencent.workbuddy.mac"
+    public nonisolated static let withBundleIdentifier = "com.tencent.with"
 
     /// Hears which app is in front. Claude counts a turn that ends in the
     /// session its window shows as read, even while another app is in front,
@@ -163,6 +165,8 @@ public final class DesktopUnreadTaskMonitor {
         case Self.claudeBundleIdentifier: .claude
         case Self.codexBundleIdentifier: .codex
         case Self.antigravityBundleIdentifier: .antigravity
+        case Self.workBuddyBundleIdentifier: .workbuddy
+        case Self.withBundleIdentifier: .with
         default: nil
         }
         let now = Date()
@@ -461,7 +465,7 @@ public final class DesktopUnreadTaskMonitor {
 }
 
 struct DesktopUnreadTaskReader: Sendable {
-    static let platforms: [TokenPlatform] = [.codex, .claude, .antigravity]
+    static let platforms: [TokenPlatform] = [.codex, .claude, .antigravity, .workbuddy, .with]
 
     let codexHome: URL
     let claudeSupportDirectory: URL
@@ -469,6 +473,7 @@ struct DesktopUnreadTaskReader: Sendable {
     let claudeMainLog: URL
     let antigravityHome: URL
     let backgroundTasksDirectory: URL
+    let hosted: DesktopHostedTaskReader
 
     init(
         codexHome: URL,
@@ -476,7 +481,8 @@ struct DesktopUnreadTaskReader: Sendable {
         claudeProjectsDirectory: URL,
         claudeMainLog: URL,
         antigravityHome: URL = AntigravityQuotaService.antigravityHomeURL(environment: [:]),
-        backgroundTasksDirectory: URL = CodexBackgroundTaskReader.directory(environment: [:]))
+        backgroundTasksDirectory: URL = CodexBackgroundTaskReader.directory(environment: [:]),
+        hosted: DesktopHostedTaskReader = DesktopHostedTaskReader(environment: [:]))
     {
         self.codexHome = codexHome
         self.claudeSupportDirectory = claudeSupportDirectory
@@ -484,6 +490,7 @@ struct DesktopUnreadTaskReader: Sendable {
         self.claudeMainLog = claudeMainLog
         self.antigravityHome = antigravityHome
         self.backgroundTasksDirectory = backgroundTasksDirectory
+        self.hosted = hosted
     }
 
     init(environment: [String: String]) {
@@ -505,7 +512,8 @@ struct DesktopUnreadTaskReader: Sendable {
             claudeMainLog: fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Logs/Claude/main.log", isDirectory: false),
             antigravityHome: AntigravityQuotaService.antigravityHomeURL(environment: environment),
-            backgroundTasksDirectory: CodexBackgroundTaskReader.directory(environment: environment))
+            backgroundTasksDirectory: CodexBackgroundTaskReader.directory(environment: environment),
+            hosted: DesktopHostedTaskReader(environment: environment))
     }
 
     // MARK: Codex
@@ -943,7 +951,13 @@ struct DesktopUnreadTaskReader: Sendable {
         Self.appLaunch(executableName: "Antigravity", reusing: known)
     }
 
-    private static func appLaunch(executableName: String, reusing known: ClaudeLaunch?) -> ClaudeLaunch? {
+    /// `bundleName` tells apart apps that share an executable name, such as
+    /// the `Electron` of every Electron app.
+    static func appLaunch(
+        executableName: String,
+        bundleName: String? = nil,
+        reusing known: ClaudeLaunch?) -> ClaudeLaunch?
+    {
         if let known, Self.processStartedAt(known.pid) == known.startedAt {
             return known
         }
@@ -955,7 +969,7 @@ struct DesktopUnreadTaskReader: Sendable {
         size = processes.count * MemoryLayout<kinfo_proc>.stride
         guard sysctl(&mib, u_int(mib.count), &processes, &size, nil, 0) == 0 else { return nil }
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let suffix = ".app/Contents/MacOS/\(executableName)"
+        let suffix = "\(bundleName.map { "/\($0)" } ?? "").app/Contents/MacOS/\(executableName)"
         for process in processes.prefix(size / MemoryLayout<kinfo_proc>.stride) {
             let name = withUnsafeBytes(of: process.kp_proc.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
             guard name == executableName,
@@ -2124,6 +2138,11 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var antigravityAnnotationsPrefix: String?
     private var antigravityBrainPrefix: String?
     private var antigravityConversationsPrefix: String?
+    private var workBuddyDatabasePath: String?
+    private var workBuddyProjectsPrefix: String?
+    private var withDatabasePath: String?
+    private var workBuddyLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
+    private var withLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private var claudeTracker = ClaudeUnreadTracker()
     private var savedClaudeTrackerState: ClaudeUnreadTracker.State?
     private var antigravityTracker = AntigravityUnreadTracker()
@@ -2278,6 +2297,15 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.antigravityBrainPrefix = antigravityRoot + "/brain/"
             self.antigravityConversationsPrefix = antigravityRoot + "/conversations/"
         }
+        if let workBuddyRoot = Self.canonicalPath(self.reader.hosted.workBuddyHome) {
+            roots.append(workBuddyRoot)
+            self.workBuddyDatabasePath = workBuddyRoot + "/workbuddy.db"
+            self.workBuddyProjectsPrefix = workBuddyRoot + "/projects/"
+        }
+        if let withRoot = Self.canonicalPath(self.reader.hosted.withSupportDirectory) {
+            roots.append(withRoot)
+            self.withDatabasePath = withRoot + "/data.db"
+        }
         guard !roots.isEmpty else { return }
 
         var context = FSEventStreamContext(
@@ -2328,12 +2356,23 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         var changed = Set<TokenPlatform>()
         var codexRolloutChanged = false
         var antigravityTranscriptChanged = false
+        var hostedChanged = Set<TokenPlatform>()
         for (index, path) in paths.enumerated() {
             if index < flags.count, flags[index] & rescanFlags != 0 {
                 changed.formUnion(DesktopUnreadTaskReader.platforms)
                 codexRolloutChanged = true
                 antigravityTranscriptChanged = true
                 break
+            }
+            if let database = self.workBuddyDatabasePath, path == database || path.hasPrefix(database + "-") {
+                hostedChanged.insert(.workbuddy)
+                continue
+            } else if let projects = self.workBuddyProjectsPrefix, path.hasPrefix(projects), path.hasSuffix(".jsonl") {
+                hostedChanged.insert(.workbuddy)
+                continue
+            } else if let database = self.withDatabasePath, path == database || path.hasPrefix(database + "-") {
+                hostedChanged.insert(.with)
+                continue
             }
             if self.codexPaths.contains(path) {
                 changed.insert(.codex)
@@ -2376,7 +2415,14 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 antigravityTranscriptChanged = true
             }
         }
-        self.recount(DesktopUnreadTaskReader.platforms.filter { changed.contains($0) })
+        let hostedPlatforms: [TokenPlatform] = [.workbuddy, .with]
+        self.recount(DesktopUnreadTaskReader.platforms.filter {
+            changed.contains($0) && !hostedPlatforms.contains($0)
+        })
+        // Both hosts rewrite their databases and transcripts many times a turn.
+        for platform in hostedPlatforms where changed.contains(platform) || hostedChanged.contains(platform) {
+            self.scheduleHostedRecount(of: platform)
+        }
         // Codex marks a thread unread as its turn ends, and a new thread
         // creates its rollout before the vnode watch covers it.
         if changed.contains(.codex) || codexRolloutChanged {
@@ -2486,6 +2532,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 if needsRetry {
                     self.scheduleAntigravityRetry()
                 }
+            case .workbuddy:
+                self.recountWorkBuddy()
+            case .with:
+                self.recountWith()
             default:
                 continue
             }
@@ -2592,6 +2642,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.recountCodexRunning()
             self.recountClaudeRunning()
             self.recountAntigravityRunning()
+            self.recount([.workbuddy, .with])
             self.scheduleRunningRefresh()
         }
     }
@@ -2630,6 +2681,112 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
 
     private func recountAntigravityRunning() {
         self.recount([.antigravity])
+    }
+
+    private func scheduleHostedRecount(of platform: TokenPlatform) {
+        guard self.appendRecountsScheduled.insert(platform).inserted else { return }
+        self.queue.asyncAfter(deadline: .now() + 0.5) {
+            self.appendRecountsScheduled.remove(platform)
+            self.recount([platform])
+        }
+    }
+
+    /// WorkBuddy marks a session unread itself when a turn finishes out of
+    /// view. A turn runs until its transcript ends with the assistant's reply,
+    /// unless the transcript has gone quiet or WorkBuddy quit.
+    private func recountWorkBuddy() {
+        let now = Date()
+        let hosted = self.reader.hosted
+        let sessions = hosted.workBuddySessions(now: now)
+        self.workBuddyLaunch = DesktopUnreadTaskReader.appLaunch(
+            executableName: "Electron",
+            bundleName: "WorkBuddy",
+            reusing: self.workBuddyLaunch)
+        let isAppRunning = self.workBuddyLaunch != nil
+        let transcripts = hosted.workBuddyTranscripts()
+        var unread: [DesktopUnreadTask] = []
+        var running: [DesktopRunningTask] = []
+        for session in sessions {
+            let transcript = transcripts[session.id]
+            let modifiedAt = transcript.flatMap {
+                (try? FileManager.default.attributesOfItem(atPath: $0.path))?[.modificationDate] as? Date
+            }
+            let isLive = isAppRunning
+                && modifiedAt.map { now.timeIntervalSince($0) < DesktopRunningTaskLiveness.quietLimit } == true
+            guard session.unread || isLive, let transcript else { continue }
+            let turn = hosted.workBuddyLastTurn(transcript: transcript)
+            if isLive, let turn, turn.isOpen {
+                running.append(DesktopRunningTask(
+                    platform: .workbuddy,
+                    id: session.id,
+                    title: session.title ?? turn.prompt,
+                    startedAt: turn.startedAt,
+                    activity: turn.activity))
+                continue
+            }
+            guard session.unread else { continue }
+            let duration: TimeInterval? = {
+                guard let startedAt = turn?.startedAt, let endedAt = turn?.endedAt else { return nil }
+                return endedAt.timeIntervalSince(startedAt)
+            }()
+            unread.append(DesktopUnreadTask(
+                platform: .workbuddy,
+                id: session.id,
+                title: session.title,
+                prompt: turn?.prompt,
+                reply: turn?.reply,
+                turnDuration: duration.flatMap { $0 > 0 ? $0 : nil },
+                workspacePath: session.workspacePath,
+                updatedAt: turn?.endedAt ?? session.lastActivityAt))
+        }
+        unread.sort { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+        running.sort { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
+        self.publish(.workbuddy, unread, Set(sessions.map(\.id)), nil)
+        self.publishRunning(.workbuddy, running)
+    }
+
+    /// With's board keeps the unread flag; its message index says whether a
+    /// session's latest turn still streams. Text comes from its message cache.
+    private func recountWith() {
+        let now = Date()
+        let hosted = self.reader.hosted
+        self.withLaunch = DesktopUnreadTaskReader.appLaunch(
+            executableName: "With",
+            bundleName: "With",
+            reusing: self.withLaunch)
+        let isAppRunning = self.withLaunch != nil
+        var unread: [DesktopUnreadTask] = []
+        var running: [DesktopRunningTask] = []
+        for session in hosted.withSessions(now: now) {
+            let turn = session.latestMessageID.flatMap(hosted.withTurn(messageID:))
+            if session.isStreaming {
+                let isLive = isAppRunning && session.lastActivityAt.map {
+                    now.timeIntervalSince($0) < DesktopRunningTaskLiveness.quietLimit
+                } == true
+                if isLive {
+                    running.append(DesktopRunningTask(
+                        platform: .with,
+                        id: session.id,
+                        title: turn?.prompt,
+                        startedAt: session.requestedAt))
+                }
+                continue
+            }
+            guard session.unread else { continue }
+            unread.append(DesktopUnreadTask(
+                platform: .with,
+                id: session.id,
+                title: nil,
+                prompt: turn?.prompt,
+                reply: turn?.reply,
+                turnDuration: turn?.duration,
+                workspacePath: nil,
+                updatedAt: session.lastActivityAt))
+        }
+        unread.sort { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+        running.sort { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
+        self.publish(.with, unread, nil, nil)
+        self.publishRunning(.with, running)
     }
 
     private func antigravityRunningTasks(

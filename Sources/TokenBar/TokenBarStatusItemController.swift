@@ -313,6 +313,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         let codexUnread = self.unreadTasks.count(for: .codex)
         let claudeUnread = self.unreadTasks.count(for: .claude)
         let antigravityUnread = self.unreadTasks.count(for: .antigravity)
+        let workbuddyUnread = self.unreadTasks.count(for: .workbuddy)
+        let withUnread = self.unreadTasks.count(for: .with)
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
@@ -326,7 +328,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             antigravityWeekly: antigravity?.weekly,
             antigravityUnreadCount: antigravityUnread,
             workbuddyToday: workbuddy?.today,
-            withToday: with?.today)
+            workbuddyUnreadCount: workbuddyUnread,
+            withToday: with?.today,
+            withUnreadCount: withUnread)
         self.statusLabelLayout = layout
         button.image = layout.image
 
@@ -346,10 +350,12 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
                 "Antigravity. Today, \(antigravity.today) tokens. Weekly quota, \(antigravity.weekly) remaining.\(Self.unreadAccessibilityText(antigravityUnread))")
         }
         if let workbuddy {
-            accessibilityLabels.append("WorkBuddy. Today, \(workbuddy.today) tokens.")
+            accessibilityLabels.append(
+                "WorkBuddy. Today, \(workbuddy.today) tokens.\(Self.unreadAccessibilityText(workbuddyUnread))")
         }
         if let with {
-            accessibilityLabels.append("With. Today, \(with.today) tokens.")
+            accessibilityLabels.append(
+                "With. Today, \(with.today) tokens.\(Self.unreadAccessibilityText(withUnread))")
         }
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
     }
@@ -1808,7 +1814,9 @@ enum StatusLabelRenderer {
         antigravityWeekly: String? = nil,
         antigravityUnreadCount: Int = 0,
         workbuddyToday: String? = nil,
-        withToday: String? = nil) -> StatusLabelLayout
+        workbuddyUnreadCount: Int = 0,
+        withToday: String? = nil,
+        withUnreadCount: Int = 0) -> StatusLabelLayout
     {
         var values: [(scope: DashboardScope, today: String, weekly: String, unreadCount: Int)] = [
             (.codex, codexToday, codexWeekly, codexUnreadCount),
@@ -1824,10 +1832,10 @@ enum StatusLabelRenderer {
         }
         // WorkBuddy and With publish no quota window, so their W row stays empty.
         if let workbuddyToday {
-            values.append((.workbuddy, workbuddyToday, "—", 0))
+            values.append((.workbuddy, workbuddyToday, "—", workbuddyUnreadCount))
         }
         if let withToday {
-            values.append((.with, withToday, "—", 0))
+            values.append((.with, withToday, "—", withUnreadCount))
         }
         let images = values.map { value in
             self.image(

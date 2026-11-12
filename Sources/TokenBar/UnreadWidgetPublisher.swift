@@ -75,6 +75,8 @@ final class UnreadWidgetPublisher {
             _ = self.model.weeklyQuotaUsageHistories
             _ = self.settings.showsClaude
             _ = self.settings.showsAntigravity
+            _ = self.settings.showsWorkBuddy
+            _ = self.settings.showsWith
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isStarted else { return }
@@ -230,6 +232,12 @@ final class UnreadWidgetPublisher {
         }
         if settings.showsAntigravity {
             platforms.append(.antigravity)
+        }
+        if settings.showsWorkBuddy {
+            platforms.append(.workbuddy)
+        }
+        if settings.showsWith {
+            platforms.append(.with)
         }
         let unread = platforms.flatMap { unreadTasks.tasks[$0] ?? [] }
         let unreadIDs = Set(unread.map { "\($0.platform.rawValue)/\($0.id)" })

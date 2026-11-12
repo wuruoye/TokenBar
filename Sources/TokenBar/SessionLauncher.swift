@@ -119,6 +119,13 @@ struct SessionLauncher {
         id: String,
         onWillOpen: ((String) -> Void)? = nil) throws
     {
+        if platform == .with {
+            onWillOpen?(id)
+            guard Self.openApplication(bundleIdentifier: Self.withBundleIdentifier) else {
+                throw SessionLauncherError.applicationUnavailable(.with)
+            }
+            return
+        }
         if platform == .antigravity {
             let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isSafePathIdentifier(trimmed) else {
