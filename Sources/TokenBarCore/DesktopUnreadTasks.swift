@@ -438,7 +438,10 @@ public final class DesktopUnreadTaskMonitor {
             guard let openedAt = opened[task.id] else { return true }
             return (task.updatedAt ?? .distantPast) > openedAt
         }
-        let excluded = Set((self.reported[platform] ?? []).map(\.id) + (self.running[platform] ?? []).map(\.id))
+        let foregroundRunningIDs = (self.running[platform] ?? [])
+            .filter { !$0.isInBackground }
+            .map(\.id)
+        let excluded = Set((self.reported[platform] ?? []).map(\.id) + foregroundRunningIDs)
         let held = (self.held[platform] ?? [:]).filter { !excluded.contains($0.key) && opened[$0.key] == nil }
         self.held[platform] = held
         let tasks = held.isEmpty ? reported : (reported + held.values.map(\.task)).sorted {
@@ -1099,6 +1102,16 @@ struct DesktopUnreadTaskReader: Sendable {
             .appendingPathComponent(conversationID + ".db", isDirectory: false)
     }
 
+    private func antigravityConversationCreationDate(conversationID: String) -> Date? {
+        guard let url = self.antigravityConversationDatabaseURL(conversationID: conversationID),
+              let createdAt = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate,
+              createdAt.timeIntervalSince1970 > 0
+        else {
+            return nil
+        }
+        return createdAt
+    }
+
     /// Whether the step Antigravity created after `stepIndex` in `conversations/<id>.db`
     /// is still pending (`1`), running (`2`), or waiting for the user (`9`).
     func antigravityIsStepWaiting(conversationID: String, after stepIndex: Int?) -> Bool {
@@ -1240,7 +1253,6 @@ struct DesktopUnreadTaskReader: Sendable {
                 isKilled: sqlite3_column_int64(statement, 12) != 0)
         }
 
-        var foregroundSubagents = Set<String>()
         var backgroundSubagents = Set<String>()
         var subagentActivities: [String: [String]] = [:]
         var subagentStartedAt: [String: Date] = [:]
@@ -1253,12 +1265,11 @@ struct DesktopUnreadTaskReader: Sendable {
                 hops += 1
             }
             guard current != row.id else { continue }
-            if row.hasActiveRunStatus {
-                foregroundSubagents.insert(current)
-            } else {
-                backgroundSubagents.insert(current)
-            }
-            if let startedAt = row.lastUserInputAt ?? row.lastModifiedAt {
+            backgroundSubagents.insert(current)
+            if let startedAt = row.lastUserInputAt
+                ?? self.antigravityConversationCreationDate(conversationID: row.id)
+                ?? row.lastModifiedAt
+            {
                 if let existing = subagentStartedAt[current] {
                     subagentStartedAt[current] = min(existing, startedAt)
                 } else {
@@ -1299,7 +1310,6 @@ struct DesktopUnreadTaskReader: Sendable {
                 isKilled: row.isKilled,
                 hasActiveRunStatus: row.hasActiveRunStatus,
                 notFullyIdle: row.notFullyIdle,
-                hasForegroundSubagents: foregroundSubagents.contains(row.id),
                 hasBackgroundSubagents: backgroundSubagents.contains(row.id),
                 subagentActivity: subagentActivities[row.id].map { $0.joined(separator: " · ") },
                 subagentStartedAt: subagentStartedAt[row.id])
@@ -1489,8 +1499,9 @@ struct DesktopUnreadTaskReader: Sendable {
                 normalized.append("Z")
             }
         }
-        return (try? Date(normalized, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
+        let date = (try? Date(normalized, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
             ?? (try? Date(normalized, strategy: Date.ISO8601FormatStyle()))
+        return date.flatMap { $0.timeIntervalSince1970 > 0 ? $0 : nil }
     }
 
     static func antigravityWorkspacePath(_ raw: String) -> String? {
@@ -1565,7 +1576,6 @@ struct AntigravitySessionSnapshot: Equatable, Sendable {
     let isKilled: Bool
     let hasActiveRunStatus: Bool
     let notFullyIdle: Bool
-    let hasForegroundSubagents: Bool
     let hasBackgroundSubagents: Bool
     let subagentActivity: String?
     var subagentStartedAt: Date? = nil
@@ -2818,7 +2828,6 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             }
             let wantsStatusCheck = session.hasActiveRunStatus
                 || session.notFullyIdle
-                || session.hasForegroundSubagents
                 || session.hasBackgroundSubagents
                 || self.antigravityWaiting[id] != nil
                 || session.lastModifiedAt.map({ now.timeIntervalSince($0) < 6 * 60 * 60 }) == true
@@ -2835,7 +2844,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                let modifiedAt = attributes[.modificationDate] as? Date
             {
                 transcriptModifiedAt = modifiedAt
-                if session.hasActiveRunStatus || session.notFullyIdle || session.hasForegroundSubagents
+                if session.hasActiveRunStatus || session.notFullyIdle
                     || session.hasBackgroundSubagents
                     || now.timeIntervalSince(modifiedAt) < DesktopRunningTaskLiveness.quietLimit
                 {
@@ -2854,7 +2863,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                     return externalTask
                 }
                 if session.hasActiveRunStatus || session.notFullyIdle
-                    || session.hasForegroundSubagents || session.hasBackgroundSubagents
+                    || session.hasBackgroundSubagents
                 {
                     transcriptActivity = self.antigravityActivities.activity(in: transcript, size: size)
                 }
@@ -2869,7 +2878,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             let latestActivityAt = max(
                 session.lastModifiedAt ?? .distantPast,
                 transcriptModifiedAt ?? .distantPast)
-            if session.hasActiveRunStatus || session.hasForegroundSubagents,
+            if session.hasActiveRunStatus,
                now.timeIntervalSince(latestActivityAt) < DesktopRunningTaskLiveness.quietLimit
             {
                 return DesktopRunningTask(

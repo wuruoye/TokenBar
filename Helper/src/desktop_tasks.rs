@@ -135,7 +135,6 @@ struct AgySession {
     killed: bool,
     active_status: bool,
     not_fully_idle: bool,
-    foreground_subagents: bool,
     background_subagents: bool,
     subagent_activity: Option<String>,
     subagent_started_ms: Option<i64>,
@@ -739,7 +738,10 @@ impl DesktopTaskMonitor {
             self.accept("antigravity", unread, Some(existing), now_ms);
         }
         if let Some((unread, running)) = self.collect_codex(codex_root, now_ms) {
-            self.running_ids.insert("codex".into(), running.iter().map(|t| t.id.clone()).collect());
+            self.running_ids.insert(
+                "codex".into(),
+                running.iter().filter(|t| !t.is_background).map(|t| t.id.clone()).collect(),
+            );
             active.extend(running);
             self.accept("codex", unread, None, now_ms);
         }
@@ -1064,7 +1066,6 @@ impl DesktopTaskMonitor {
             }
             let wants_status_check = session.active_status
                 || session.not_fully_idle
-                || session.foreground_subagents
                 || session.background_subagents
                 || self.agy.waiting.contains(&session.id)
                 || session
@@ -1086,7 +1087,6 @@ impl DesktopTaskMonitor {
                 }
                 if session.active_status
                     || session.not_fully_idle
-                    || session.foreground_subagents
                     || session.background_subagents
                 {
                     activity = turn.activity.clone();
@@ -1103,7 +1103,7 @@ impl DesktopTaskMonitor {
                 .max(stamp.as_ref().map_or(0, |s| s.modified_ms));
             let title = session_title(session.title.as_deref(), session.preview.as_deref(), "Antigravity 会话");
             let workspace_label = session.workspace_path.as_deref().and_then(workspace_basename).map(str::to_string);
-            if (session.active_status || session.foreground_subagents) && now_ms - latest_activity < QUIET_LIMIT_MS {
+            if session.active_status && now_ms - latest_activity < QUIET_LIMIT_MS {
                 foreground_ids.insert(session.id.clone());
                 running.push(DesktopRunningTask {
                     id: session.id.clone(),
@@ -1336,7 +1336,6 @@ impl DesktopTaskMonitor {
             .ok()?;
         let raws: BTreeMap<String, Raw> = rows.flatten().map(|r| (r.id.clone(), r)).collect();
 
-        let mut fg_subagents = HashSet::new();
         let mut bg_subagents = HashSet::new();
         let mut activities: HashMap<String, Vec<String>> = HashMap::new();
         let mut sub_started: HashMap<String, i64> = HashMap::new();
@@ -1356,12 +1355,15 @@ impl DesktopTaskMonitor {
             if current == row.id {
                 continue;
             }
-            if row.active_status {
-                fg_subagents.insert(current.clone());
-            } else {
-                bg_subagents.insert(current.clone());
-            }
-            if let Some(started) = row.last_user_input_ms.or(row.last_modified_ms) {
+            bg_subagents.insert(current.clone());
+            let created_ms = (!row.id.contains('/') && !row.id.contains(".."))
+                .then(|| root.join("conversations").join(format!("{}.db", row.id)))
+                .and_then(|p| fs::metadata(p).ok())
+                .and_then(|m| m.created().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .filter(|&ms| ms > 0);
+            if let Some(started) = row.last_user_input_ms.or(created_ms).or(row.last_modified_ms) {
                 let entry = sub_started.entry(current.clone()).or_insert(started);
                 *entry = (*entry).min(started);
             }
@@ -1404,7 +1406,6 @@ impl DesktopTaskMonitor {
                     killed: row.killed,
                     active_status: row.active_status,
                     not_fully_idle: row.not_fully_idle,
-                    foreground_subagents: fg_subagents.contains(&row.id),
                     background_subagents: bg_subagents.contains(&row.id),
                     subagent_activity: activities.get(&row.id).map(|a| a.join(" · ")),
                     subagent_started_ms: sub_started.get(&row.id).copied(),
@@ -2459,22 +2460,25 @@ fn parse_timestamp_ms(value: &str) -> Option<i64> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(num) = trimmed.parse::<i64>() {
-        return Some(if num > 10_000_000_000 { num } else { num * 1000 });
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-        return Some(dt.timestamp_millis());
-    }
-    let normalized = trimmed.replacen(' ', "T", 1);
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
-        return Some(dt.timestamp_millis());
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&normalized, format) {
-            return Some(naive.and_utc().timestamp_millis());
+    let parsed = if let Ok(num) = trimmed.parse::<i64>() {
+        Some(if num > 10_000_000_000 { num } else { num * 1000 })
+    } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        Some(dt.timestamp_millis())
+    } else {
+        let normalized = trimmed.replacen(' ', "T", 1);
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
+            Some(dt.timestamp_millis())
+        } else {
+            ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+                .into_iter()
+                .find_map(|format| {
+                    chrono::NaiveDateTime::parse_from_str(&normalized, format)
+                        .ok()
+                        .map(|naive| naive.and_utc().timestamp_millis())
+                })
         }
-    }
-    None
+    };
+    parsed.filter(|&ms| ms > 0)
 }
 
 fn parse_pbtxt_annotation(text: &str) -> PbtxtAnnotation {
@@ -2739,6 +2743,82 @@ mod tests {
     fn parses_antigravity_sqlite_dates_as_utc() {
         assert_eq!(parse_timestamp_ms("2026-11-06 15:00:00"), Some(1_793_977_200_000));
         assert_eq!(parse_timestamp_ms("2026-11-06 15:00:00.250"), Some(1_793_977_200_250));
+        assert_eq!(parse_timestamp_ms("0001-01-01 00:00:00+00:00"), None);
+    }
+
+    #[test]
+    fn idle_parent_with_running_subagent_is_unread_and_then_background() {
+        let dir = std::env::temp_dir().join(format!("tokenbar-agy-subagent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("annotations")).unwrap();
+        let db_path = dir.join("conversation_summaries.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                preview TEXT NOT NULL DEFAULT '',
+                step_count INTEGER NOT NULL DEFAULT 0,
+                last_modified_time TEXT NOT NULL,
+                last_user_input_time TEXT NOT NULL,
+                workspace_uris TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT '',
+                agent_name TEXT NOT NULL DEFAULT '',
+                parent_conversation_id TEXT NOT NULL DEFAULT '',
+                nesting_depth INTEGER NOT NULL DEFAULT 0,
+                not_fully_idle INTEGER NOT NULL DEFAULT 0,
+                killed INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (
+                'root-1', 'Mini Harness', 'reply', 10,
+                '2026-11-12 12:29:20+00:00', '2026-11-12 12:04:37+00:00',
+                '[\"file:///tmp/mini-harness\"]', 'CASCADE_RUN_STATUS_IDLE',
+                '', '', 0, 1, 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (
+                'sub-1', '', '', 20,
+                '2026-11-12 12:31:00+00:00', '0001-01-01 00:00:00+00:00',
+                '[\"file:///tmp/mini-harness\"]', 'CASCADE_RUN_STATUS_RUNNING',
+                'self', 'root-1', 1, 1, 0
+            )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        fs::write(
+            dir.join("annotations/root-1.pbtxt"),
+            "title:\"Mini Harness\" last_user_view_time:{seconds:1794485696 nanos:0}\n",
+        )
+        .unwrap();
+
+        let now_ms = 1_794_486_700_000;
+        let codex_dir = dir.join("empty-codex");
+        let mut monitor = DesktopTaskMonitor::new(None);
+        monitor.set_app_state("antigravity", true, Some(1_794_480_000_000));
+        let snap = monitor.poll(&codex_dir, &dir, now_ms);
+        assert!(snap.running.is_empty());
+        assert!(snap.background.is_empty());
+        assert_eq!(snap.unread.len(), 1);
+        assert_eq!(snap.unread[0].id, "root-1");
+        assert_eq!(snap.unread[0].background_activity.as_deref(), Some("Subagent · self"));
+
+        // Once the user opens the parent conversation, it moves to Background while the subagent runs.
+        monitor.mark_opened("antigravity", "root-1", now_ms + 1_000);
+        let snap_after = monitor.poll(&codex_dir, &dir, now_ms + 2_000);
+        assert!(snap_after.unread.is_empty());
+        assert!(snap_after.running.is_empty());
+        assert_eq!(snap_after.background.len(), 1);
+        assert_eq!(snap_after.background[0].id, "root-1");
+        assert_eq!(snap_after.background[0].current_step.as_deref(), Some("Subagent · self"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
