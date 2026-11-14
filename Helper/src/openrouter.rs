@@ -1,6 +1,6 @@
 //! Public OpenRouter token quotes. No account credentials or session data are sent.
 use crate::{
-    pricing::{normalize_anthropic_model_id, normalize_pricing_model_id},
+    pricing::{normalize_anthropic_model_id, normalize_google_model_id, normalize_pricing_model_id},
     usage::{CacheWriteBreakdown, TokenBreakdown, TokenCostBreakdown},
 };
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,7 @@ fn key(author: &str, model: &str) -> String {
             )
         }
         "anthropic" => format!("anthropic/{}", normalize_anthropic_model_id(model)),
+        "google" => format!("google/{}", normalize_google_model_id(model)),
         _ => String::new(),
     }
 }
@@ -189,6 +190,7 @@ impl Catalog {
         }
         let mut models = HashMap::new();
         let mut context_windows = HashMap::new();
+        let mut google_raw_lengths: HashMap<String, usize> = HashMap::new();
         for row in rows {
             let Some(id) = row.get("id").and_then(Value::as_str) else {
                 continue;
@@ -204,13 +206,58 @@ impl Catalog {
                     context_windows.insert(id.to_string(), window);
                 }
             }
-            if !["openai", "anthropic"].contains(&author)
+            if !["openai", "anthropic", "google"].contains(&author)
                 || slug.contains(':')
                 || slug.contains('/')
             {
                 continue;
             }
+            if author == "google" && !slug.starts_with("gemini") {
+                continue;
+            }
             let canonical = key(author, slug);
+            if author == "google" {
+                let Ok(base) = rates(&row["pricing"], false) else {
+                    continue;
+                };
+                if base.output.unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                if google_raw_lengths
+                    .get(&canonical)
+                    .is_some_and(|length| *length <= id.len())
+                {
+                    continue;
+                }
+                let mut thresholds = Vec::new();
+                if let Some(overrides) = row["pricing"].get("overrides") {
+                    if let Some(overrides) = overrides.as_array() {
+                        for item in overrides.iter().take(64) {
+                            let Some(min) = item.get("min_prompt_tokens").and_then(Value::as_i64) else {
+                                continue;
+                            };
+                            if !(0..=10_000_000).contains(&min) {
+                                continue;
+                            }
+                            if let Ok(override_rates) = rates(item, true) {
+                                thresholds.push(Threshold {
+                                    min_prompt_tokens: min,
+                                    rates: override_rates,
+                                });
+                            }
+                        }
+                    }
+                }
+                google_raw_lengths.insert(canonical.clone(), id.len());
+                models.insert(
+                    canonical,
+                    ModelPrice {
+                        rates: base,
+                        thresholds,
+                    },
+                );
+                continue;
+            }
             // Use current canonical model entries; a dated/variant quote must
             // not overwrite the current model's base rate.
             let plain_slug = if author == "anthropic" {
@@ -334,7 +381,7 @@ impl Catalog {
         }
         // When the quote omits context overrides, retain the verified OpenAI
         // long-context rule instead of silently treating the whole prompt as short.
-        if entry.thresholds.is_empty() && known_long_context && prompt > 272000 {
+        if author == "openai" && entry.thresholds.is_empty() && known_long_context && prompt > 272000 {
             rates.input = rates.input.map(|v| v * 2.0);
             rates.cache_read = rates.cache_read.map(|v| v * 2.0);
             rates.cache_write = rates.cache_write.map(|v| v * 2.0);
@@ -347,18 +394,28 @@ impl Catalog {
                 Some(tokens as f64 * rate?)
             }
         }
+        let cache_read_rate = if author == "google" {
+            rates.cache_read.or(rates.input)
+        } else {
+            rates.cache_read
+        };
+        let cache_write_rate = if author == "google" {
+            rates.cache_write.or(rates.input)
+        } else {
+            rates.cache_write
+        };
         let cache_write = match writes {
             Some(writes) => {
                 let total = usage.cache_write.max(0);
                 let one_hour = writes.one_hour.max(0).min(total);
-                cost(one_hour, rates.cache_write_1h)? + cost(total - one_hour, rates.cache_write)?
+                cost(one_hour, rates.cache_write_1h)? + cost(total - one_hour, cache_write_rate)?
             }
-            _ => cost(usage.cache_write, rates.cache_write)?,
+            _ => cost(usage.cache_write, cache_write_rate)?,
         };
         let result = TokenCostBreakdown {
             input: cost(usage.input, rates.input)?,
             output: cost(usage.output, rates.output)?,
-            cache_read: cost(usage.cache_read, rates.cache_read)?,
+            cache_read: cost(usage.cache_read, cache_read_rate)?,
             cache_write,
             reasoning: cost(usage.reasoning, rates.output)?,
         };
@@ -374,7 +431,9 @@ impl Catalog {
                 .all(|(id, window)| id.len() <= 200 && *window > 0 && *window <= MAX_CONTEXT_WINDOW)
             && self.models.iter().all(|(id, price)| {
                 id.len() <= 200
-                    && (id.starts_with("openai/") || id.starts_with("anthropic/"))
+                    && (id.starts_with("openai/")
+                        || id.starts_with("anthropic/")
+                        || id.starts_with("google/"))
                     && price.rates.valid(false)
                     && price.thresholds.len() <= 64
                     && price.thresholds.iter().all(|t| {
@@ -404,10 +463,9 @@ struct Cache {
     catalog: Catalog,
 }
 
-/// Bumped to 2 when the catalog began retaining `context_length`, so a cached
-/// version-1 file (prices only, no windows) is discarded and refetched rather
-/// than silently reporting every context window as unknown.
-const CACHE_VERSION: u32 = 2;
+/// Bumped to 3 when the catalog began retaining `google/gemini*` prices so
+/// cached version-2 files (OpenAI/Anthropic prices only) are refreshed.
+const CACHE_VERSION: u32 = 3;
 fn load_cache(dir: &Path, now: i64) -> Option<Cache> {
     let path = dir.join("openrouter-pricing.json");
     if fs::metadata(&path).ok()?.len() > MAX_BYTES as u64 {
@@ -589,4 +647,100 @@ fn download() -> Result<Vec<u8>, String> {
         return Err("pricing response too large".into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pricing::GooglePricing;
+    use chrono::NaiveDate;
+    use std::sync::Arc;
+
+    #[test]
+    fn catalog_prices_google_gemini_and_tiered_models() {
+        let json = br#"{
+            "data": [
+                {
+                    "id": "openai/gpt-5.4",
+                    "context_length": 1000000,
+                    "pricing": {"prompt": "0.0000025", "completion": "0.000015"}
+                },
+                {
+                    "id": "google/gemini-4-hydrogen",
+                    "context_length": 1048576,
+                    "pricing": {
+                        "prompt": "0.0000015",
+                        "completion": "0.0000075",
+                        "input_cache_read": "0.000000075",
+                        "input_cache_write": "0.0000000833333333333333"
+                    }
+                },
+                {
+                    "id": "google/gemini-4-carbon",
+                    "context_length": 1048576,
+                    "pricing": {
+                        "prompt": "0.000002",
+                        "completion": "0.00001",
+                        "input_cache_read": "0.0000001"
+                    }
+                },
+                {
+                    "id": "google/gemini-3.8-flash",
+                    "context_length": 1048576,
+                    "pricing": {
+                        "prompt": "0.000000825",
+                        "completion": "0.000004125",
+                        "input_cache_read": "0.0000000825"
+                    }
+                },
+                {
+                    "id": "google/gemini-3.1-pro-preview",
+                    "context_length": 1048576,
+                    "pricing": {
+                        "prompt": "0.000002",
+                        "completion": "0.000012",
+                        "input_cache_read": "0.0000002"
+                    }
+                },
+                {
+                    "id": "google/gemini-3.1-pro-preview-customtools",
+                    "context_length": 1048576,
+                    "pricing": {
+                        "prompt": "0.000009",
+                        "completion": "0.000099"
+                    }
+                }
+            ]
+        }"#;
+        let catalog = Arc::new(Catalog::from_json(json).expect("catalog should parse"));
+        assert!(catalog.valid());
+        let pricing = GooglePricing::bundled_for_date(NaiveDate::from_ymd_opt(2026, 11, 14).unwrap())
+            .with_openrouter_catalog(Some(catalog));
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let hydrogen = pricing
+            .calculate_token_costs("gemini-4-hydrogen", &usage)
+            .expect("gemini-4-hydrogen should have price");
+        assert!((hydrogen.total() - 9.075).abs() < 1e-6);
+
+        let carbon = pricing
+            .calculate_token_costs("gemini-4-carbon", &usage)
+            .expect("gemini-4-carbon should have price");
+        assert!((carbon.total() - 12.1).abs() < 1e-6);
+
+        let tiered = pricing
+            .calculate_token_costs("gemini-3.8-flash-tiered", &usage)
+            .expect("gemini-3.8-flash-tiered should normalize to gemini-3.8-flash");
+        assert!((tiered.total() - 5.0325).abs() < 1e-6);
+
+        let pro = pricing
+            .calculate_token_costs("gemini-3.1-pro", &usage)
+            .expect("gemini-3.1-pro-preview should be retained with shortest raw id");
+        assert!((pro.total() - 14.2).abs() < 1e-6);
+    }
 }

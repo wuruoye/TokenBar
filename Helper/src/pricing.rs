@@ -1407,6 +1407,7 @@ pub(crate) fn normalize_pricing_model_id(model_id: &str) -> String {
 pub struct GooglePricing {
     effective_date: NaiveDate,
     catalog_rates: HashMap<String, GoogleRateRow>,
+    openrouter: Option<Arc<Catalog>>,
 }
 
 impl Default for GooglePricing {
@@ -1441,7 +1442,13 @@ impl GooglePricing {
         Self {
             effective_date,
             catalog_rates: HashMap::new(),
+            openrouter: None,
         }
+    }
+
+    pub fn with_openrouter_catalog(mut self, catalog: Option<Arc<Catalog>>) -> Self {
+        self.openrouter = catalog;
+        self
     }
 
     pub fn from_openrouter_catalog(
@@ -1451,6 +1458,7 @@ impl GooglePricing {
         Ok(Self {
             effective_date,
             catalog_rates: parse_openrouter_gemini_rates(json)?,
+            openrouter: None,
         })
     }
 
@@ -1473,12 +1481,23 @@ impl GooglePricing {
         model_id: &str,
         usage: &TokenBreakdown,
     ) -> Option<TokenCostBreakdown> {
+        let normalized = normalize_google_model_id(model_id);
+        let row = if let Some(row) = self.catalog_rates.get(&normalized).copied() {
+            row
+        } else if let Some(costs) = self
+            .openrouter
+            .as_ref()
+            .and_then(|catalog| catalog.costs("google", model_id, usage, None, true))
+        {
+            return Some(costs);
+        } else {
+            bundled_google_row(&normalized, self.effective_date)?
+        };
         let prompt_tokens = usage
             .input
             .max(0)
             .saturating_add(usage.cache_read.max(0))
             .saturating_add(usage.cache_write.max(0));
-        let row = self.row_for_model(model_id)?;
         let rate = match row.long_context {
             Some(long) if prompt_tokens > row.long_context_min_prompt_tokens => long,
             _ => row.standard,
@@ -1494,14 +1513,6 @@ impl GooglePricing {
                 / TOKENS_PER_MILLION,
         };
         costs.total().is_finite().then_some(costs)
-    }
-
-    fn row_for_model(&self, model_id: &str) -> Option<GoogleRateRow> {
-        let normalized = normalize_google_model_id(model_id);
-        self.catalog_rates
-            .get(&normalized)
-            .copied()
-            .or_else(|| bundled_google_row(&normalized, self.effective_date))
     }
 }
 
@@ -1546,7 +1557,7 @@ fn bundled_google_row(
     })
 }
 
-fn normalize_google_model_id(model_id: &str) -> String {
+pub(crate) fn normalize_google_model_id(model_id: &str) -> String {
     let mut normalized = model_id.trim().to_ascii_lowercase();
     for prefix in ["models/", "google/", "gemini/", "vertex_ai/", "vertex/"] {
         if let Some(model) = normalized.strip_prefix(prefix) {
@@ -1567,6 +1578,7 @@ fn normalize_google_model_id(model_id: &str) -> String {
         "-latest",
         "-thinking",
         "-exp",
+        "-tiered",
         "-minimal",
         "-medium",
         "-xhigh",

@@ -255,7 +255,8 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .openrouter_pricing_json
         .as_deref()
         .and_then(|path| GooglePricing::from_openrouter_catalog_file(path, today).ok())
-        .unwrap_or_else(|| GooglePricing::bundled_for_date(today));
+        .unwrap_or_else(|| GooglePricing::bundled_for_date(today))
+        .with_openrouter_catalog(catalog.clone());
     let antigravity_messages = parse_local_antigravity_messages(
         antigravity_options.clone(),
         &anthropic_pricing,
