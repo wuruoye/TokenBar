@@ -33,7 +33,7 @@ struct SessionLauncher {
     private let resolveAntigravitySession: (String) -> AntigravitySessionTarget?
     private let launchGrokSession: (SessionSummary) -> Bool
     private let launchAntigravityApplication: () -> Bool
-    private let navigateAntigravityConversation: @MainActor (String, String?) -> Void
+    private let navigateAntigravityConversation: @MainActor (String, String?, String?) -> Void
 
     init(
         openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
@@ -49,8 +49,9 @@ struct SessionLauncher {
         launchAntigravityApplication: @escaping () -> Bool = {
             AntigravityWorkspaceLauncher().openApplication()
         },
-        navigateAntigravityConversation: @escaping @MainActor (String, String?) -> Void = {
-            AntigravityConversationNavigator.shared.navigate(to: $0, expectedTitle: $1)
+        navigateAntigravityConversation: @escaping @MainActor (String, String?, String?) -> Void = {
+            AntigravityConversationNavigator.shared.navigate(
+                to: $0, expectedTitle: $1, workspacePath: $2)
         })
     {
         self.openURL = openURL
@@ -81,11 +82,25 @@ struct SessionLauncher {
             guard Self.isSafePathIdentifier(sessionID) else {
                 throw SessionLauncherError.invalidSessionID
             }
-            let target = self.resolveAntigravitySession(sessionID)
-            let fallbackTitle = session.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let expectedTitle = target?.title ?? fallbackTitle.flatMap { $0.isEmpty ? nil : $0 }
+            let title: String? = if let raw = session.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                    !raw.isEmpty
+            {
+                raw
+            } else {
+                nil
+            }
+            let workspacePath: String? = if let raw = session.workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                            !raw.isEmpty
+            {
+                raw
+            } else {
+                nil
+            }
             onWillOpen?(sessionID)
-            try self.openAntigravity(conversationID: sessionID, expectedTitle: expectedTitle)
+            try self.openAntigravity(
+                conversationID: sessionID,
+                expectedTitle: title,
+                workspacePath: workspacePath)
             return
         }
         let claudeDesktopSessionID = session.platformID == .claude
@@ -131,9 +146,11 @@ struct SessionLauncher {
             guard Self.isSafePathIdentifier(trimmed) else {
                 throw SessionLauncherError.invalidSessionID
             }
-            let target = self.resolveAntigravitySession(trimmed)
             onWillOpen?(trimmed)
-            try self.openAntigravity(conversationID: trimmed, expectedTitle: target?.title)
+            try self.openAntigravity(
+                conversationID: trimmed,
+                expectedTitle: nil,
+                workspacePath: nil)
             return
         }
         let url = try Self.deepLink(platform: platform, id: id)
@@ -143,12 +160,18 @@ struct SessionLauncher {
         }
     }
 
-    private func openAntigravity(conversationID: String, expectedTitle: String?) throws {
-        let activated = self.openURL(Self.antigravityFocusURL) || self.launchAntigravityApplication()
+    private func openAntigravity(
+        conversationID: String,
+        expectedTitle: String?,
+        workspacePath: String?) throws
+    {
+        let activated = AntigravityWorkspaceLauncher().openFocusURLAsync()
+            || self.openURL(Self.antigravityFocusURL)
+            || self.launchAntigravityApplication()
         guard activated else {
             throw SessionLauncherError.applicationUnavailable(.antigravity)
         }
-        self.navigateAntigravityConversation(conversationID, expectedTitle)
+        self.navigateAntigravityConversation(conversationID, expectedTitle, workspacePath)
     }
 
     /// Builds the link that shows a Codex thread or Claude Desktop session in
@@ -553,6 +576,24 @@ struct AntigravitySessionResolver {
 private struct AntigravityWorkspaceLauncher {
     private let bundleIdentifier = "com.google.antigravity"
 
+    /// Dispatches `antigravity://focus` asynchronously via LaunchServices so
+    /// `@MainActor` never blocks on the target app's AppleEvent round-trip.
+    func openFocusURLAsync() -> Bool {
+        guard let application = NSWorkspace.shared
+            .urlForApplication(withBundleIdentifier: self.bundleIdentifier)
+        else {
+            return false
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(
+            [SessionLauncher.antigravityFocusURL],
+            withApplicationAt: application,
+            configuration: configuration,
+            completionHandler: nil)
+        return true
+    }
+
     func openApplication() -> Bool {
         guard let application = NSWorkspace.shared
             .urlForApplication(withBundleIdentifier: self.bundleIdentifier)
@@ -567,119 +608,738 @@ private struct AntigravityWorkspaceLauncher {
 }
 
 /// Switches Antigravity's Hub window to `/c/<conversationID>` by pressing the
-/// matching sidebar conversation link via macOS Accessibility.
+/// matching sidebar `AXLink` via macOS Accessibility.
 ///
 /// Antigravity's `antigravity://open` URL scheme resets the Hub router to the
 /// blank new-conversation screen when invoked without a prompt, whereas
-/// `antigravity://focus` brings the existing window forward untouched and each
-/// sidebar item is exposed as a standard `AXLink` whose `AXURL` path is
-/// `/c/<conversationID>`.
-@MainActor
-final class AntigravityConversationNavigator {
+/// `antigravity://focus` brings the existing window forward untouched. On
+/// Electron `BaseWindow` + `WebContentsView` builds (Antigravity 2.32+),
+/// `AXWindows` on `AXApplication` collapses to `AXApplication` itself, so
+/// TokenBar resolves the Hub `AXWebArea` and `Sidebar` navigation landmark via
+/// `AXUIElementCopyElementAtPosition` inside the on-screen window bounds and
+/// presses `/c/<conversationID>` directly on a `.userInteractive` queue.
+final class AntigravityConversationNavigator: @unchecked Sendable {
     static let shared = AntigravityConversationNavigator()
 
-    private let bundleIdentifier = "com.google.antigravity"
-    private var hasPromptedForAccessibility = false
-    private var activeTask: Task<Void, Never>?
+    private static let bundleIdentifier = "com.google.antigravity"
 
-    func navigate(to conversationID: String, expectedTitle: String?) {
-        self.activeTask?.cancel()
-        self.activeTask = Task { @MainActor [weak self] in
+    private struct CachedHubElements {
+        var webArea: AXUIElement
+        var sidebar: AXUIElement?
+    }
+
+    private struct HubAncestors {
+        var webArea: AXUIElement?
+        var sidebar: AXUIElement?
+    }
+
+    private struct HubScanResult {
+        var targetLink: AXUIElement?
+        var sidebar: AXUIElement?
+        var toggleSidebarButton: AXUIElement?
+        var collapsedSectionButton: AXUIElement?
+        var conversationLinkCount = 0
+        var visitedCount = 0
+    }
+
+    private enum AttemptOutcome {
+        case pressed(pid: pid_t, root: AXUIElement)
+        case retry(sawLoadedSidebar: Bool)
+    }
+
+    private let workerQueue = DispatchQueue(
+        label: "com.wuruoye.TokenBar.antigravity-navigator",
+        qos: .userInteractive)
+    private let stateLock = NSLock()
+    private var generation: UInt64 = 0
+    private var hasPromptedForAccessibility = false
+    private var cachedHubByPID: [pid_t: CachedHubElements] = [:]
+
+    @MainActor
+    func navigate(
+        to conversationID: String,
+        expectedTitle: String?,
+        workspacePath: String?)
+    {
+        let currentGeneration = self.nextGeneration()
+        self.workerQueue.async { [weak self] in
             guard let self else { return }
-            if !AXIsProcessTrusted() {
-                if !self.hasPromptedForAccessibility {
-                    self.hasPromptedForAccessibility = true
-                    let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-                    _ = AXIsProcessTrustedWithOptions(options)
-                }
-                for _ in 0 ..< 38 {
-                    try? await Task.sleep(for: .milliseconds(400))
-                    guard !Task.isCancelled else { return }
-                    if AXIsProcessTrusted() {
-                        break
-                    }
-                }
-                guard AXIsProcessTrusted(), !Task.isCancelled else { return }
-            }
+            guard self.ensureAccessibilityTrusted(generation: currentGeneration) else { return }
+
+            var resolvedMetadata = false
+            var resolvedTitle = expectedTitle
+            var resolvedWorkspaceName = Self.workspaceFolderName(from: workspacePath)
 
             var didToggleSidebar = false
-            for attempt in 0 ..< 16 {
-                guard !Task.isCancelled else { return }
-                if self.tryPressConversationLink(
-                    conversationID: conversationID,
-                    expectedTitle: expectedTitle,
-                    allowToggleSidebar: !didToggleSidebar,
-                    didToggleSidebar: &didToggleSidebar)
-                {
-                    return
+            var didExpandSection = false
+            var stableSidebarMisses = 0
+
+            for attempt in 0 ..< 80 {
+                guard self.isCurrent(generation: currentGeneration) else { return }
+
+                let justExpandedUI = didToggleSidebar || didExpandSection
+                if attempt > 0, (resolvedTitle == nil || resolvedWorkspaceName == nil), !resolvedMetadata {
+                    resolvedMetadata = true
+                    if let target = AntigravitySessionResolver().target(for: conversationID) {
+                        if resolvedTitle == nil {
+                            resolvedTitle = target.title
+                        }
+                        if resolvedWorkspaceName == nil {
+                            resolvedWorkspaceName = Self.workspaceFolderName(from: target.workspacePath)
+                        }
+                    }
                 }
-                let delay: Duration = attempt == 0 ? .milliseconds(120) : .milliseconds(160)
-                try? await Task.sleep(for: delay)
+
+                let outcome = self.tryPressConversationLink(
+                    conversationID: conversationID,
+                    expectedTitle: resolvedTitle,
+                    expectedWorkspaceName: resolvedWorkspaceName,
+                    didToggleSidebar: &didToggleSidebar,
+                    didExpandSection: &didExpandSection)
+
+                switch outcome {
+                case let .pressed(pid, root):
+                    self.ensureMessageInputFocused(
+                        pid: pid,
+                        root: root,
+                        targetPath: "/c/\(conversationID)",
+                        generation: currentGeneration)
+                    return
+                case let .retry(sawLoadedSidebar):
+                    let expandedThisTurn = !justExpandedUI && (didToggleSidebar || didExpandSection)
+                    if expandedThisTurn {
+                        stableSidebarMisses = 0
+                    } else if sawLoadedSidebar {
+                        stableSidebarMisses += 1
+                        if stableSidebarMisses >= 15 {
+                            return
+                        }
+                    }
+                }
+
+                Thread.sleep(forTimeInterval: attempt < 20 ? 0.015 : 0.06)
             }
         }
     }
 
-    private struct WindowScan {
-        var targetLink: AXUIElement?
-        var conversationLinkCount = 0
-        var toggleSidebarButton: AXUIElement?
-        var visitedCount = 0
+    private func nextGeneration() -> UInt64 {
+        self.stateLock.lock()
+        defer { self.stateLock.unlock() }
+        self.generation &+= 1
+        return self.generation
+    }
+
+    private func isCurrent(generation: UInt64) -> Bool {
+        self.stateLock.lock()
+        defer { self.stateLock.unlock() }
+        return self.generation == generation
+    }
+
+    private func cachedElements(for pid: pid_t) -> CachedHubElements? {
+        self.stateLock.lock()
+        defer { self.stateLock.unlock() }
+        return self.cachedHubByPID[pid]
+    }
+
+    private func setCachedElements(_ elements: CachedHubElements?, for pid: pid_t) {
+        self.stateLock.lock()
+        self.cachedHubByPID[pid] = elements
+        self.stateLock.unlock()
+    }
+
+    private func ensureAccessibilityTrusted(generation: UInt64) -> Bool {
+        if AXIsProcessTrusted() {
+            return true
+        }
+        let shouldPrompt: Bool = {
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            if self.hasPromptedForAccessibility {
+                return false
+            }
+            self.hasPromptedForAccessibility = true
+            return true
+        }()
+        if shouldPrompt {
+            DispatchQueue.main.async {
+                let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+                _ = AXIsProcessTrustedWithOptions(options)
+            }
+        }
+        for _ in 0 ..< 38 {
+            Thread.sleep(forTimeInterval: 0.4)
+            guard self.isCurrent(generation: generation) else { return false }
+            if AXIsProcessTrusted() {
+                return true
+            }
+        }
+        return AXIsProcessTrusted() && self.isCurrent(generation: generation)
     }
 
     private func tryPressConversationLink(
         conversationID: String,
         expectedTitle: String?,
-        allowToggleSidebar: Bool,
-        didToggleSidebar: inout Bool) -> Bool
+        expectedWorkspaceName: String?,
+        didToggleSidebar: inout Bool,
+        didExpandSection: inout Bool) -> AttemptOutcome
     {
-        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: self.bundleIdentifier)
-        guard !apps.isEmpty else { return false }
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleIdentifier)
+        guard !apps.isEmpty else { return .retry(sawLoadedSidebar: false) }
         let targetPath = "/c/\(conversationID)"
 
-        var fallbackToggleCandidate: (window: AXUIElement, button: AXUIElement, app: NSRunningApplication)?
+        var sawLoadedSidebar = false
+        var toggleCandidate: (button: AXUIElement, window: AXUIElement?, app: NSRunningApplication)?
+        var expandCandidate: AXUIElement?
         var titleMatchedWindow: (window: AXUIElement, app: NSRunningApplication)?
 
         for app in apps {
-            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            let pid = app.processIdentifier
+
+            // Fast path: reuse validated Hub AXWebArea / Sidebar for this PID.
+            if let cached = self.cachedElements(for: pid),
+               Self.stringAttribute(kAXRoleAttribute as CFString, of: cached.webArea) == "AXWebArea"
+            {
+                if Self.urlPath(of: cached.webArea) == targetPath {
+                    return .pressed(pid: pid, root: cached.webArea)
+                }
+                if let cachedSidebar = cached.sidebar, Self.isSidebarLandmark(cachedSidebar) {
+                    let quickScan = Self.scanSidebar(
+                        cachedSidebar,
+                        targetPath: targetPath,
+                        expectedWorkspaceName: expectedWorkspaceName)
+                    if let link = quickScan.targetLink,
+                       AXUIElementPerformAction(link, kAXPressAction as CFString) == .success
+                    {
+                        return .pressed(pid: pid, root: cached.webArea)
+                    }
+                }
+            } else {
+                self.setCachedElements(nil, for: pid)
+            }
+
+            let appElement = AXUIElementCreateApplication(pid)
             _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
             _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 
+            var scannedWebAreas: [AXUIElement] = []
+            let hubRoots = Self.discoverHubRoots(appElement: appElement, pid: pid)
+            for root in hubRoots {
+                guard let webArea = root.webArea else { continue }
+                if scannedWebAreas.contains(where: { CFEqual($0, webArea) }) {
+                    continue
+                }
+                scannedWebAreas.append(webArea)
+
+                if Self.urlPath(of: webArea) == targetPath {
+                    self.setCachedElements(CachedHubElements(webArea: webArea, sidebar: root.sidebar), for: pid)
+                    return .pressed(pid: pid, root: webArea)
+                }
+
+                let scan = Self.scanHubWebArea(
+                    webArea,
+                    knownSidebar: root.sidebar,
+                    targetPath: targetPath,
+                    expectedWorkspaceName: expectedWorkspaceName)
+                self.setCachedElements(
+                    CachedHubElements(webArea: webArea, sidebar: scan.sidebar ?? root.sidebar),
+                    for: pid)
+
+                if let link = scan.targetLink,
+                   AXUIElementPerformAction(link, kAXPressAction as CFString) == .success
+                {
+                    return .pressed(pid: pid, root: webArea)
+                }
+                if scan.conversationLinkCount > 0 {
+                    sawLoadedSidebar = true
+                }
+                if expandCandidate == nil, let sectionButton = scan.collapsedSectionButton {
+                    expandCandidate = sectionButton
+                }
+                if toggleCandidate == nil,
+                   scan.conversationLinkCount == 0,
+                   scan.sidebar == nil,
+                   let toggleButton = scan.toggleSidebarButton
+                {
+                    toggleCandidate = (toggleButton, nil, app)
+                }
+            }
+
+            // Classic AXWindow fallback (standalone IDE windows or older BrowserWindow builds).
             let windows = Self.windows(of: appElement)
             for window in windows {
-                let scan = Self.scan(window: window, targetPath: targetPath)
+                let scan = Self.scanWindowFallback(window: window, targetPath: targetPath)
                 if let link = scan.targetLink {
                     Self.raiseAndActivate(window: window, app: app)
                     if AXUIElementPerformAction(link, kAXPressAction as CFString) == .success {
-                        return true
+                        return .pressed(pid: pid, root: window)
                     }
+                }
+                if scan.conversationLinkCount > 0 {
+                    sawLoadedSidebar = true
                 }
                 let windowTitle = Self.stringAttribute(kAXTitleAttribute as CFString, of: window)
                 if Self.windowTitleMatches(windowTitle, expectedTitle: expectedTitle),
                    scan.conversationLinkCount == 0
                 {
                     titleMatchedWindow = (window, app)
-                } else if fallbackToggleCandidate == nil,
+                } else if toggleCandidate == nil,
                           scan.visitedCount > 15,
                           scan.conversationLinkCount == 0,
                           let toggleButton = scan.toggleSidebarButton
                 {
-                    fallbackToggleCandidate = (window, toggleButton, app)
+                    toggleCandidate = (toggleButton, window, app)
                 }
             }
         }
 
         if let matched = titleMatchedWindow {
             Self.raiseAndActivate(window: matched.window, app: matched.app)
-            return true
+            return .pressed(pid: matched.app.processIdentifier, root: matched.window)
         }
 
-        if allowToggleSidebar, let candidate = fallbackToggleCandidate {
-            Self.raiseAndActivate(window: candidate.window, app: candidate.app)
+        if !didExpandSection, let sectionButton = expandCandidate {
+            if AXUIElementPerformAction(sectionButton, kAXPressAction as CFString) == .success {
+                didExpandSection = true
+            }
+        } else if !didToggleSidebar, let candidate = toggleCandidate {
+            if let window = candidate.window {
+                Self.raiseAndActivate(window: window, app: candidate.app)
+            }
             if AXUIElementPerformAction(candidate.button, kAXPressAction as CFString) == .success {
                 didToggleSidebar = true
             }
         }
-        return false
+
+        return .retry(sawLoadedSidebar: sawLoadedSidebar)
+    }
+
+    /// Antigravity's editor only auto-focuses `Message input` on route mount
+    /// when `document.hasFocus()` is already `true`. When jumping from another
+    /// app or clicking the already-open conversation, focus it explicitly once
+    /// the window becomes frontmost and the target route is active.
+    private func ensureMessageInputFocused(
+        pid: pid_t,
+        root: AXUIElement,
+        targetPath: String,
+        generation: UInt64)
+    {
+        let appElement = AXUIElementCreateApplication(pid)
+        let isWebArea = Self.stringAttribute(kAXRoleAttribute as CFString, of: root) == "AXWebArea"
+
+        for _ in 0 ..< 30 {
+            guard self.isCurrent(generation: generation) else { return }
+            let frontmost = Self.boolAttribute(kAXFrontmostAttribute as CFString, of: appElement) == true
+            let routeReady = !isWebArea || Self.urlPath(of: root) == targetPath
+            if frontmost, routeReady {
+                if !Self.isMessageInputFocused(appElement: appElement),
+                   let input = Self.findMessageInput(in: root)
+                {
+                    _ = AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                }
+                if Self.isMessageInputFocused(appElement: appElement) {
+                    Thread.sleep(forTimeInterval: 0.025)
+                    guard self.isCurrent(generation: generation) else { return }
+                    if Self.isMessageInputFocused(appElement: appElement) {
+                        return
+                    }
+                    if let input = Self.findMessageInput(in: root) {
+                        _ = AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                    }
+                    if Self.isMessageInputFocused(appElement: appElement) {
+                        return
+                    }
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.015)
+        }
+    }
+
+    private static func isMessageInputFocused(appElement: AXUIElement) -> Bool {
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused,
+              CFGetTypeID(focused) == AXUIElementGetTypeID()
+        else {
+            return false
+        }
+        let element = unsafeDowncast(focused, to: AXUIElement.self)
+        return Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Message input"
+    }
+
+    private static func findMessageInput(in root: AXUIElement) -> AXUIElement? {
+        var stack: [AXUIElement] = [root]
+        var visited = 0
+
+        while let element = stack.popLast(), visited < 800 {
+            visited += 1
+            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+            if role == "AXTextArea" || role == "AXComboBox" || role == "AXTextField" {
+                if Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Message input" {
+                    return element
+                }
+                continue
+            }
+            if role == kAXButtonRole as String || role == "AXPopUpButton" || role == "AXImage"
+                || role == "AXStaticText" || role == "AXLink" || role == "AXCheckBox"
+                || role == "AXList" || role == "AXHeading" || role == "AXMenuBar" || role == "AXMenu"
+            {
+                continue
+            }
+            if role == "AXGroup" {
+                let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
+                if desc == "Sidebar" || desc == "File Viewer" || desc == "Notifications" {
+                    continue
+                }
+            }
+            // Pushing in order makes popLast() visit trailing children (the
+            // bottom input composer) before leading children (Conversation Log).
+            stack.append(contentsOf: Self.children(of: element))
+        }
+        return nil
+    }
+
+    private static func discoverHubRoots(appElement: AXUIElement, pid: pid_t) -> [HubAncestors] {
+        var results: [HubAncestors] = []
+        let rects = Self.onScreenWindowBounds(pid: pid)
+        for rect in rects {
+            let probePoints = [
+                CGPoint(x: min(rect.minX + 120, rect.maxX - 16), y: min(rect.minY + 180, rect.maxY - 16)),
+                CGPoint(x: min(rect.minX + 24, rect.maxX - 16), y: min(rect.minY + 56, rect.maxY - 16)),
+                CGPoint(x: rect.midX, y: min(rect.minY + 48, rect.maxY - 16)),
+                CGPoint(x: min(rect.minX + 24, rect.maxX - 16), y: rect.midY),
+            ]
+            for point in probePoints {
+                var hit: AXUIElement?
+                guard AXUIElementCopyElementAtPosition(
+                    appElement,
+                    Float(point.x),
+                    Float(point.y),
+                    &hit) == .success,
+                      let hit
+                else {
+                    continue
+                }
+                let ancestors = Self.resolveHubAncestors(from: hit)
+                if ancestors.webArea != nil {
+                    results.append(ancestors)
+                    if ancestors.sidebar != nil {
+                        break
+                    }
+                }
+            }
+        }
+
+        if results.isEmpty {
+            var focused: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+               let focused,
+               CFGetTypeID(focused) == AXUIElementGetTypeID()
+            {
+                let element = unsafeDowncast(focused, to: AXUIElement.self)
+                let ancestors = Self.resolveHubAncestors(from: element)
+                if ancestors.webArea != nil {
+                    results.append(ancestors)
+                }
+            }
+        }
+
+        return results
+    }
+
+    private static func resolveHubAncestors(from start: AXUIElement) -> HubAncestors {
+        var result = HubAncestors()
+        var fallbackWebArea: AXUIElement?
+        var current = start
+
+        for _ in 0 ..< 64 {
+            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: current)
+            if result.sidebar == nil, role == "AXGroup", Self.isSidebarLandmark(current) {
+                result.sidebar = current
+            } else if role == "AXWebArea" {
+                fallbackWebArea = current
+                if Self.isLocalHubWebArea(current) {
+                    result.webArea = current
+                }
+            }
+
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent,
+                  CFGetTypeID(parent) == AXUIElementGetTypeID()
+            else {
+                break
+            }
+            let next = unsafeDowncast(parent, to: AXUIElement.self)
+            if CFEqual(next, current) {
+                break
+            }
+            current = next
+        }
+
+        if result.webArea == nil {
+            result.webArea = fallbackWebArea
+        }
+        return result
+    }
+
+    private static func scanHubWebArea(
+        _ webArea: AXUIElement,
+        knownSidebar: AXUIElement?,
+        targetPath: String,
+        expectedWorkspaceName: String?) -> HubScanResult
+    {
+        var result = HubScanResult()
+        var sidebar = knownSidebar
+
+        if sidebar == nil {
+            var queue: [(element: AXUIElement, depth: Int)] = [(webArea, 0)]
+            var index = 0
+            while index < queue.count, result.visitedCount < 400 {
+                let (element, depth) = queue[index]
+                index += 1
+                result.visitedCount += 1
+
+                let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+                if role == "AXGroup" {
+                    let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
+                    if desc == "Sidebar",
+                       Self.stringAttribute(kAXSubroleAttribute as CFString, of: element) == "AXLandmarkNavigation"
+                    {
+                        sidebar = element
+                        if result.toggleSidebarButton != nil {
+                            break
+                        }
+                        continue
+                    }
+                    if desc == "File Viewer" || desc == "Notifications" {
+                        continue
+                    }
+                } else if role == kAXButtonRole as String, result.toggleSidebarButton == nil {
+                    let label = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
+                        ?? Self.stringAttribute(kAXTitleAttribute as CFString, of: element)
+                    if let label, label.hasPrefix("Toggle Sidebar") {
+                        result.toggleSidebarButton = element
+                        if sidebar != nil {
+                            break
+                        }
+                    }
+                    continue
+                } else if role != "AXWebArea" {
+                    continue
+                }
+
+                guard depth < 14 else { continue }
+                for child in Self.children(of: element) {
+                    queue.append((child, depth + 1))
+                }
+            }
+        }
+
+        result.sidebar = sidebar
+        if let sidebar {
+            let sidebarScan = Self.scanSidebar(
+                sidebar,
+                targetPath: targetPath,
+                expectedWorkspaceName: expectedWorkspaceName)
+            result.targetLink = sidebarScan.targetLink
+            result.conversationLinkCount = sidebarScan.conversationLinkCount
+            result.collapsedSectionButton = sidebarScan.collapsedSectionButton
+            result.visitedCount += sidebarScan.visitedCount
+            if result.targetLink != nil || result.conversationLinkCount > 0 {
+                return result
+            }
+        }
+
+        // Fallback if a future Antigravity build renames the Sidebar landmark.
+        let fallback = Self.scanWindowFallback(window: webArea, targetPath: targetPath)
+        result.visitedCount += fallback.visitedCount
+        if let link = fallback.targetLink {
+            result.targetLink = link
+        }
+        if fallback.conversationLinkCount > result.conversationLinkCount {
+            result.conversationLinkCount = fallback.conversationLinkCount
+        }
+        if result.toggleSidebarButton == nil {
+            result.toggleSidebarButton = fallback.toggleSidebarButton
+        }
+        return result
+    }
+
+    private static func scanSidebar(
+        _ sidebar: AXUIElement,
+        targetPath: String,
+        expectedWorkspaceName: String?) -> HubScanResult
+    {
+        var result = HubScanResult(sidebar: sidebar)
+        var queue: [AXUIElement] = [sidebar]
+        var buttons: [AXUIElement] = []
+        var index = 0
+
+        while index < queue.count, result.visitedCount < 2500 {
+            let element = queue[index]
+            index += 1
+            result.visitedCount += 1
+
+            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+            if role == "AXLink" {
+                if let path = Self.urlPath(of: element) {
+                    if path == targetPath {
+                        result.targetLink = element
+                        return result
+                    }
+                    if path.hasPrefix("/c/") {
+                        result.conversationLinkCount += 1
+                    }
+                }
+                continue
+            }
+
+            if role == kAXButtonRole as String {
+                buttons.append(element)
+                continue
+            }
+
+            if role == "AXPopUpButton" || role == "AXImage" || role == "AXStaticText" || role == "AXCheckBox" {
+                continue
+            }
+
+            queue.append(contentsOf: Self.children(of: element))
+        }
+
+        var fallbackMainHeaderButton: AXUIElement?
+        for button in buttons {
+            guard Self.boolAttribute("AXExpanded" as CFString, of: button) == false else { continue }
+            let label = (Self.stringAttribute(kAXTitleAttribute as CFString, of: button)
+                ?? Self.stringAttribute(kAXDescriptionAttribute as CFString, of: button))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let label, !label.isEmpty else { continue }
+            if let expectedWorkspaceName,
+               label.caseInsensitiveCompare(expectedWorkspaceName) == .orderedSame
+            {
+                result.collapsedSectionButton = button
+                break
+            }
+            if fallbackMainHeaderButton == nil,
+               label == "Conversations" || label == "Workspaces" || label == "Projects"
+            {
+                fallbackMainHeaderButton = button
+            }
+        }
+
+        if result.collapsedSectionButton == nil, result.conversationLinkCount == 0 {
+            result.collapsedSectionButton = fallbackMainHeaderButton
+        }
+        return result
+    }
+
+    private static func scanWindowFallback(window: AXUIElement, targetPath: String) -> HubScanResult {
+        var result = HubScanResult()
+        var queue: [(element: AXUIElement, depth: Int)] = [(window, 0)]
+        var index = 0
+        let maxNodes = 4000
+        let maxDepth = 40
+
+        while index < queue.count, result.visitedCount < maxNodes {
+            let (element, depth) = queue[index]
+            index += 1
+            result.visitedCount += 1
+
+            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+            if role == "AXLink" {
+                if let path = Self.urlPath(of: element) {
+                    if path == targetPath {
+                        result.targetLink = element
+                        return result
+                    }
+                    if path.hasPrefix("/c/") {
+                        result.conversationLinkCount += 1
+                    }
+                }
+                continue
+            }
+            if role == kAXButtonRole as String {
+                if result.toggleSidebarButton == nil {
+                    let label = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
+                        ?? Self.stringAttribute(kAXTitleAttribute as CFString, of: element)
+                    if let label, label.hasPrefix("Toggle Sidebar") {
+                        result.toggleSidebarButton = element
+                    }
+                }
+                continue
+            }
+            if role == "AXPopUpButton" || role == "AXImage" || role == "AXStaticText" || role == "AXCheckBox"
+                || role == "AXMenuBar" || role == "AXMenu" || role == "AXApplication"
+            {
+                continue
+            }
+            if role == "AXGroup" {
+                let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
+                if desc == "File Viewer" || desc == "Notifications" {
+                    continue
+                }
+            }
+
+            guard depth < maxDepth else { continue }
+            for child in Self.children(of: element) {
+                queue.append((child, depth + 1))
+            }
+        }
+        return result
+    }
+
+    private static func isSidebarLandmark(_ element: AXUIElement) -> Bool {
+        Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Sidebar"
+            && Self.stringAttribute(kAXSubroleAttribute as CFString, of: element) == "AXLandmarkNavigation"
+    }
+
+    private static func isLocalHubWebArea(_ element: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success,
+              let value
+        else {
+            return false
+        }
+        let url: URL? = if let u = value as? URL {
+            u
+        } else if let raw = value as? String {
+            URL(string: raw)
+        } else {
+            nil
+        }
+        guard let host = url?.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    private static func onScreenWindowBounds(pid: pid_t) -> [CGRect] {
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID) as? [[String: Any]]
+        else {
+            return []
+        }
+        return windows.compactMap { window in
+            guard window[kCGWindowOwnerPID as String] as? pid_t == pid,
+                  window[kCGWindowLayer as String] as? Int == 0,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  rect.width >= 300,
+                  rect.height >= 200
+            else {
+                return nil
+            }
+            return rect
+        }
+    }
+
+    private static func workspaceFolderName(from workspacePath: String?) -> String? {
+        guard let raw = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else {
+            return nil
+        }
+        let name = URL(fileURLWithPath: raw).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name == "/" ? nil : name
     }
 
     private static func raiseAndActivate(window: AXUIElement, app: NSRunningApplication) {
@@ -694,17 +1354,23 @@ final class AntigravityConversationNavigator {
         if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
            let list = value as? [AXUIElement]
         {
-            result.append(contentsOf: list)
+            result = list.filter {
+                !CFEqual($0, appElement)
+                    && Self.stringAttribute(kAXRoleAttribute as CFString, of: $0) == kAXWindowRole as String
+            }
         }
         if result.isEmpty {
             for attr in [kAXMainWindowAttribute as CFString, kAXFocusedWindowAttribute as CFString] {
                 var single: CFTypeRef?
                 if AXUIElementCopyAttributeValue(appElement, attr, &single) == .success,
-                   let element = single
+                   let element = single,
+                   CFGetTypeID(element) == AXUIElementGetTypeID()
                 {
-                    // CoreFoundation type check for AXUIElement
-                    if CFGetTypeID(element) == AXUIElementGetTypeID() {
-                        result.append(unsafeDowncast(element, to: AXUIElement.self))
+                    let axWindow = unsafeDowncast(element, to: AXUIElement.self)
+                    if !CFEqual(axWindow, appElement),
+                       Self.stringAttribute(kAXRoleAttribute as CFString, of: axWindow) == kAXWindowRole as String
+                    {
+                        result.append(axWindow)
                         break
                     }
                 }
@@ -713,46 +1379,14 @@ final class AntigravityConversationNavigator {
         return result
     }
 
-    private static func scan(window: AXUIElement, targetPath: String) -> WindowScan {
-        var result = WindowScan()
-        var queue: [(element: AXUIElement, depth: Int)] = [(window, 0)]
-        var index = 0
-        let maxNodes = 12000
-        let maxDepth = 50
-
-        while index < queue.count, result.visitedCount < maxNodes {
-            let (element, depth) = queue[index]
-            index += 1
-            result.visitedCount += 1
-
-            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element)
-            if role == "AXLink", let path = Self.urlPath(of: element) {
-                if path == targetPath {
-                    result.targetLink = element
-                    return result
-                }
-                if path.hasPrefix("/c/") {
-                    result.conversationLinkCount += 1
-                }
-            } else if role == kAXButtonRole as String, result.toggleSidebarButton == nil {
-                let label = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
-                    ?? Self.stringAttribute(kAXTitleAttribute as CFString, of: element)
-                if let label, label.hasPrefix("Toggle Sidebar") {
-                    result.toggleSidebarButton = element
-                }
-            }
-
-            guard depth < maxDepth else { continue }
-            var childrenValue: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue) == .success,
-               let children = childrenValue as? [AXUIElement]
-            {
-                for child in children {
-                    queue.append((child, depth + 1))
-                }
-            }
+    private static func children(of element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AXUIElement]
+        else {
+            return []
         }
-        return result
+        return children
     }
 
     private static func stringAttribute(_ attribute: CFString, of element: AXUIElement) -> String? {
@@ -763,6 +1397,16 @@ final class AntigravityConversationNavigator {
             return nil
         }
         return string
+    }
+
+    private static func boolAttribute(_ attribute: CFString, of element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let boolValue = value as? Bool
+        else {
+            return nil
+        }
+        return boolValue
     }
 
     private static func urlPath(of element: AXUIElement) -> String? {
