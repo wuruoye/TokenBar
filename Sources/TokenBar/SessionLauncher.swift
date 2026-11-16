@@ -608,16 +608,17 @@ private struct AntigravityWorkspaceLauncher {
 }
 
 /// Switches Antigravity's Hub window to `/c/<conversationID>` by pressing the
-/// matching sidebar `AXLink` via macOS Accessibility.
+/// matching sidebar `AXLink` via macOS Accessibility and focusing `Message input`.
 ///
 /// Antigravity's `antigravity://open` URL scheme resets the Hub router to the
 /// blank new-conversation screen when invoked without a prompt, whereas
-/// `antigravity://focus` brings the existing window forward untouched. On
-/// Electron `BaseWindow` + `WebContentsView` builds (Antigravity 2.32+),
-/// `AXWindows` on `AXApplication` collapses to `AXApplication` itself, so
-/// TokenBar resolves the Hub `AXWebArea` and `Sidebar` navigation landmark via
-/// `AXUIElementCopyElementAtPosition` inside the on-screen window bounds and
-/// presses `/c/<conversationID>` directly on a `.userInteractive` queue.
+/// `antigravity://focus` brings the existing window forward untouched. Each
+/// window mounts built-in browser `WebContentsView` tabs alongside the local
+/// Hub `WebContentsView`, so TokenBar locates the local `127.0.0.1`/`localhost`
+/// Hub `AXWebArea` by pruning non-Hub `AXWebArea` subtrees under `AXWindows`
+/// (with `AXUIElementCopyElementAtPosition` as a fallback when `AXWindows` is
+/// not yet populated), caches `(webArea, sidebar)` per PID, presses `/c/<id>`
+/// on a `.userInteractive` queue, and focuses `Message input`.
 final class AntigravityConversationNavigator: @unchecked Sendable {
     static let shared = AntigravityConversationNavigator()
 
@@ -631,6 +632,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
     private struct HubAncestors {
         var webArea: AXUIElement?
         var sidebar: AXUIElement?
+        var window: AXUIElement?
     }
 
     private struct HubScanResult {
@@ -702,7 +704,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
                     self.ensureMessageInputFocused(
                         pid: pid,
                         root: root,
-                        targetPath: "/c/\(conversationID)",
+                        conversationID: conversationID,
                         generation: currentGeneration)
                     return
                 case let .retry(sawLoadedSidebar):
@@ -785,7 +787,6 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
     {
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleIdentifier)
         guard !apps.isEmpty else { return .retry(sawLoadedSidebar: false) }
-        let targetPath = "/c/\(conversationID)"
 
         var sawLoadedSidebar = false
         var toggleCandidate: (button: AXUIElement, window: AXUIElement?, app: NSRunningApplication)?
@@ -799,13 +800,13 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             if let cached = self.cachedElements(for: pid),
                Self.stringAttribute(kAXRoleAttribute as CFString, of: cached.webArea) == "AXWebArea"
             {
-                if Self.urlPath(of: cached.webArea) == targetPath {
+                if Self.isShowingSession(cached.webArea, conversationID: conversationID) {
                     return .pressed(pid: pid, root: cached.webArea)
                 }
                 if let cachedSidebar = cached.sidebar, Self.isSidebarLandmark(cachedSidebar) {
                     let quickScan = Self.scanSidebar(
                         cachedSidebar,
-                        targetPath: targetPath,
+                        conversationID: conversationID,
                         expectedWorkspaceName: expectedWorkspaceName)
                     if let link = quickScan.targetLink,
                        AXUIElementPerformAction(link, kAXPressAction as CFString) == .success
@@ -821,8 +822,9 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
             _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 
+            let windows = Self.windows(of: appElement)
             var scannedWebAreas: [AXUIElement] = []
-            let hubRoots = Self.discoverHubRoots(appElement: appElement, pid: pid)
+            let hubRoots = Self.discoverHubRoots(appElement: appElement, windows: windows, pid: pid)
             for root in hubRoots {
                 guard let webArea = root.webArea else { continue }
                 if scannedWebAreas.contains(where: { CFEqual($0, webArea) }) {
@@ -830,7 +832,10 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
                 }
                 scannedWebAreas.append(webArea)
 
-                if Self.urlPath(of: webArea) == targetPath {
+                if Self.isShowingSession(webArea, conversationID: conversationID) {
+                    if let window = root.window {
+                        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                    }
                     self.setCachedElements(CachedHubElements(webArea: webArea, sidebar: root.sidebar), for: pid)
                     return .pressed(pid: pid, root: webArea)
                 }
@@ -838,16 +843,19 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
                 let scan = Self.scanHubWebArea(
                     webArea,
                     knownSidebar: root.sidebar,
-                    targetPath: targetPath,
+                    conversationID: conversationID,
                     expectedWorkspaceName: expectedWorkspaceName)
                 self.setCachedElements(
                     CachedHubElements(webArea: webArea, sidebar: scan.sidebar ?? root.sidebar),
                     for: pid)
 
-                if let link = scan.targetLink,
-                   AXUIElementPerformAction(link, kAXPressAction as CFString) == .success
-                {
-                    return .pressed(pid: pid, root: webArea)
+                if let link = scan.targetLink {
+                    if let window = root.window {
+                        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                    }
+                    if AXUIElementPerformAction(link, kAXPressAction as CFString) == .success {
+                        return .pressed(pid: pid, root: webArea)
+                    }
                 }
                 if scan.conversationLinkCount > 0 {
                     sawLoadedSidebar = true
@@ -860,14 +868,13 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
                    scan.sidebar == nil,
                    let toggleButton = scan.toggleSidebarButton
                 {
-                    toggleCandidate = (toggleButton, nil, app)
+                    toggleCandidate = (toggleButton, root.window, app)
                 }
             }
 
-            // Classic AXWindow fallback (standalone IDE windows or older BrowserWindow builds).
-            let windows = Self.windows(of: appElement)
-            for window in windows {
-                let scan = Self.scanWindowFallback(window: window, targetPath: targetPath)
+            // Standalone IDE window fallback (windows that do not host a Hub AXWebArea).
+            for window in windows where Self.hubWebArea(in: window) == nil {
+                let scan = Self.scanNonHubArea(root: window, conversationID: conversationID)
                 if let link = scan.targetLink {
                     Self.raiseAndActivate(window: window, app: app)
                     if AXUIElementPerformAction(link, kAXPressAction as CFString) == .success {
@@ -914,13 +921,13 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
     }
 
     /// Antigravity's editor only auto-focuses `Message input` on route mount
-    /// when `document.hasFocus()` is already `true`. When jumping from another
-    /// app or clicking the already-open conversation, focus it explicitly once
-    /// the window becomes frontmost and the target route is active.
+    /// when `document.hasFocus()` is already `true` and focus is not on a
+    /// sidebar `<a>` link. Focus it explicitly once the window is frontmost and
+    /// the target session route is active.
     private func ensureMessageInputFocused(
         pid: pid_t,
         root: AXUIElement,
-        targetPath: String,
+        conversationID: String,
         generation: UInt64)
     {
         let appElement = AXUIElementCreateApplication(pid)
@@ -929,7 +936,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
         for _ in 0 ..< 30 {
             guard self.isCurrent(generation: generation) else { return }
             let frontmost = Self.boolAttribute(kAXFrontmostAttribute as CFString, of: appElement) == true
-            let routeReady = !isWebArea || Self.urlPath(of: root) == targetPath
+            let routeReady = !isWebArea || Self.isShowingSession(root, conversationID: conversationID)
             if frontmost, routeReady {
                 if !Self.isMessageInputFocused(appElement: appElement),
                    let input = Self.findMessageInput(in: root)
@@ -963,7 +970,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             return false
         }
         let element = unsafeDowncast(focused, to: AXUIElement.self)
-        return Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Message input"
+        return Self.hasLabel("Message input", on: element)
     }
 
     private static func findMessageInput(in root: AXUIElement) -> AXUIElement? {
@@ -974,9 +981,14 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             visited += 1
             let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
             if role == "AXTextArea" || role == "AXComboBox" || role == "AXTextField" {
-                if Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Message input" {
+                if Self.boolAttribute(kAXEnabledAttribute as CFString, of: element) != false,
+                   Self.hasLabel("Message input", on: element)
+                {
                     return element
                 }
+                continue
+            }
+            if role == "AXWebArea", !CFEqual(element, root) {
                 continue
             }
             if role == kAXButtonRole as String || role == "AXPopUpButton" || role == "AXImage"
@@ -985,11 +997,8 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             {
                 continue
             }
-            if role == "AXGroup" {
-                let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
-                if desc == "Sidebar" || desc == "File Viewer" || desc == "Notifications" {
-                    continue
-                }
+            if role == "AXGroup", Self.isIgnoredHubRegion(element) || Self.isSidebarLandmark(element) {
+                continue
             }
             // Pushing in order makes popLast() visit trailing children (the
             // bottom input composer) before leading children (Conversation Log).
@@ -998,8 +1007,28 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
         return nil
     }
 
-    private static func discoverHubRoots(appElement: AXUIElement, pid: pid_t) -> [HubAncestors] {
+    private static func discoverHubRoots(
+        appElement: AXUIElement,
+        windows: [AXUIElement],
+        pid: pid_t) -> [HubAncestors]
+    {
         var results: [HubAncestors] = []
+
+        // Primary: structural AXWindow -> local Hub AXWebArea (pruning embedded
+        // browser WebContentsView tabs in 1 node without coordinate assumptions).
+        let unminimized = windows.filter { Self.boolAttribute(kAXMinimizedAttribute as CFString, of: $0) != true }
+        let orderedWindows = unminimized.isEmpty ? windows : unminimized
+        for window in orderedWindows {
+            if let hubArea = Self.hubWebArea(in: window) {
+                results.append(HubAncestors(webArea: hubArea, sidebar: nil, window: window))
+            }
+        }
+        if !results.isEmpty {
+            return results
+        }
+
+        // Fallback: hit-test inside CGWindow bounds when Electron BaseWindow has
+        // not yet materialized its AXWindow element.
         let rects = Self.onScreenWindowBounds(pid: pid)
         for rect in rects {
             let probePoints = [
@@ -1046,6 +1075,35 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
         return results
     }
 
+    private static func hubWebArea(in window: AXUIElement) -> AXUIElement? {
+        var queue: [(element: AXUIElement, depth: Int)] = [(window, 0)]
+        var index = 0
+        var visited = 0
+
+        while index < queue.count, visited < 400 {
+            let (element, depth) = queue[index]
+            index += 1
+            visited += 1
+
+            let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+            if role == "AXWebArea" {
+                if Self.isLocalHubWebArea(element) {
+                    return element
+                }
+                // Never descend into built-in browser WebContentsView tabs.
+                continue
+            }
+            if role == kAXButtonRole as String || role == "AXMenuBar" || role == "AXMenu" {
+                continue
+            }
+            guard depth < 12 else { continue }
+            for child in Self.children(of: element) {
+                queue.append((child, depth + 1))
+            }
+        }
+        return nil
+    }
+
     private static func resolveHubAncestors(from start: AXUIElement) -> HubAncestors {
         var result = HubAncestors()
         var fallbackWebArea: AXUIElement?
@@ -1053,13 +1111,15 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
 
         for _ in 0 ..< 64 {
             let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: current)
-            if result.sidebar == nil, role == "AXGroup", Self.isSidebarLandmark(current) {
+            if result.sidebar == nil, Self.isSidebarLandmark(current) {
                 result.sidebar = current
             } else if role == "AXWebArea" {
                 fallbackWebArea = current
                 if Self.isLocalHubWebArea(current) {
                     result.webArea = current
                 }
+            } else if role == kAXWindowRole as String {
+                result.window = current
             }
 
             var parent: CFTypeRef?
@@ -1085,7 +1145,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
     private static func scanHubWebArea(
         _ webArea: AXUIElement,
         knownSidebar: AXUIElement?,
-        targetPath: String,
+        conversationID: String,
         expectedWorkspaceName: String?) -> HubScanResult
     {
         var result = HubScanResult()
@@ -1101,17 +1161,14 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
 
                 let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
                 if role == "AXGroup" {
-                    let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
-                    if desc == "Sidebar",
-                       Self.stringAttribute(kAXSubroleAttribute as CFString, of: element) == "AXLandmarkNavigation"
-                    {
+                    if Self.isSidebarLandmark(element) {
                         sidebar = element
                         if result.toggleSidebarButton != nil {
                             break
                         }
                         continue
                     }
-                    if desc == "File Viewer" || desc == "Notifications" {
+                    if Self.isIgnoredHubRegion(element) {
                         continue
                     }
                 } else if role == kAXButtonRole as String, result.toggleSidebarButton == nil {
@@ -1139,19 +1196,19 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
         if let sidebar {
             let sidebarScan = Self.scanSidebar(
                 sidebar,
-                targetPath: targetPath,
+                conversationID: conversationID,
                 expectedWorkspaceName: expectedWorkspaceName)
             result.targetLink = sidebarScan.targetLink
             result.conversationLinkCount = sidebarScan.conversationLinkCount
             result.collapsedSectionButton = sidebarScan.collapsedSectionButton
             result.visitedCount += sidebarScan.visitedCount
-            if result.targetLink != nil || result.conversationLinkCount > 0 {
+            if result.targetLink != nil {
                 return result
             }
         }
 
-        // Fallback if a future Antigravity build renames the Sidebar landmark.
-        let fallback = Self.scanWindowFallback(window: webArea, targetPath: targetPath)
+        // Main-area fallback (e.g. `/history` list or future landmark rename).
+        let fallback = Self.scanNonHubArea(root: webArea, conversationID: conversationID)
         result.visitedCount += fallback.visitedCount
         if let link = fallback.targetLink {
             result.targetLink = link
@@ -1167,7 +1224,7 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
 
     private static func scanSidebar(
         _ sidebar: AXUIElement,
-        targetPath: String,
+        conversationID: String,
         expectedWorkspaceName: String?) -> HubScanResult
     {
         var result = HubScanResult(sidebar: sidebar)
@@ -1182,12 +1239,12 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
 
             let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
             if role == "AXLink" {
-                if let path = Self.urlPath(of: element) {
-                    if path == targetPath {
+                if let url = Self.elementURL(of: element) {
+                    if Self.matchesConversationLink(url, conversationID: conversationID) {
                         result.targetLink = element
                         return result
                     }
-                    if path.hasPrefix("/c/") {
+                    if Self.isHubURL(url), url.path.hasPrefix("/c/") {
                         result.conversationLinkCount += 1
                     }
                 }
@@ -1232,12 +1289,12 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
         return result
     }
 
-    private static func scanWindowFallback(window: AXUIElement, targetPath: String) -> HubScanResult {
+    private static func scanNonHubArea(root: AXUIElement, conversationID: String) -> HubScanResult {
         var result = HubScanResult()
-        var queue: [(element: AXUIElement, depth: Int)] = [(window, 0)]
+        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
         var index = 0
         let maxNodes = 4000
-        let maxDepth = 40
+        let maxDepth = 32
 
         while index < queue.count, result.visitedCount < maxNodes {
             let (element, depth) = queue[index]
@@ -1245,13 +1302,18 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             result.visitedCount += 1
 
             let role = Self.stringAttribute(kAXRoleAttribute as CFString, of: element) ?? ""
+            if role == "AXWebArea", !CFEqual(element, root) {
+                if !Self.isLocalHubWebArea(element) {
+                    continue
+                }
+            }
             if role == "AXLink" {
-                if let path = Self.urlPath(of: element) {
-                    if path == targetPath {
+                if let url = Self.elementURL(of: element) {
+                    if Self.matchesConversationLink(url, conversationID: conversationID) {
                         result.targetLink = element
                         return result
                     }
-                    if path.hasPrefix("/c/") {
+                    if Self.isHubURL(url), url.path.hasPrefix("/c/") {
                         result.conversationLinkCount += 1
                     }
                 }
@@ -1272,11 +1334,8 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             {
                 continue
             }
-            if role == "AXGroup" {
-                let desc = Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element)
-                if desc == "File Viewer" || desc == "Notifications" {
-                    continue
-                }
+            if role == "AXGroup", Self.isSidebarLandmark(element) || Self.isIgnoredHubRegion(element) {
+                continue
             }
 
             guard depth < maxDepth else { continue }
@@ -1288,26 +1347,82 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
     }
 
     private static func isSidebarLandmark(_ element: AXUIElement) -> Bool {
-        Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == "Sidebar"
-            && Self.stringAttribute(kAXSubroleAttribute as CFString, of: element) == "AXLandmarkNavigation"
+        Self.hasLabel("Sidebar", on: element)
+            && (Self.stringAttribute(kAXSubroleAttribute as CFString, of: element) == "AXLandmarkNavigation"
+                || Self.stringAttribute(kAXRoleAttribute as CFString, of: element) == kAXGroupRole as String)
+    }
+
+    private static func isIgnoredHubRegion(_ element: AXUIElement) -> Bool {
+        Self.hasLabel("File Viewer", on: element)
+            || Self.hasLabel("Notifications", on: element)
+            || Self.hasLabel("Typeahead menu", on: element)
+    }
+
+    private static func hasLabel(_ expected: String, on element: AXUIElement) -> Bool {
+        Self.stringAttribute(kAXDescriptionAttribute as CFString, of: element) == expected
+            || Self.stringAttribute(kAXTitleAttribute as CFString, of: element) == expected
     }
 
     private static func isLocalHubWebArea(_ element: AXUIElement) -> Bool {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success,
-              let value
-        else {
+        guard let url = Self.elementURL(of: element) else { return false }
+        return Self.isHubURL(url)
+    }
+
+    private static func isShowingSession(_ element: AXUIElement, conversationID: String) -> Bool {
+        guard let url = Self.elementURL(of: element) else { return false }
+        return Self.matchesSession(url, conversationID: conversationID)
+    }
+
+    static func matchesSession(_ url: URL, conversationID: String) -> Bool {
+        guard Self.isHubURL(url), url.path.hasPrefix("/c/") else {
             return false
         }
-        let url: URL? = if let u = value as? URL {
-            u
-        } else if let raw = value as? String {
-            URL(string: raw)
-        } else {
-            nil
+        let target = conversationID.lowercased()
+        let rawIDs = String(url.path.dropFirst("/c/".count))
+        if rawIDs.lowercased() == target {
+            return true
         }
-        guard let host = url?.host?.lowercased() else { return false }
+        guard rawIDs.contains("+") else {
+            return false
+        }
+        let panes = rawIDs.split(separator: "+").map { $0.lowercased() }
+        guard panes.contains(target) else {
+            return false
+        }
+        let focused = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "focused" })?
+            .value?
+            .lowercased()
+        return (focused ?? panes.first) == target
+    }
+
+    static func matchesConversationLink(_ url: URL, conversationID: String) -> Bool {
+        guard Self.isHubURL(url) else { return false }
+        return url.path.lowercased() == "/c/\(conversationID.lowercased())"
+    }
+
+    private static func isHubURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
         return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    private static func elementURL(of element: AXUIElement) -> URL? {
+        for attr in [kAXURLAttribute as CFString, kAXDocumentAttribute as CFString] {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, attr, &value) == .success,
+                  let value
+            else {
+                continue
+            }
+            if let url = value as? URL {
+                return url
+            }
+            if let raw = value as? String, let url = URL(string: raw) {
+                return url
+            }
+        }
+        return nil
     }
 
     private static func onScreenWindowBounds(pid: pid_t) -> [CGRect] {
@@ -1407,25 +1522,6 @@ final class AntigravityConversationNavigator: @unchecked Sendable {
             return nil
         }
         return boolValue
-    }
-
-    private static func urlPath(of element: AXUIElement) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success,
-              let value
-        else {
-            return nil
-        }
-        if let url = value as? URL {
-            return url.path
-        }
-        if let raw = value as? String {
-            if let url = URL(string: raw), !url.path.isEmpty {
-                return url.path
-            }
-            return raw
-        }
-        return nil
     }
 
     private static func windowTitleMatches(_ windowTitle: String?, expectedTitle: String?) -> Bool {
