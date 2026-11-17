@@ -117,16 +117,17 @@ public struct ClaudeQuotaService: QuotaProviding, Sendable {
         } catch {
             throw ClaudeQuotaServiceError.invalidResponse
         }
-        guard response.fiveHour != nil || response.sevenDay != nil else {
+        guard response.fiveHour != nil || response.sevenDay != nil,
+              let cachedAtMilliseconds = response.cachedAtMilliseconds,
+              cachedAtMilliseconds.isFinite
+        else {
             throw ClaudeQuotaServiceError.invalidResponse
         }
         return QuotaSnapshot(
             session: response.fiveHour?.snapshot(windowMinutes: 5 * 60),
             weekly: response.sevenDay?.snapshot(windowMinutes: 7 * 24 * 60),
             resetCredits: nil,
-            updatedAt: response.cachedAtMilliseconds.map {
-                Date(timeIntervalSince1970: $0 / 1000)
-            } ?? self.now(),
+            updatedAt: Date(timeIntervalSince1970: cachedAtMilliseconds / 1000),
             origin: origin)
     }
 

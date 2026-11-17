@@ -11,11 +11,17 @@ public extension QuotaProviding {
 
 public enum CodexQuotaServiceError: LocalizedError, Sendable {
     case noQuotaWindows
+    case localQuotaUnavailable
+    case localQuotaExpired
 
     public var errorDescription: String? {
         switch self {
         case .noQuotaWindows:
             "Codex did not return a 5-hour or weekly quota window."
+        case .localQuotaUnavailable:
+            "No Codex quota was found in local session logs. Use Codex to update local quota data."
+        case .localQuotaExpired:
+            "The quota windows recorded in Codex's local session logs have expired. Use Codex to update local quota data."
         }
     }
 }
@@ -27,14 +33,11 @@ public struct CodexQuotaService: QuotaProviding, Sendable {
     private let loadResetCredits: @Sendable () async throws -> QuotaResetCreditsSnapshot?
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        let quotaClient = CodexAppServerQuotaClient(environment: environment)
-        let resetCreditsClient = CodexResetCreditsClient(environment: environment)
+        let quotaClient = CodexLocalQuotaClient(environment: environment)
         self.loadQuota = {
-            try await quotaClient.fetchQuota()
+            try quotaClient.fetchQuota()
         }
-        self.loadResetCredits = {
-            try await resetCreditsClient.fetch()
-        }
+        self.loadResetCredits = { nil }
     }
 
     init(loadQuota: @escaping @Sendable () async throws -> QuotaSnapshot) {

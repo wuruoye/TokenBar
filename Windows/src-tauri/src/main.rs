@@ -221,7 +221,7 @@ async fn refresh(app: tauri::AppHandle) {
     };
     publish(&app, &state).await;
     let memory_status = update_receiver(&state, &settings).await;
-    let quotas = quota::fetch(&settings, &previous).await;
+    let quotas = quota::fetch(&settings, &previous, &state.dir).await;
     {
         let mut dashboard = state.dashboard.lock().await;
         dashboard.quotas = quotas.clone();

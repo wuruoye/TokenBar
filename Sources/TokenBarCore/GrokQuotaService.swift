@@ -26,7 +26,6 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
     public let platform = TokenPlatform.grok
 
     private let loadLog: @Sendable () throws -> Data
-    private let now: @Sendable () -> Date
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         let logURL = Self.logURL(environment: environment)
@@ -37,15 +36,10 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
                 throw GrokQuotaServiceError.logUnavailable
             }
         }
-        self.now = Date.init
     }
 
-    init(
-        loadLog: @escaping @Sendable () throws -> Data,
-        now: @escaping @Sendable () -> Date = Date.init)
-    {
+    init(loadLog: @escaping @Sendable () throws -> Data) {
         self.loadLog = loadLog
-        self.now = now
     }
 
     public func fetchQuota() async throws -> QuotaSnapshot {
@@ -89,7 +83,9 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
             throw GrokQuotaServiceError.snapshotUnavailable
         }
         let resetsAt = latest.config.resetDate
-        guard usedPercent != nil || resetsAt != nil else {
+        guard usedPercent != nil || resetsAt != nil,
+              let updatedAt = latest.record.timestamp.flatMap(Self.parseDate)
+        else {
             throw GrokQuotaServiceError.invalidSnapshot
         }
         return QuotaSnapshot(
@@ -100,7 +96,7 @@ public struct GrokQuotaService: QuotaProviding, Sendable {
                 resetsAt: resetsAt,
                 usageKnown: usedPercent != nil),
             resetCredits: nil,
-            updatedAt: latest.record.timestamp.flatMap(Self.parseDate) ?? self.now())
+            updatedAt: updatedAt)
     }
 
     private static func logURL(environment: [String: String]) -> URL {
