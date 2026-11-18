@@ -297,7 +297,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             showsGrok: self.settings.showsGrok,
             showsAntigravity: self.settings.showsAntigravity,
             showsWorkBuddy: self.settings.showsWorkBuddy,
-            showsWith: self.settings.showsWith)
+            showsWith: self.settings.showsWith,
+            showsOpenCode: self.settings.showsOpenCode)
     }
 
     private func updateStatusButton() {
@@ -310,11 +311,13 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             : nil
         let workbuddy = self.settings.showsWorkBuddy ? self.statusValues(for: .workbuddy) : nil
         let with = self.settings.showsWith ? self.statusValues(for: .with) : nil
+        let opencode = self.settings.showsOpenCode ? self.statusValues(for: .opencode) : nil
         let codexUnread = self.unreadTasks.count(for: .codex)
         let claudeUnread = self.unreadTasks.count(for: .claude)
         let antigravityUnread = self.unreadTasks.count(for: .antigravity)
         let workbuddyUnread = self.unreadTasks.count(for: .workbuddy)
         let withUnread = self.unreadTasks.count(for: .with)
+        let opencodeUnread = self.unreadTasks.count(for: .opencode)
         let layout = StatusLabelRenderer.layout(
             codexToday: codex.today,
             codexWeekly: codex.weekly,
@@ -330,7 +333,9 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             workbuddyToday: workbuddy?.today,
             workbuddyUnreadCount: workbuddyUnread,
             withToday: with?.today,
-            withUnreadCount: withUnread)
+            withUnreadCount: withUnread,
+            opencodeToday: opencode?.today,
+            opencodeUnreadCount: opencodeUnread)
         self.statusLabelLayout = layout
         button.image = layout.image
 
@@ -356,6 +361,10 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
         if let with {
             accessibilityLabels.append(
                 "With. Today, \(with.today) tokens.\(Self.unreadAccessibilityText(withUnread))")
+        }
+        if let opencode {
+            accessibilityLabels.append(
+                "OpenCode. Today, \(opencode.today) tokens.\(Self.unreadAccessibilityText(opencodeUnread))")
         }
         button.setAccessibilityLabel(accessibilityLabels.joined(separator: " "))
     }
@@ -463,6 +472,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             _ = self.settings.showsAntigravity
             _ = self.settings.showsWorkBuddy
             _ = self.settings.showsWith
+            _ = self.settings.showsOpenCode
             _ = self.settings.usesWeekdayWeeklyPacing
             _ = self.settings.showsFullRequestContentOnHover
             _ = self.settings.monitorsCodexMemory
@@ -602,7 +612,8 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             showsGrok: self.settings.showsGrok,
             showsAntigravity: self.settings.showsAntigravity,
             showsWorkBuddy: self.settings.showsWorkBuddy,
-            showsWith: self.settings.showsWith)
+            showsWith: self.settings.showsWith,
+            showsOpenCode: self.settings.showsOpenCode)
         let header = DashboardHeaderView(
             model: self.model,
             showsClaude: self.settings.showsClaude,
@@ -610,6 +621,7 @@ final class TokenBarStatusItemController: NSObject, NSMenuDelegate, TokenBarMenu
             showsAntigravity: self.settings.showsAntigravity,
             showsWorkBuddy: self.settings.showsWorkBuddy,
             showsWith: self.settings.showsWith,
+            showsOpenCode: self.settings.showsOpenCode,
             accentColor: accentColor,
             onSelectScope: { [weak self] scope in
                 self?.selectScope(scope)
@@ -1816,7 +1828,9 @@ enum StatusLabelRenderer {
         workbuddyToday: String? = nil,
         workbuddyUnreadCount: Int = 0,
         withToday: String? = nil,
-        withUnreadCount: Int = 0) -> StatusLabelLayout
+        withUnreadCount: Int = 0,
+        opencodeToday: String? = nil,
+        opencodeUnreadCount: Int = 0) -> StatusLabelLayout
     {
         var values: [(scope: DashboardScope, today: String, weekly: String, unreadCount: Int)] = [
             (.codex, codexToday, codexWeekly, codexUnreadCount),
@@ -1830,12 +1844,15 @@ enum StatusLabelRenderer {
         if let antigravityToday, let antigravityWeekly {
             values.append((.antigravity, antigravityToday, antigravityWeekly, antigravityUnreadCount))
         }
-        // WorkBuddy and With publish no quota window, so their W row stays empty.
+        // WorkBuddy, With, and OpenCode publish no quota window, so their W row stays empty.
         if let workbuddyToday {
             values.append((.workbuddy, workbuddyToday, "—", workbuddyUnreadCount))
         }
         if let withToday {
             values.append((.with, withToday, "—", withUnreadCount))
+        }
+        if let opencodeToday {
+            values.append((.opencode, opencodeToday, "—", opencodeUnreadCount))
         }
         let images = values.map { value in
             self.image(
@@ -2043,6 +2060,7 @@ enum PlatformStatusIcon {
         case .grok: "xmark"
         case .workbuddy: "briefcase"
         case .with: "bubble.left.and.bubble.right"
+        case .opencode: "terminal"
         default: nil
         }
     }

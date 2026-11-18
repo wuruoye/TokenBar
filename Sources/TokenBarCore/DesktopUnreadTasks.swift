@@ -153,6 +153,7 @@ public final class DesktopUnreadTaskMonitor {
     public nonisolated static let antigravityBundleIdentifier = "com.google.antigravity"
     public nonisolated static let workBuddyBundleIdentifier = "com.tencent.workbuddy.mac"
     public nonisolated static let withBundleIdentifier = "com.tencent.with"
+    public nonisolated static let openCodeBundleIdentifier = "ai.opencode.desktop"
 
     /// Hears which app is in front. Claude counts a turn that ends in the
     /// session its window shows as read, even while another app is in front,
@@ -167,6 +168,7 @@ public final class DesktopUnreadTaskMonitor {
         case Self.antigravityBundleIdentifier: .antigravity
         case Self.workBuddyBundleIdentifier: .workbuddy
         case Self.withBundleIdentifier: .with
+        case Self.openCodeBundleIdentifier: .opencode
         default: nil
         }
         let now = Date()
@@ -468,7 +470,7 @@ public final class DesktopUnreadTaskMonitor {
 }
 
 struct DesktopUnreadTaskReader: Sendable {
-    static let platforms: [TokenPlatform] = [.codex, .claude, .antigravity, .workbuddy, .with]
+    static let platforms: [TokenPlatform] = [.codex, .claude, .antigravity, .workbuddy, .with, .opencode]
 
     let codexHome: URL
     let claudeSupportDirectory: URL
@@ -2151,6 +2153,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
     private var workBuddyDatabasePath: String?
     private var workBuddyProjectsPrefix: String?
     private var withDatabasePath: String?
+    private var openCodeDatabasePath: String?
     private var workBuddyLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private var withLaunch: DesktopUnreadTaskReader.ClaudeLaunch?
     private var claudeTracker = ClaudeUnreadTracker()
@@ -2316,6 +2319,10 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             roots.append(withRoot)
             self.withDatabasePath = withRoot + "/data.db"
         }
+        if let openCodeRoot = Self.canonicalPath(self.reader.hosted.openCodeDataDirectory) {
+            roots.append(openCodeRoot)
+            self.openCodeDatabasePath = openCodeRoot + "/opencode.db"
+        }
         guard !roots.isEmpty else { return }
 
         var context = FSEventStreamContext(
@@ -2383,6 +2390,9 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             } else if let database = self.withDatabasePath, path == database || path.hasPrefix(database + "-") {
                 hostedChanged.insert(.with)
                 continue
+            } else if let database = self.openCodeDatabasePath, path == database || path.hasPrefix(database + "-") {
+                hostedChanged.insert(.opencode)
+                continue
             }
             if self.codexPaths.contains(path) {
                 changed.insert(.codex)
@@ -2425,7 +2435,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 antigravityTranscriptChanged = true
             }
         }
-        let hostedPlatforms: [TokenPlatform] = [.workbuddy, .with]
+        let hostedPlatforms: [TokenPlatform] = [.workbuddy, .with, .opencode]
         self.recount(DesktopUnreadTaskReader.platforms.filter {
             changed.contains($0) && !hostedPlatforms.contains($0)
         })
@@ -2546,6 +2556,8 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
                 self.recountWorkBuddy()
             case .with:
                 self.recountWith()
+            case .opencode:
+                self.recountOpenCode()
             default:
                 continue
             }
@@ -2652,7 +2664,7 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
             self.recountCodexRunning()
             self.recountClaudeRunning()
             self.recountAntigravityRunning()
-            self.recount([.workbuddy, .with])
+            self.recount([.workbuddy, .with, .opencode])
             self.scheduleRunningRefresh()
         }
     }
@@ -2797,6 +2809,68 @@ final class DesktopUnreadTaskWatcher: @unchecked Sendable {
         running.sort { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
         self.publish(.with, unread, nil, nil)
         self.publishRunning(.with, running)
+    }
+
+    /// OpenCode records `time_busy`, `time_idle`, and `time_viewed` per session
+    /// in `opencode.db`. A session is running while `time_busy > time_idle`,
+    /// and unread when a finished turn has not been viewed (`time_viewed < time_idle`).
+    private func recountOpenCode() {
+        let now = Date()
+        let hosted = self.reader.hosted
+        let sessions = hosted.openCodeSessions(now: now)
+        var unread: [DesktopUnreadTask] = []
+        var running: [DesktopRunningTask] = []
+        for session in sessions {
+            if session.isRunning {
+                let lastActive = session.updatedAt ?? session.busyAt
+                let isLive = lastActive.map {
+                    now.timeIntervalSince($0) < DesktopRunningTaskLiveness.quietLimit
+                } == true
+                guard isLive else { continue }
+                let turn = hosted.openCodeLastTurn(sessionID: session.id)
+                if let askQuestion = turn?.askQuestion {
+                    unread.append(DesktopUnreadTask(
+                        platform: .opencode,
+                        id: session.id,
+                        title: session.title,
+                        prompt: turn?.prompt,
+                        reply: turn?.reply,
+                        askQuestion: askQuestion,
+                        turnDuration: nil,
+                        workspacePath: session.workspacePath,
+                        updatedAt: session.updatedAt ?? session.busyAt))
+                } else {
+                    running.append(DesktopRunningTask(
+                        platform: .opencode,
+                        id: session.id,
+                        title: session.title ?? turn?.prompt,
+                        startedAt: session.busyAt,
+                        activity: turn?.activity))
+                }
+                continue
+            }
+            guard session.unread else { continue }
+            let turn = hosted.openCodeLastTurn(sessionID: session.id)
+            let duration: TimeInterval? = {
+                guard let busyAt = session.busyAt, let idleAt = session.idleAt else { return nil }
+                let elapsed = idleAt.timeIntervalSince(busyAt)
+                return elapsed > 0 ? elapsed : nil
+            }()
+            unread.append(DesktopUnreadTask(
+                platform: .opencode,
+                id: session.id,
+                title: session.title,
+                prompt: turn?.prompt,
+                reply: turn?.reply,
+                askQuestion: turn?.askQuestion,
+                turnDuration: duration,
+                workspacePath: session.workspacePath,
+                updatedAt: session.idleAt ?? session.updatedAt))
+        }
+        unread.sort { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+        running.sort { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
+        self.publish(.opencode, unread, Set(sessions.map(\.id)), nil)
+        self.publishRunning(.opencode, running)
     }
 
     private func antigravityRunningTasks(

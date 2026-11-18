@@ -26,6 +26,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .antigravity: "Antigravity"
         case .workbuddy: "WorkBuddy"
         case .with: "With"
+        case .opencode: "OpenCode"
         default: self.rawValue.capitalized
         }
     }
@@ -38,6 +39,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
         case .antigravity: "AG"
         case .workbuddy: "WB"
         case .with: "W"
+        case .opencode: "OC"
         default: String(self.displayName.prefix(1))
         }
     }
@@ -48,6 +50,7 @@ public struct TokenPlatform: RawRepresentable, Codable, Equatable, Hashable, Ide
     public static let antigravity = TokenPlatform(rawValue: "antigravity")
     public static let workbuddy = TokenPlatform(rawValue: "workbuddy")
     public static let with = TokenPlatform(rawValue: "with")
+    public static let opencode = TokenPlatform(rawValue: "opencode")
 }
 
 public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
@@ -57,6 +60,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
     case antigravity
     case workbuddy
     case with
+    case opencode
 
     public var id: String { self.rawValue }
 
@@ -68,6 +72,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .antigravity: TokenPlatform.antigravity.displayName
         case .workbuddy: TokenPlatform.workbuddy.displayName
         case .with: TokenPlatform.with.displayName
+        case .opencode: TokenPlatform.opencode.displayName
         }
     }
 
@@ -79,6 +84,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         case .antigravity: .antigravity
         case .workbuddy: .workbuddy
         case .with: .with
+        case .opencode: .opencode
         }
     }
 
@@ -91,7 +97,8 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
         showsGrok: Bool,
         showsAntigravity: Bool,
         showsWorkBuddy: Bool,
-        showsWith: Bool) -> [Self]
+        showsWith: Bool,
+        showsOpenCode: Bool = true) -> [Self]
     {
         Self.allCases.filter { scope in
             switch scope {
@@ -101,6 +108,7 @@ public enum DashboardScope: String, Codable, CaseIterable, Hashable, Identifiabl
             case .antigravity: showsAntigravity
             case .workbuddy: showsWorkBuddy
             case .with: showsWith
+            case .opencode: showsOpenCode
             }
         }
     }
@@ -454,6 +462,28 @@ public struct RequestSummary: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct SessionContextOccupancy: Codable, Equatable, Sendable {
+    public let promptTokens: Int64
+    public let contextWindow: Int64?
+    public let percent: Double?
+    public let systemTokens: Int64?
+    public let messageTokens: Int64?
+
+    public init(
+        promptTokens: Int64,
+        contextWindow: Int64? = nil,
+        percent: Double? = nil,
+        systemTokens: Int64? = nil,
+        messageTokens: Int64? = nil)
+    {
+        self.promptTokens = promptTokens
+        self.contextWindow = contextWindow
+        self.percent = percent
+        self.systemTokens = systemTokens
+        self.messageTokens = messageTokens
+    }
+}
+
 public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let platform: TokenPlatform?
@@ -466,6 +496,7 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
     public let costUsd: Double
     public let models: [String]
     public let requests: [RequestSummary]
+    public let context: SessionContextOccupancy?
 
     public init(
         id: String,
@@ -478,7 +509,8 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
         requests: [RequestSummary],
         title: String? = nil,
         workspacePath: String? = nil,
-        platform: TokenPlatform? = nil)
+        platform: TokenPlatform? = nil,
+        context: SessionContextOccupancy? = nil)
     {
         self.id = id
         self.platform = platform
@@ -491,6 +523,7 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
         self.costUsd = costUsd
         self.models = models
         self.requests = requests
+        self.context = context
     }
 
     public var requestCount: Int {
@@ -538,7 +571,8 @@ public struct SessionSummary: Codable, Equatable, Identifiable, Sendable {
             requests: self.requests.map { $0.redactedForCache() },
             title: nil,
             workspacePath: nil,
-            platform: self.platform)
+            platform: self.platform,
+            context: self.context)
     }
 }
 

@@ -26,6 +26,10 @@ use tokenbar_helper::with::{
     extract_request_detail as extract_with_request_detail, parse_local_with_messages,
     LocalParseOptions as WithParseOptions,
 };
+use tokenbar_helper::opencode::{
+    extract_request_detail as extract_opencode_request_detail, load_opencode_session_titles,
+    parse_local_opencode_messages, LocalParseOptions as OpenCodeParseOptions,
+};
 use tokenbar_helper::workbuddy::{
     extract_request_detail as extract_workbuddy_request_detail, load_workbuddy_session_titles,
     parse_local_workbuddy_messages, LocalParseOptions as WorkBuddyParseOptions,
@@ -147,6 +151,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     config.end_ms,
                 ),
                 "with" => extract_with_request_detail(
+                    &config.session_path,
+                    config.start_ms,
+                    config.end_ms,
+                ),
+                "opencode" => extract_opencode_request_detail(
                     &config.session_path,
                     config.start_ms,
                     config.end_ms,
@@ -308,12 +317,21 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         until: antigravity_options.until.clone(),
     })
     .unwrap_or_default();
+    let opencode_options = OpenCodeParseOptions {
+        home_dir: antigravity_options.home_dir.clone(),
+        use_env_roots,
+        since: antigravity_options.since.clone(),
+        until: antigravity_options.until.clone(),
+    };
+    let opencode_messages = parse_local_opencode_messages(opencode_options.clone()).unwrap_or_default();
+    session_titles.extend(load_opencode_session_titles(&opencode_options));
     let mut messages = codex_messages;
     messages.extend(claude_messages);
     messages.extend(grok_messages);
     messages.extend(antigravity_messages);
     messages.extend(workbuddy_messages);
     messages.extend(with_messages);
+    messages.extend(opencode_messages);
     config
         .statistics_time_zone
         .normalize_message_dates(&mut messages);
@@ -691,9 +709,9 @@ fn parse_request_detail_args(
             Some("--platform") => {
                 let value = args.next().ok_or("--platform requires a value")?;
                 let value = value.to_str().ok_or("--platform must be valid UTF-8")?;
-                if !matches!(value, "codex" | "claude" | "grok" | "antigravity" | "workbuddy" | "with") {
+                if !matches!(value, "codex" | "claude" | "grok" | "antigravity" | "workbuddy" | "with" | "opencode") {
                     return Err(
-                        "--platform must be codex, claude, grok, antigravity, workbuddy, or with".to_string()
+                        "--platform must be codex, claude, grok, antigravity, workbuddy, with, or opencode".to_string()
                     );
                 }
                 platform = value.to_string();

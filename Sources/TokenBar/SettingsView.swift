@@ -74,6 +74,7 @@ struct TokenBarSettingsView: View {
                 Toggle("Show Antigravity", isOn: self.$settings.showsAntigravity)
                 Toggle("Show WorkBuddy", isOn: self.$settings.showsWorkBuddy)
                 Toggle("Show With", isOn: self.$settings.showsWith)
+                Toggle("Show OpenCode", isOn: self.$settings.showsOpenCode)
 
                 Text("Adds each provider's T/W section and dashboard tab. Changes take effect immediately.")
                     .font(.caption)
@@ -83,7 +84,7 @@ struct TokenBarSettingsView: View {
             Section("Desktop") {
                 Toggle("Show desktop card", isOn: self.$settings.showsDesktopCard)
 
-                Text("A card on the desktop, below your windows, lists unread and running Codex, Claude, Antigravity, WorkBuddy, and With tasks and glows while anything is unread. Drag it to move it; right-click it to hide it.")
+                Text("A card on the desktop, below your windows, lists unread and running Codex, Claude, Antigravity, WorkBuddy, With, and OpenCode tasks and glows while anything is unread. Drag it to move it; right-click it to hide it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -177,6 +177,9 @@ final class DesktopCardController {
     private func openPanel() {
         let view = DesktopCardView(
             state: self.state,
+            sessionInfo: { [publisher = self.publisher] platform, taskID in
+                publisher.sessionInfo(platform: platform, taskID: taskID)
+            },
             open: { [weak self] platform, taskID in
                 self?.openTask(TokenPlatform(rawValue: platform), taskID)
             },
@@ -613,5 +616,31 @@ private final class DesktopCardPanel: NSPanel {
 
     override var canBecomeMain: Bool {
         false
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        let isContextEvent = event.type == .rightMouseDown
+            || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
+        if isContextEvent,
+           let contentView = self.contentView,
+           let anchor = Self.contextMenuAnchor(at: event.locationInWindow, in: contentView),
+           let menu = anchor.menuBuilder?()
+        {
+            NSMenu.popUpContextMenu(menu, with: event, for: anchor)
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    private static func contextMenuAnchor(at windowPoint: NSPoint, in view: NSView) -> SessionContextMenuAnchorView? {
+        guard !view.isHidden, view.alphaValue > 0 else { return nil }
+        let localPoint = view.convert(windowPoint, from: nil)
+        guard view.bounds.contains(localPoint) else { return nil }
+        for subview in view.subviews.reversed() {
+            if let match = self.contextMenuAnchor(at: windowPoint, in: subview) {
+                return match
+            }
+        }
+        return view as? SessionContextMenuAnchorView
     }
 }

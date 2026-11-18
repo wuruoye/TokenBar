@@ -67,6 +67,14 @@ final class UnreadWidgetPublisher {
         self.pendingActivityRefreshPlatforms.removeAll()
     }
 
+    func sessionInfo(platform: String, taskID: String) -> DesktopSessionInfo {
+        DesktopSessionInfo(
+            platform: TokenPlatform(rawValue: platform),
+            taskID: taskID,
+            sessions: self.model.activitySnapshot?.sessions ?? [],
+            usageDate: self.model.activitySnapshot?.days.map(\.date).max())
+    }
+
     private func observe() {
         withObservationTracking {
             _ = self.unreadTasks.tasks
@@ -77,6 +85,7 @@ final class UnreadWidgetPublisher {
             _ = self.settings.showsAntigravity
             _ = self.settings.showsWorkBuddy
             _ = self.settings.showsWith
+            _ = self.settings.showsOpenCode
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isStarted else { return }
@@ -238,6 +247,9 @@ final class UnreadWidgetPublisher {
         }
         if settings.showsWith {
             platforms.append(.with)
+        }
+        if settings.showsOpenCode {
+            platforms.append(.opencode)
         }
         let unread = platforms.flatMap { unreadTasks.tasks[$0] ?? [] }
         let unreadIDs = Set(unread.map { "\($0.platform.rawValue)/\($0.id)" })

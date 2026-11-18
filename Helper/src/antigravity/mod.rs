@@ -51,6 +51,17 @@ const PAYLOAD_USER_MESSAGE: u32 = 19;
 const PAYLOAD_MODEL_RESPONSE: u32 = 20;
 const PAYLOAD_CONVERSATION_START: u32 = 30;
 
+/// `GeneratorMetadata` field numbers.
+const GEN_CHAT_MODEL: u32 = 1;
+const GEN_STEP_INDICES: u32 = 2;
+const CHAT_MODEL_KEY_FALLBACK: u32 = 3;
+const CHAT_USAGE: u32 = 4;
+const CHAT_START_METADATA: u32 = 9;
+const CHAT_MODEL_ID: u32 = 19;
+const CHAT_MODEL_DISPLAY_NAME: u32 = 21;
+const START_CONTEXT_WINDOW_METADATA: u32 = 10;
+const CONTEXT_MAX_TOKENS: u32 = 4;
+
 #[derive(Debug, Clone, Default)]
 pub struct LocalParseOptions {
     pub home_dir: Option<String>,
@@ -614,8 +625,8 @@ fn parse_conversation_file(
         }
     };
     let metadata = read_conversation_metadata(&connection, path, summaries);
-    let models = read_model_names(&connection);
-    build_messages(&metadata, &steps, &models)
+    let generations = read_generations(&connection);
+    build_messages(&metadata, &steps, &generations)
 }
 
 fn read_conversation_metadata(
@@ -767,38 +778,72 @@ fn read_output(step_type: i64, payload: &[u8]) -> Option<String> {
 struct ModelDescriptor {
     model_id: String,
     reasoning_effort: Option<String>,
+    context_window: Option<i64>,
 }
 
-/// Maps Antigravity's numeric model key to the model name and reasoning effort
-/// recorded alongside each generation.
-fn read_model_names(connection: &Connection) -> HashMap<u64, ModelDescriptor> {
-    let mut names = HashMap::new();
-    let Ok(mut statement) = connection.prepare("SELECT data FROM gen_metadata") else {
-        return names;
+#[derive(Debug, Default)]
+struct GenerationIndex {
+    models: HashMap<u64, ModelDescriptor>,
+    step_windows: HashMap<i64, i64>,
+}
+
+/// Maps Antigravity's numeric model key and step indices to the model identity
+/// and live `maxContextTokens` budget recorded alongside each generation.
+fn read_generations(connection: &Connection) -> GenerationIndex {
+    let mut index = GenerationIndex::default();
+    let Ok(mut statement) = connection
+        .prepare("SELECT data FROM gen_metadata ORDER BY idx")
+        .or_else(|_| connection.prepare("SELECT data FROM gen_metadata"))
+    else {
+        return index;
     };
     let Ok(rows) = statement.query_map([], |row| row.get::<_, Vec<u8>>(0)) else {
-        return names;
+        return index;
     };
     for blob in rows.filter_map(Result::ok) {
-        let Some(generation) = proto::message(&blob, &[1]) else {
+        let Some(generation) = proto::message(&blob, &[GEN_CHAT_MODEL]) else {
             continue;
         };
-        let Some(model) = proto::string(generation, &[19]) else {
+        let context_window = proto::integer(
+            generation,
+            &[
+                CHAT_START_METADATA,
+                START_CONTEXT_WINDOW_METADATA,
+                CONTEXT_MAX_TOKENS,
+            ],
+        )
+        .filter(|value| *value > 0);
+        if let Some(window) = context_window {
+            for step_index in proto::repeated_integers(&blob, GEN_STEP_INDICES) {
+                index.step_windows.insert(step_index, window);
+            }
+        }
+        let Some(model) = proto::string(generation, &[CHAT_MODEL_ID]) else {
             continue;
         };
-        let display_name = proto::string(generation, &[21]);
-        let key = proto::varint(generation, &[4, USAGE_MODEL_KEY])
-            .or_else(|| proto::varint(generation, &[3]));
+        let display_name = proto::string(generation, &[CHAT_MODEL_DISPLAY_NAME]);
+        let key = proto::varint(generation, &[CHAT_USAGE, USAGE_MODEL_KEY])
+            .or_else(|| proto::varint(generation, &[CHAT_MODEL_KEY_FALLBACK]));
         if let Some(key) = key {
-            names
+            index
+                .models
                 .entry(key)
-                .or_insert_with(|| parse_generation_model(model, display_name));
+                .and_modify(|entry| {
+                    if context_window.is_some() {
+                        entry.context_window = context_window;
+                    }
+                })
+                .or_insert_with(|| parse_generation_model(model, display_name, context_window));
         }
     }
-    names
+    index
 }
 
-fn parse_generation_model(raw_model: &str, display_name: Option<&str>) -> ModelDescriptor {
+fn parse_generation_model(
+    raw_model: &str,
+    display_name: Option<&str>,
+    context_window: Option<i64>,
+) -> ModelDescriptor {
     let reasoning_effort = display_name
         .and_then(reasoning_effort_from_model)
         .or_else(|| reasoning_effort_from_model(raw_model))
@@ -810,6 +855,7 @@ fn parse_generation_model(raw_model: &str, display_name: Option<&str>) -> ModelD
     ModelDescriptor {
         model_id,
         reasoning_effort,
+        context_window,
     }
 }
 
@@ -845,7 +891,7 @@ fn normalize_antigravity_model_id(raw_model: &str, display_name: Option<&str>) -
 fn build_messages(
     metadata: &ConversationMetadata,
     steps: &[StepRecord],
-    models: &HashMap<u64, ModelDescriptor>,
+    generations: &GenerationIndex,
 ) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut pending_prompt: Option<String> = None;
@@ -868,9 +914,7 @@ fn build_messages(
         let Some(timestamp) = step.finished_at_ms.or(step.started_at_ms) else {
             continue;
         };
-        let descriptor = resolve_model(step, models);
-        // Antigravity stores no context window, so only the prompt total is
-        // known here; capacity is resolved from the pricing catalog.
+        let descriptor = resolve_model(step, &generations.models);
         let prompt_tokens = tokens
             .input
             .max(0)
@@ -888,6 +932,11 @@ fn build_messages(
         );
         message.reasoning_effort = descriptor.reasoning_effort;
         message.prompt_tokens = Some(prompt_tokens);
+        message.context_window = generations
+            .step_windows
+            .get(&step.index)
+            .copied()
+            .or(descriptor.context_window);
         message.physical_session_id = Some(metadata.conversation_id.clone());
         message.is_subagent = metadata.is_subagent;
         message.set_workspace(
@@ -958,14 +1007,26 @@ fn resolve_model(step: &StepRecord, models: &HashMap<u64, ModelDescriptor>) -> M
                 [Some(effort)] => Some((*effort).to_string()),
                 _ => None,
             };
+            let mut distinct_windows = models
+                .values()
+                .filter_map(|entry| entry.context_window)
+                .collect::<Vec<_>>();
+            distinct_windows.sort_unstable();
+            distinct_windows.dedup();
+            let context_window = match distinct_windows.as_slice() {
+                [window] => Some(*window),
+                _ => None,
+            };
             ModelDescriptor {
                 model_id: (*model_id).to_string(),
                 reasoning_effort,
+                context_window,
             }
         }
         _ => ModelDescriptor {
             model_id: "unknown".to_string(),
             reasoning_effort: None,
+            context_window: None,
         },
     }
 }
@@ -975,5 +1036,78 @@ fn provider_for_model(model_id: &str) -> &'static str {
         "anthropic"
     } else {
         "google"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn encode_varint_field(number: u32, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint(u64::from(number << 3), &mut out);
+        encode_varint(value, &mut out);
+        out
+    }
+
+    fn encode_bytes_field(number: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint(u64::from((number << 3) | 2), &mut out);
+        encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn reads_live_context_window_from_gen_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)", [])
+            .unwrap();
+
+        let mut packed_steps = Vec::new();
+        encode_varint(10, &mut packed_steps);
+        encode_varint(11, &mut packed_steps);
+
+        let context_meta = encode_varint_field(CONTEXT_MAX_TOKENS, 512_000);
+        let start_meta = encode_bytes_field(START_CONTEXT_WINDOW_METADATA, &context_meta);
+        let usage = encode_varint_field(USAGE_MODEL_KEY, 1437);
+        let mut chat_model = Vec::new();
+        chat_model.extend(encode_bytes_field(CHAT_USAGE, &usage));
+        chat_model.extend(encode_bytes_field(CHAT_START_METADATA, &start_meta));
+        chat_model.extend(encode_bytes_field(CHAT_MODEL_ID, b"gemini-4-hydrogen-medium"));
+        chat_model.extend(encode_bytes_field(
+            CHAT_MODEL_DISPLAY_NAME,
+            b"Gemini 4 Hydrogen (Medium)",
+        ));
+
+        let mut gen_blob = Vec::new();
+        gen_blob.extend(encode_bytes_field(GEN_STEP_INDICES, &packed_steps));
+        gen_blob.extend(encode_bytes_field(GEN_CHAT_MODEL, &chat_model));
+        connection
+            .execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [&gen_blob])
+            .unwrap();
+
+        let generations = read_generations(&connection);
+        assert_eq!(generations.step_windows.get(&10), Some(&512_000));
+        assert_eq!(generations.step_windows.get(&11), Some(&512_000));
+        assert_eq!(
+            generations.models.get(&1437).and_then(|m| m.context_window),
+            Some(512_000)
+        );
     }
 }

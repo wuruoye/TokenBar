@@ -17,6 +17,7 @@ pub mod grok;
 pub mod memory;
 pub mod pricing;
 pub mod openrouter;
+pub mod opencode;
 pub mod usage;
 pub mod desktop_tasks;
 pub mod workbench;
@@ -895,7 +896,7 @@ pub fn build_snapshot_with_context_windows(
         .iter()
         .map(|message| message.client.clone())
         .collect::<BTreeSet<_>>();
-    let known_platforms = ["codex", "claude", "grok", "antigravity", "workbuddy", "with"];
+    let known_platforms = ["codex", "claude", "grok", "antigravity", "workbuddy", "with", "opencode"];
     let mut platforms = known_platforms
         .iter()
         .map(|platform| (*platform).to_string())

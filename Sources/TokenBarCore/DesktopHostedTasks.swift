@@ -15,6 +15,7 @@ import SQLite3
 struct DesktopHostedTaskReader: Sendable {
     let workBuddyHome: URL
     let withSupportDirectory: URL
+    let openCodeDataDirectory: URL
 
     /// Unread sessions older than this are left to the app's own sidebar.
     static let unreadWindow: TimeInterval = 7 * 24 * 60 * 60
@@ -29,6 +30,15 @@ struct DesktopHostedTaskReader: Sendable {
         self.withSupportDirectory = environment["WITH_DATA_DIR"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
             ?? home.appendingPathComponent("Library/Application Support/com.tencent.with", isDirectory: true)
+        if let openCodeDir = environment["OPENCODE_DATA_DIR"].flatMap({ $0.isEmpty ? nil : $0 }) {
+            self.openCodeDataDirectory = URL(fileURLWithPath: openCodeDir, isDirectory: true)
+        } else if let xdgDataHome = environment["XDG_DATA_HOME"].flatMap({ $0.isEmpty ? nil : $0 }) {
+            self.openCodeDataDirectory = URL(fileURLWithPath: xdgDataHome, isDirectory: true)
+                .appendingPathComponent("opencode", isDirectory: true)
+        } else {
+            self.openCodeDataDirectory = home
+                .appendingPathComponent(".local/share/opencode", isDirectory: true)
+        }
     }
 
     var workBuddyDatabase: URL {
@@ -41,6 +51,10 @@ struct DesktopHostedTaskReader: Sendable {
 
     var withMessageCache: URL {
         self.withSupportDirectory.appendingPathComponent("qa_detail.db", isDirectory: false)
+    }
+
+    var openCodeDatabase: URL {
+        self.openCodeDataDirectory.appendingPathComponent("opencode.db", isDirectory: false)
     }
 
     // MARK: WorkBuddy
@@ -249,6 +263,153 @@ struct DesktopHostedTaskReader: Sendable {
             prompt: Self.nonEmpty(json["request"] as? String),
             reply: Self.nonEmpty(reply),
             duration: duration)
+    }
+
+    // MARK: OpenCode
+
+    struct OpenCodeSession: Equatable, Sendable {
+        let id: String
+        let title: String?
+        let workspacePath: String?
+        let isRunning: Bool
+        let unread: Bool
+        let busyAt: Date?
+        let idleAt: Date?
+        let updatedAt: Date?
+    }
+
+    struct OpenCodeTurn: Equatable, Sendable {
+        let prompt: String?
+        let reply: String?
+        let activity: String?
+        let askQuestion: String?
+    }
+
+    func openCodeSessions(now: Date) -> [OpenCodeSession] {
+        guard let database = Self.open(self.openCodeDatabase) else { return [] }
+        defer { sqlite3_close(database) }
+        let since = Int64((now.timeIntervalSince1970 - Self.unreadWindow) * 1000)
+        let query = """
+            SELECT id, title, directory, time_busy, time_idle, time_viewed, time_updated
+            FROM session_v2
+            WHERE parent_id IS NULL
+              AND time_archived IS NULL
+              AND time_updated >= ?
+            ORDER BY time_updated DESC
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, since)
+        var sessions: [OpenCodeSession] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = Self.text(statement, 0) else { continue }
+            let title = Self.text(statement, 1)
+            let workspacePath = Self.text(statement, 2)
+            let busyMs = sqlite3_column_type(statement, 3) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 3)
+            let idleMs = sqlite3_column_type(statement, 4) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 4)
+            let viewedMs = sqlite3_column_type(statement, 5) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 5)
+            let updatedMs = sqlite3_column_int64(statement, 6)
+            let isRunning = busyMs.map { busy in
+                idleMs.map { busy > $0 } ?? true
+            } ?? false
+            let unread = !isRunning && idleMs.map { idle in
+                viewedMs.map { $0 < idle } ?? true
+            } ?? false
+            sessions.append(OpenCodeSession(
+                id: id,
+                title: title,
+                workspacePath: workspacePath,
+                isRunning: isRunning,
+                unread: unread,
+                busyAt: busyMs.flatMap(Self.millisecondsDate),
+                idleAt: idleMs.flatMap(Self.millisecondsDate),
+                updatedAt: Self.millisecondsDate(updatedMs)))
+        }
+        return sessions
+    }
+
+    func openCodeLastTurn(sessionID: String) -> OpenCodeTurn? {
+        guard let database = Self.open(self.openCodeDatabase) else { return nil }
+        defer { sqlite3_close(database) }
+        let query = """
+            SELECT type, data
+            FROM session_message
+            WHERE session_id = ?
+              AND type IN ('user', 'assistant')
+            ORDER BY seq DESC
+            LIMIT 40
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, Self.sqliteTransient)
+        var rows: [(type: String, json: [String: Any])] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let type = Self.text(statement, 0),
+                  let rawData = Self.text(statement, 1)?.data(using: .utf8),
+                  let json = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any]
+            else {
+                continue
+            }
+            rows.append((type: type, json: json))
+        }
+        guard !rows.isEmpty else { return nil }
+        rows.reverse()
+
+        let startIndex = rows.lastIndex(where: { $0.type == "user" }) ?? 0
+        var prompt: String?
+        var reply: String?
+        var activity: String?
+        var askQuestion: String?
+
+        for row in rows[startIndex...] {
+            if row.type == "user" {
+                let metadata = row.json["metadata"] as? [String: Any]
+                prompt = Self.nonEmpty(metadata?["displayText"] as? String)
+                    ?? Self.nonEmpty(row.json["text"] as? String)
+                reply = nil
+                activity = nil
+                askQuestion = nil
+                continue
+            }
+            guard row.type == "assistant" else { continue }
+            let parts = row.json["content"] as? [[String: Any]] ?? []
+            for part in parts {
+                switch part["type"] as? String {
+                case "text":
+                    if let text = Self.nonEmpty(part["text"] as? String) {
+                        reply = text
+                    }
+                    activity = "Replying"
+                case "reasoning":
+                    activity = "Thinking"
+                case "tool":
+                    let name = part["name"] as? String ?? "tool"
+                    let state = part["state"] as? [String: Any]
+                    let status = state?["status"] as? String
+                    let isPending = status != "completed" && status != "error"
+                    if name == "question", isPending {
+                        let input = state?["input"] as? [String: Any]
+                        let questions = input?["questions"] as? [[String: Any]]
+                        let first = questions?.first
+                        askQuestion = Self.nonEmpty(first?["question"] as? String)
+                            ?? Self.nonEmpty(first?["header"] as? String)
+                            ?? "Waiting for your answer"
+                        activity = "Waiting for your answer"
+                    } else if isPending {
+                        activity = "Running \(name)"
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        return OpenCodeTurn(
+            prompt: prompt,
+            reply: reply,
+            activity: activity,
+            askQuestion: askQuestion)
     }
 
     // MARK: Helpers

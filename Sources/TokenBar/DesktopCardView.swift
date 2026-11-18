@@ -27,6 +27,7 @@ struct DesktopCardView: View {
     private static let padding: CGFloat = 14
 
     let state: DesktopCardState
+    let sessionInfo: (String, String) -> DesktopSessionInfo
     let open: (String, String) -> Void
     let drag: (DragPhase) -> Void
     let resize: (DragPhase) -> Void
@@ -157,6 +158,7 @@ struct DesktopCardView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .background(self.sessionContextAnchor(for: task, isUnread: true))
             } else {
                 Label("All caught up", systemImage: "checkmark.circle")
                     .font(CardFont.sans(12, .medium))
@@ -191,6 +193,7 @@ struct DesktopCardView: View {
                         UnreadCardRow(task: task, replyLines: 1, showsDetails: false) {
                             self.open(task.platform, task.taskID)
                         }
+                        .background(self.sessionContextAnchor(for: task, isUnread: true))
                     }
                     .transition(Self.rowTransition)
                 }
@@ -208,6 +211,12 @@ struct DesktopCardView: View {
             RunningSummaryRow(running: tasks, isInBackground: isInBackground, animates: self.state.isVisible) {
                 self.open(task.platform, task.taskID)
             }
+            .background(SessionContextMenuAnchor {
+                DesktopSessionMenuBuilder.makeSummaryMenu(
+                    tasks: tasks,
+                    isInBackground: isInBackground,
+                    sessionInfo: self.sessionInfo)
+            })
         }
     }
 
@@ -296,6 +305,7 @@ struct DesktopCardView: View {
                     UnreadCardRow(task: task, replyLines: 2, showsDetails: true) {
                         self.open(task.platform, task.taskID)
                     }
+                    .background(self.sessionContextAnchor(for: task, isUnread: true))
                 }
                 .transition(Self.rowTransition)
             }
@@ -314,6 +324,7 @@ struct DesktopCardView: View {
                 CompactTaskRow(task: task, isUnread: isUnread) {
                     self.open(task.platform, task.taskID)
                 }
+                .background(self.sessionContextAnchor(for: task, isUnread: isUnread))
                 .transition(Self.rowTransition)
             }
         }
@@ -332,8 +343,35 @@ struct DesktopCardView: View {
                 RunningCardRow(task: task, isInBackground: isInBackground, animates: self.state.isVisible) {
                     self.open(task.platform, task.taskID)
                 }
+                .background(self.sessionContextAnchor(for: task, isInBackground: isInBackground))
                 .transition(Self.rowTransition)
             }
+        }
+    }
+
+    private func sessionContextAnchor(
+        for task: UnreadWidgetSnapshot.Item,
+        isUnread: Bool) -> some View
+    {
+        SessionContextMenuAnchor {
+            DesktopSessionMenuBuilder.makeMenu(
+                for: DesktopSessionMenuBuilder.presentation(
+                    for: task,
+                    isUnread: isUnread,
+                    info: self.sessionInfo(task.platform, task.taskID)))
+        }
+    }
+
+    private func sessionContextAnchor(
+        for task: UnreadWidgetSnapshot.RunningItem,
+        isInBackground: Bool) -> some View
+    {
+        SessionContextMenuAnchor {
+            DesktopSessionMenuBuilder.makeMenu(
+                for: DesktopSessionMenuBuilder.presentation(
+                    for: task,
+                    isInBackground: isInBackground,
+                    info: self.sessionInfo(task.platform, task.taskID)))
         }
     }
 }

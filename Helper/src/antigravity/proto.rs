@@ -137,6 +137,38 @@ pub fn integer(buffer: &[u8], numbers: &[u32]) -> Option<i64> {
     i64::try_from(varint(buffer, numbers)?).ok()
 }
 
+/// Collects a repeated integer field encoded either as individual varints or
+/// packed inside length-delimited bytes.
+pub fn repeated_integers(buffer: &[u8], number: u32) -> Vec<i64> {
+    let mut values = Vec::new();
+    for (field_number, value) in fields(buffer) {
+        if field_number != number {
+            continue;
+        }
+        match value {
+            Value::Varint(raw) => {
+                if let Ok(parsed) = i64::try_from(raw) {
+                    values.push(parsed);
+                }
+            }
+            Value::Bytes(bytes) => {
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let Some((raw, next)) = read_varint(bytes, offset) else {
+                        break;
+                    };
+                    offset = next;
+                    if let Ok(parsed) = i64::try_from(raw) {
+                        values.push(parsed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
 pub fn string<'a>(buffer: &'a [u8], numbers: &[u32]) -> Option<&'a str> {
     let bytes = message(buffer, numbers)?;
     let text = std::str::from_utf8(bytes).ok()?;

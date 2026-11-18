@@ -141,6 +141,13 @@ struct SessionLauncher {
             }
             return
         }
+        if platform == .opencode {
+            onWillOpen?(id)
+            guard Self.openApplication(bundleIdentifier: Self.openCodeBundleIdentifier) else {
+                throw SessionLauncherError.applicationUnavailable(.opencode)
+            }
+            return
+        }
         if platform == .antigravity {
             let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isSafePathIdentifier(trimmed) else {
@@ -255,6 +262,7 @@ struct SessionLauncher {
     }
 
     static let withBundleIdentifier = "com.tencent.with"
+    static let openCodeBundleIdentifier = "ai.opencode.desktop"
 
     static func openApplication(bundleIdentifier: String) -> Bool {
         guard let application = NSWorkspace.shared
@@ -426,6 +434,29 @@ struct ClaudeDesktopSessionResolver {
         }
 
         return matches.sorted(by: Self.isPreferred).first?.sessionId
+    }
+
+    func cliSessionID(for desktopSessionID: String) -> String? {
+        guard Self.isSafeSessionID(desktopSessionID),
+              let enumerator = FileManager.default.enumerator(
+            at: self.sessionsRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])
+        else { return nil }
+
+        for case let fileURL as URL in enumerator
+            where fileURL.pathExtension == "json"
+                && fileURL.deletingPathExtension().lastPathComponent == desktopSessionID
+        {
+            guard let data = try? Data(contentsOf: fileURL),
+                  let record = try? JSONDecoder().decode(Record.self, from: data),
+                  record.sessionId == desktopSessionID,
+                  let cliSessionID = record.cliSessionId,
+                  Self.isSafeSessionID(cliSessionID)
+            else { continue }
+            return cliSessionID
+        }
+        return nil
     }
 
     private static func isPreferred(_ lhs: Record, _ rhs: Record) -> Bool {

@@ -105,6 +105,7 @@ public final class TokenBarSettings {
     public static let defaultShowsAntigravity = true
     public static let defaultShowsWorkBuddy = true
     public static let defaultShowsWith = true
+    public static let defaultShowsOpenCode = true
     public static let defaultUsesWeekdayWeeklyPacing = false
     public static let defaultShowsFullRequestContentOnHover = true
     public static let defaultShowsDesktopCard = false
@@ -174,6 +175,14 @@ public final class TokenBarSettings {
             self.defaults.set(
                 self.showsWith,
                 forKey: self.keys.showsWith)
+        }
+    }
+
+    public var showsOpenCode: Bool {
+        didSet {
+            self.defaults.set(
+                self.showsOpenCode,
+                forKey: self.keys.showsOpenCode)
         }
     }
 
@@ -266,6 +275,9 @@ public final class TokenBarSettings {
         self.showsWith = defaults.object(
             forKey: self.keys.showsWith) as? Bool
             ?? Self.defaultShowsWith
+        self.showsOpenCode = defaults.object(
+            forKey: self.keys.showsOpenCode) as? Bool
+            ?? Self.defaultShowsOpenCode
         self.usesWeekdayWeeklyPacing = defaults.object(
             forKey: self.keys.usesWeekdayWeeklyPacing) as? Bool
             ?? Self.defaultUsesWeekdayWeeklyPacing
@@ -302,6 +314,7 @@ public final class TokenBarSettings {
         self.showsAntigravity = Self.defaultShowsAntigravity
         self.showsWorkBuddy = Self.defaultShowsWorkBuddy
         self.showsWith = Self.defaultShowsWith
+        self.showsOpenCode = Self.defaultShowsOpenCode
         self.usesWeekdayWeeklyPacing = Self.defaultUsesWeekdayWeeklyPacing
         self.showsFullRequestContentOnHover = Self.defaultShowsFullRequestContentOnHover
         self.showsDesktopCard = Self.defaultShowsDesktopCard
@@ -322,6 +335,7 @@ public final class TokenBarSettings {
         let showsAntigravity: String
         let showsWorkBuddy: String
         let showsWith: String
+        let showsOpenCode: String
         let usesWeekdayWeeklyPacing: String
         let showsFullRequestContentOnHover: String
         let showsDesktopCard: String
@@ -342,6 +356,7 @@ public final class TokenBarSettings {
             self.showsAntigravity = "\(prefix).showsAntigravity"
             self.showsWorkBuddy = "\(prefix).showsWorkBuddy"
             self.showsWith = "\(prefix).showsWith"
+            self.showsOpenCode = "\(prefix).showsOpenCode"
             self.usesWeekdayWeeklyPacing = "\(prefix).usesWeekdayWeeklyPacing"
             self.showsFullRequestContentOnHover = "\(prefix).showsFullRequestContentOnHover"
             self.showsDesktopCard = "\(prefix).showsDesktopCard"

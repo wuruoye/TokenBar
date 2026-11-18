@@ -1192,6 +1192,11 @@ enum DemoPreviewRenderer {
             : state.size.points
         let content = DesktopCardView(
             state: state,
+            sessionInfo: { platform, taskID in
+                DesktopSessionInfo(
+                    platform: TokenPlatform(rawValue: platform), taskID: taskID,
+                    sessions: [], usageDate: nil, resolveClaudeSession: { _ in nil })
+            },
             open: { _, _ in },
             drag: { _ in },
             resize: { _ in },
