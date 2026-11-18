@@ -415,6 +415,9 @@ function dashboard(): HTMLElement {
     credits.append(el("strong", "", "↻  Extra resets"), el("strong", "", quota.availableResetCredits + " available"));
     quotaCard.append(credits);
   }
+  if (quota && (quota.session || quota.weekly) && quota.updatedAtMs > 0) {
+    quotaCard.append(el("p", "muted small", "额度采样于 " + dateTime(quota.updatedAtMs)));
+  }
   if (quota?.error) quotaCard.append(el("p", "notice", (quota.session || quota.weekly ? "显示上次结果 · " : "") + quota.error));
   else if (!quota?.session && !quota?.weekly) quotaCard.append(el("p", "muted", "正在读取额度…"));
   main.append(quotaCard);
