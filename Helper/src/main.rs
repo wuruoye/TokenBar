@@ -37,7 +37,7 @@ use tokenbar_helper::workbuddy::{
 use serde::Deserialize;
 use tokenbar_helper::memory::{load_usage_snapshot, run_receiver, MemoryReceiverConfig, DEFAULT_PORT};
 use tokenbar_helper::pricing::{AnthropicPricing, CodexPricing, GooglePricing};
-use tokenbar_helper::usage::BillingBasis;
+use tokenbar_helper::usage::{BillingBasis, CostSource, UnifiedMessage};
 use tokenbar_helper::{
     build_snapshot_with_context_windows, extract_request_detail as extract_codex_request_detail,
     load_claude_session_titles, load_codex_session_titles, normalize_codex_reasoning_usage,
@@ -216,8 +216,8 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let use_env_roots = home_dir.is_none();
 
-    let catalog_load = load_openrouter_pricing(&config);
-    let catalog = catalog_load.catalog.map(Arc::new);
+    let mut catalog_load = load_openrouter_pricing(&config);
+    let mut catalog = catalog_load.catalog.map(Arc::new);
     let default_billing = codex_default_billing(&config);
     let mut pricing = config
         .openai_pricing_markdown
@@ -250,13 +250,13 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(|path| load_codex_session_titles(&codex_messages, path))
         .unwrap_or_default();
-    let anthropic_pricing = config
+    let mut anthropic_pricing = config
         .anthropic_pricing_markdown
         .as_deref()
         .and_then(|path| AnthropicPricing::from_official_markdown_file(path, today).ok())
         .unwrap_or_else(|| AnthropicPricing::bundled_for_date(today))
         .with_openrouter_catalog(catalog.clone());
-    let claude_messages = parse_local_claude_messages(
+    let mut claude_messages = parse_local_claude_messages(
         ClaudeParseOptions {
             home_dir: home_dir.clone(),
             use_env_roots,
@@ -287,19 +287,54 @@ fn run_snapshot(config: SnapshotConfig) -> Result<(), Box<dyn Error>> {
         since: Some(parse_first_day.format("%Y-%m-%d").to_string()),
         until: Some(parse_last_day.format("%Y-%m-%d").to_string()),
     };
-    let google_pricing = config
+    let mut google_pricing = config
         .openrouter_pricing_json
         .as_deref()
         .and_then(|path| GooglePricing::from_openrouter_catalog_file(path, today).ok())
         .unwrap_or_else(|| GooglePricing::bundled_for_date(today))
         .with_openrouter_catalog(catalog.clone());
-    let antigravity_messages = parse_local_antigravity_messages(
+    let mut antigravity_messages = parse_local_antigravity_messages(
         antigravity_options.clone(),
         &anthropic_pricing,
         &google_pricing,
     )
     .map_err(io::Error::other)?;
     session_titles.extend(load_antigravity_session_titles(&antigravity_options));
+
+    if config.openrouter_pricing_json.is_none()
+        && !config.offline_pricing
+        && catalog_load.status.status != "updated"
+    {
+        let unpriced_models = collect_unpriced_models(&[
+            &codex_messages,
+            &claude_messages,
+            &antigravity_messages,
+        ]);
+        if !unpriced_models.is_empty() {
+            if let Some(dir) = tokenbar_helper::openrouter::default_cache_dir() {
+                let refreshed = tokenbar_helper::openrouter::refresh_for_unpriced_models(
+                    &dir,
+                    config.offline_pricing,
+                    &unpriced_models,
+                );
+                if refreshed.status.status == "updated" {
+                    catalog = refreshed.catalog.map(Arc::new);
+                    catalog_load.status = refreshed.status;
+                    pricing = pricing.with_openrouter_catalog(catalog.clone());
+                    anthropic_pricing = anthropic_pricing.with_openrouter_catalog(catalog.clone());
+                    google_pricing = google_pricing.with_openrouter_catalog(catalog.clone());
+                    reprice_unpriced_messages(
+                        &mut codex_messages,
+                        &mut claude_messages,
+                        &mut antigravity_messages,
+                        &pricing,
+                        &anthropic_pricing,
+                        &google_pricing,
+                    );
+                }
+            }
+        }
+    }
     let workbuddy_messages = parse_local_workbuddy_messages(WorkBuddyParseOptions {
         home_dir: antigravity_options.home_dir.clone(),
         use_env_roots,
@@ -399,6 +434,75 @@ fn load_openrouter_pricing(config: &SnapshotConfig) -> tokenbar_helper::openrout
         source: "bundled".into(), updated_at_ms: None, model_count: 0,
         status: "cache-unavailable".into(),
     }}
+}
+
+fn collect_unpriced_models(groups: &[&[UnifiedMessage]]) -> Vec<String> {
+    let mut models = std::collections::BTreeSet::new();
+    for group in groups {
+        for message in *group {
+            if message.cost_source == CostSource::Unknown && message.tokens.total() > 0 {
+                let model = message.model_id.trim().to_ascii_lowercase();
+                if !model.is_empty() {
+                    models.insert(model);
+                }
+            }
+        }
+    }
+    models.into_iter().collect()
+}
+
+fn reprice_unpriced_messages(
+    codex_messages: &mut [UnifiedMessage],
+    claude_messages: &mut [UnifiedMessage],
+    antigravity_messages: &mut [UnifiedMessage],
+    codex_pricing: &CodexPricing,
+    anthropic_pricing: &AnthropicPricing,
+    google_pricing: &GooglePricing,
+) {
+    for message in codex_messages {
+        if message.cost_source != CostSource::Unknown {
+            continue;
+        }
+        if let Some(costs) = codex_pricing.calculate_token_costs_with_service_tier(
+            &message.model_id,
+            &message.tokens,
+            message.service_tier,
+            message.billing,
+        ) {
+            message.cost = costs.total();
+            message.token_costs = Some(costs);
+            message.cost_source = CostSource::Estimated;
+        }
+    }
+    for message in claude_messages {
+        if message.cost_source != CostSource::Unknown {
+            continue;
+        }
+        if let Some(costs) = anthropic_pricing.calculate_token_costs_with_cache_writes(
+            &message.model_id,
+            &message.tokens,
+            message.cache_write_breakdown.as_ref(),
+        ) {
+            message.cost = costs.total();
+            message.token_costs = Some(costs);
+            message.cost_source = CostSource::Estimated;
+        }
+    }
+    for message in antigravity_messages {
+        if message.cost_source != CostSource::Unknown {
+            continue;
+        }
+        let costs = if message.provider_id == "anthropic" {
+            anthropic_pricing.calculate_token_costs(&message.model_id, &message.tokens)
+        } else {
+            google_pricing.calculate_token_costs(&message.model_id, &message.tokens)
+        };
+        if let Some(costs) = costs {
+            message.cost = costs.total();
+            message.token_costs = Some(costs);
+            message.cost_source = CostSource::Estimated;
+        }
+    }
 }
 
 fn codex_session_index_path(config: &SnapshotConfig) -> Option<PathBuf> {

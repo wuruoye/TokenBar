@@ -17,6 +17,8 @@ pub const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const DAY_MS: i64 = 86_400_000;
 const RETRY_MS: i64 = 3_600_000;
+const NEW_MODEL_DEBOUNCE_MS: i64 = 60_000;
+const MAX_CHECKED_UNKNOWN_MODELS: usize = 200;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,6 +463,8 @@ struct Cache {
     version: u32,
     fetched_at_ms: i64,
     catalog: Catalog,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checked_unknown_models: Vec<String>,
 }
 
 /// Bumped to 3 when the catalog began retaining `google/gemini*` prices so
@@ -549,31 +553,81 @@ pub fn refresh(dir: &Path, offline: bool) -> CatalogLoad {
         dir,
         chrono::Utc::now().timestamp_millis(),
         offline,
+        &[],
         download,
     )
 }
+
+pub fn refresh_for_unpriced_models(
+    dir: &Path,
+    offline: bool,
+    unpriced_models: &[String],
+) -> CatalogLoad {
+    refresh_with(
+        dir,
+        chrono::Utc::now().timestamp_millis(),
+        offline,
+        unpriced_models,
+        download,
+    )
+}
+
+fn normalize_checked_unknown_models(models: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for model in models {
+        let normalized = model.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && normalized.len() <= 200 {
+            seen.insert(normalized);
+        }
+    }
+    seen.into_iter().take(MAX_CHECKED_UNKNOWN_MODELS).collect()
+}
+
 fn refresh_with(
     dir: &Path,
     now: i64,
     offline: bool,
+    unpriced_models: &[String],
     fetch: impl FnOnce() -> Result<Vec<u8>, String>,
 ) -> CatalogLoad {
     let old = load_cache(dir, now);
     if offline {
         return result(old, "offline");
     }
-    if old.as_ref().is_some_and(|c| now - c.fetched_at_ms < DAY_MS) {
+    let normalized_unpriced = normalize_checked_unknown_models(unpriced_models);
+    let force = !normalized_unpriced.is_empty();
+    if !force && old.as_ref().is_some_and(|c| now - c.fetched_at_ms < DAY_MS) {
         return result(old, "cached");
+    }
+    let has_new_unpriced = force
+        && match &old {
+            None => true,
+            Some(cache) => normalized_unpriced
+                .iter()
+                .any(|model| !cache.checked_unknown_models.iter().any(|seen| seen == model)),
+        };
+    let cooldown_ms = if has_new_unpriced {
+        NEW_MODEL_DEBOUNCE_MS
+    } else {
+        RETRY_MS
+    };
+    if force
+        && !has_new_unpriced
+        && old.as_ref().is_some_and(|c| now - c.fetched_at_ms < RETRY_MS)
+    {
+        return result(old, "retry-wait");
     }
     if fs::create_dir_all(dir).is_err() {
         return result(old, "cache-unavailable");
     }
     let attempt = dir.join("openrouter-last-attempt");
-    if fs::read_to_string(&attempt)
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .is_some_and(|t| t <= now && now - t < RETRY_MS)
-    {
+    let recent_attempt = |cooldown: i64| {
+        fs::read_to_string(&attempt)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|t| t <= now && now - t < cooldown)
+    };
+    if recent_attempt(cooldown_ms) {
         return result(old, "retry-wait");
     }
     let lock_path = dir.join("openrouter-refresh.lock");
@@ -595,9 +649,22 @@ fn refresh_with(
     drop(lock);
     let _guard = RefreshLock(lock_path);
     // Another helper may have finished between the first read and acquiring the lock.
-    if let Some(fresh) = load_cache(dir, now).filter(|c| now - c.fetched_at_ms < DAY_MS) {
-        return result(Some(fresh), "cached");
+    let fresh = load_cache(dir, now);
+    if !force && fresh.as_ref().is_some_and(|c| now - c.fetched_at_ms < DAY_MS) {
+        return result(fresh, "cached");
     }
+    if force && recent_attempt(cooldown_ms) {
+        return result(fresh.or(old), "retry-wait");
+    }
+    let checked_unknown_models = if force {
+        normalized_unpriced
+    } else {
+        fresh
+            .as_ref()
+            .or(old.as_ref())
+            .map(|c| c.checked_unknown_models.clone())
+            .unwrap_or_default()
+    };
     let _ = private_write(&attempt, now.to_string().as_bytes());
     let updated = fetch()
         .and_then(|bytes| Catalog::from_json(&bytes))
@@ -606,6 +673,7 @@ fn refresh_with(
                 version: CACHE_VERSION,
                 fetched_at_ms: now,
                 catalog,
+                checked_unknown_models,
             };
             let bytes = serde_json::to_vec(&cache).map_err(|_| "cannot encode pricing cache")?;
             private_write(&dir.join("openrouter-pricing.json"), &bytes)?;
@@ -742,5 +810,78 @@ mod tests {
             .calculate_token_costs("gemini-3.1-pro", &usage)
             .expect("gemini-3.1-pro-preview should be retained with shortest raw id");
         assert!((pro.total() - 14.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unpriced_model_forces_refresh_within_day_ttl_with_cooldown() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokenbar-openrouter-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let initial_json = br#"{
+            "data": [{
+                "id": "google/gemini-4-carbon",
+                "context_length": 1048576,
+                "pricing": {"prompt": "0.000002", "completion": "0.00001"}
+            }]
+        }"#;
+        let updated_json = br#"{
+            "data": [
+                {
+                    "id": "google/gemini-4-carbon",
+                    "context_length": 1048576,
+                    "pricing": {"prompt": "0.000002", "completion": "0.00001"}
+                },
+                {
+                    "id": "google/gemini-4-neon",
+                    "context_length": 1048576,
+                    "pricing": {"prompt": "0.000003", "completion": "0.000015"}
+                }
+            ]
+        }"#;
+
+        let t0 = 1_795_000_000_000_i64;
+        let first = refresh_with(&dir, t0, false, &[], || Ok(initial_json.to_vec()));
+        assert_eq!(first.status.status, "updated");
+
+        // Still inside 24h TTL: normal refresh stays cached.
+        let cached = refresh_with(&dir, t0 + 3_600_000, false, &[], || {
+            panic!("normal refresh within 24h should not fetch")
+        });
+        assert_eq!(cached.status.status, "cached");
+
+        // First sighting of a new unpriced model refreshes immediately (bypasses 24h TTL).
+        let forced = refresh_with(
+            &dir,
+            t0 + 3_600_000,
+            false,
+            &["gemini-4-neon".to_string(), "gemini-internal".to_string()],
+            || Ok(updated_json.to_vec()),
+        );
+        assert_eq!(forced.status.status, "updated");
+        assert_eq!(forced.status.model_count, 2);
+
+        // Same still-unpriced model within 1h hits retry-wait.
+        let throttled = refresh_with(
+            &dir,
+            t0 + 3_600_000 + 300_000,
+            false,
+            &["gemini-internal".to_string()],
+            || panic!("already-checked unknown model within 1h should not fetch"),
+        );
+        assert_eq!(throttled.status.status, "retry-wait");
+
+        // Another brand-new unpriced model after the 60s debounce refreshes immediately.
+        let second_new = refresh_with(
+            &dir,
+            t0 + 3_600_000 + 300_000,
+            false,
+            &["gemini-internal".to_string(), "gemini-4-krypton".to_string()],
+            || Ok(updated_json.to_vec()),
+        );
+        assert_eq!(second_new.status.status, "updated");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
